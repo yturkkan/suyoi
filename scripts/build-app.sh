@@ -20,8 +20,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleExecutable</key><string>Suyoi</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.8</string>
-<key>CFBundleVersion</key><string>0.1.8</string>
+<key>CFBundleShortVersionString</key><string>0.1.9</string>
+<key>CFBundleVersion</key><string>0.1.9</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
@@ -33,4 +33,5 @@ PLIST
 touch "$APP"
 rm -f "$PWD/build/Suyoi.app.zip"
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP" "$PWD/build/Suyoi.app.zip"
+(cd "$PWD/build" && /usr/bin/shasum -a 256 Suyoi.app.zip > Suyoi.app.zip.sha256)
 printf '\nBuilt locally: %s\nPackaged archive: %s\nLaunch manually: open "%s"\n' "$APP" "$PWD/build/Suyoi.app.zip" "$APP"

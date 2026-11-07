@@ -4,19 +4,25 @@ import SuyoiCore
 
 struct CleanupPreviewView: View {
     let report: CleanupReport
+    let recheckingCandidateIDs: Set<String>
     let onTrashCandidate: ((CleanupCandidate) -> Void)?
+    let onRecheckCandidate: ((CleanupCandidate) -> Void)?
     let onTrashAllEligible: (() -> Void)?
     let onDismiss: () -> Void
     private let leafGreen = Color(red: 0.22, green: 0.53, blue: 0.39)
 
     init(
         report: CleanupReport,
+        recheckingCandidateIDs: Set<String> = [],
         onTrashCandidate: ((CleanupCandidate) -> Void)? = nil,
+        onRecheckCandidate: ((CleanupCandidate) -> Void)? = nil,
         onTrashAllEligible: (() -> Void)? = nil,
         onDismiss: @escaping () -> Void
     ) {
         self.report = report
+        self.recheckingCandidateIDs = recheckingCandidateIDs
         self.onTrashCandidate = onTrashCandidate
+        self.onRecheckCandidate = onRecheckCandidate
         self.onTrashAllEligible = onTrashAllEligible
         self.onDismiss = onDismiss
     }
@@ -143,6 +149,8 @@ struct CleanupPreviewView: View {
 
     private func candidateCard(_ candidate: CleanupCandidate, blocked: Bool) -> some View {
         let assessment = report.assessments[candidate.id]
+        let diagnostic = assessment.map { SafetyDiagnostics.explain(assessment: $0, candidate: candidate) }
+        let isRechecking = recheckingCandidateIDs.contains(candidate.id)
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(candidate.agentName.map { "\($0) · \(candidate.category)" } ?? candidate.category)
@@ -169,6 +177,27 @@ struct CleanupPreviewView: View {
                 .buttonStyle(.plain)
                 .help("Reveal in Finder")
 
+                if blocked, diagnostic?.canRecheck == true, let onRecheckCandidate {
+                    Button {
+                        onRecheckCandidate(candidate)
+                    } label: {
+                        HStack(spacing: 3) {
+                            if isRechecking {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                            }
+                            Text("Recheck")
+                                .font(.system(size: 9.5, weight: .medium))
+                        }
+                        .foregroundStyle(leafGreen)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isRechecking)
+                    .help(diagnostic?.remediationHint ?? "Recheck safety for this item")
+                }
+
                 if !blocked, let onTrashCandidate {
                     Button {
                         onTrashCandidate(candidate)
@@ -182,7 +211,12 @@ struct CleanupPreviewView: View {
                 }
             }
 
-            if let reasons = assessment?.blockedReasons, !reasons.isEmpty {
+            if blocked, let diagnostic {
+                Text("\(diagnostic.headline) (\(diagnostic.checkName)) — \(diagnostic.remediationHint)")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            } else if let reasons = assessment?.blockedReasons, !reasons.isEmpty {
                 Text(reasons.joined(separator: " · "))
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)

@@ -1,6 +1,8 @@
 import AppKit
 import Foundation
+import ServiceManagement
 import SuyoiCore
+import UserNotifications
 
 public enum DashboardTab: String, CaseIterable, Sendable {
     case agents = "Agents"
@@ -79,12 +81,16 @@ final class DashboardModel: ObservableObject {
     @Published var availableUpdate: AppReleaseInfo?
     @Published var isCheckingForUpdates = false
     @Published var isInstallingUpdate = false
+    @Published var areNotificationsEnabled: Bool
+    @Published var isLaunchAtLoginEnabled: Bool
+    @Published var recheckingCandidateIDs: Set<String> = []
 
     private static let providerOrderKey = "suyoi.quotaProviderOrder"
     private static let hiddenProvidersKey = "suyoi.hiddenQuotaProviders"
     private static let cleanupRootPathKey = "suyoi.cleanupRootPath"
     private static let liveQuotaEnabledKey = "suyoi.isLiveQuotaEnabled"
     private static let scanAllWorkspacesKey = "suyoi.scanAllWorkspaces"
+    private static let notificationsEnabledKey = "suyoi.areNotificationsEnabled"
 
     let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
     private let inspector = SystemInspector()
@@ -93,6 +99,7 @@ final class DashboardModel: ObservableObject {
     private let liveQuotaPoller: any LiveQuotaPolling
     private let agentSteerer: any AgentSteering
     private let appUpdater: any AppUpdating
+    private var alertTracker = AlertStateTracker()
     private var livePollTask: Task<Void, Never>?
     private var livePollGeneration: UInt64 = 0
     private var cleanupScanTask: Task<Void, Never>?
@@ -151,6 +158,8 @@ final class DashboardModel: ObservableObject {
         } else {
             self.hiddenProviders = []
         }
+        self.areNotificationsEnabled = UserDefaults.standard.bool(forKey: Self.notificationsEnabledKey)
+        self.isLaunchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
     }
 
     var agentRows: [AgentObservation] {
@@ -444,6 +453,7 @@ final class DashboardModel: ObservableObject {
             snapshot = newSnapshot
             quotaSnapshot = newQuotas
             isRefreshing = false
+            evaluateAndDeliverAlerts()
             if isLiveQuotaEnabled {
                 pollLiveQuotas(trigger: .automatic)
             }
@@ -490,6 +500,7 @@ final class DashboardModel: ObservableObject {
             liveQuotas[.claude] = claudeStatus
             liveQuotas[.gemini] = geminiStatus
             isPollingLiveQuotas = false
+            evaluateAndDeliverAlerts()
         }
     }
 
@@ -505,6 +516,7 @@ final class DashboardModel: ObservableObject {
             guard !Task.isCancelled, isLiveQuotaEnabled, livePollGeneration == gen else { return }
             liveQuotas[provider] = status
             isPollingLiveQuotas = false
+            evaluateAndDeliverAlerts()
         }
     }
 
@@ -552,6 +564,106 @@ final class DashboardModel: ObservableObject {
 
     func assessment(for candidate: CleanupCandidate) -> SafetyAssessment? {
         cleanup?.assessments[candidate.id]
+    }
+
+    func diagnosticDetail(for candidate: CleanupCandidate) -> SafetyDiagnosticDetail? {
+        guard let currentAssessment = assessment(for: candidate) else { return nil }
+        return SafetyDiagnostics.explain(assessment: currentAssessment, candidate: candidate)
+    }
+
+    func recheckCandidate(_ candidate: CleanupCandidate) {
+        guard cleanup != nil, !recheckingCandidateIDs.contains(candidate.id) else { return }
+        recheckingCandidateIDs.insert(candidate.id)
+        let home = homeDirectory
+        Task {
+            let updatedAssessment = await Task.detached(priority: .userInitiated) {
+                let service = InventoryService(safetyEvaluator: SafetyEvaluator(), worktreeInspector: WorktreeInspector())
+                return service.assessCandidateForTrash(candidate, homeDirectory: home)
+            }.value
+            recheckingCandidateIDs.remove(candidate.id)
+            guard let currentReport = cleanup else { return }
+            var updatedAssessments = currentReport.assessments
+            updatedAssessments[candidate.id] = updatedAssessment
+            cleanup = CleanupReport(
+                candidates: currentReport.candidates,
+                warnings: currentReport.warnings,
+                partial: currentReport.partial,
+                agentCacheCandidates: currentReport.agentCacheCandidates,
+                worktrees: currentReport.worktrees,
+                assessments: updatedAssessments,
+                discoveredCount: currentReport.discoveredCount
+            )
+            let detail = SafetyDiagnostics.explain(assessment: updatedAssessment, candidate: candidate)
+            showBanner(
+                updatedAssessment.isReviewableForTrash
+                    ? "\(URL(fileURLWithPath: candidate.path).lastPathComponent) is now ready for Trash"
+                    : detail.headline,
+                isError: !updatedAssessment.isReviewableForTrash
+            )
+        }
+    }
+
+    func setNotificationsEnabled(_ enabled: Bool) {
+        areNotificationsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.notificationsEnabledKey)
+        if enabled {
+            guard Bundle.main.bundleURL.pathExtension == "app" else {
+                showBanner("Alert notifications enabled")
+                return
+            }
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if granted {
+                        self.showBanner("Agent waiting & quota notifications enabled")
+                        self.evaluateAndDeliverAlerts()
+                    } else {
+                        self.showBanner("Enable Suyoi notifications in macOS System Settings", isError: true)
+                    }
+                }
+            }
+        } else {
+            showBanner("Notifications disabled")
+        }
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            isLaunchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
+            showBanner(isLaunchAtLoginEnabled ? "Launch at Login enabled" : "Launch at Login disabled")
+        } catch {
+            isLaunchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
+            showBanner("Move Suyoi.app to /Applications to enable Launch at Login", isError: true)
+        }
+    }
+
+    private func evaluateAndDeliverAlerts() {
+        var combinedQuotaMap: [QuotaProvider: ProviderQuotaStatus] = [:]
+        for provider in QuotaProvider.allCases where !hiddenProviders.contains(provider) {
+            if let live = liveQuotas[provider], live.status != .unavailable {
+                combinedQuotaMap[provider] = live
+            } else if let local = quotaSnapshot?.providers.first(where: { $0.provider == provider }),
+                      local.status != .unavailable {
+                combinedQuotaMap[provider] = local
+            }
+        }
+        let events = alertTracker.evaluate(agents: agentRows, quotas: combinedQuotaMap)
+        guard areNotificationsEnabled, !events.isEmpty else { return }
+        for event in events {
+            showBanner("\(event.title): \(event.body)", isError: event.kind == .quotaCritical)
+            guard Bundle.main.bundleURL.pathExtension == "app" else { continue }
+            let content = UNMutableNotificationContent()
+            content.title = event.title
+            content.body = event.body
+            content.sound = .default
+            let request = UNNotificationRequest(identifier: event.id, content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(request)
+        }
     }
 
     // MARK: - User-Initiated Actions
@@ -752,7 +864,7 @@ final class DashboardModel: ObservableObject {
     }
 
     var currentAppVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.8"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.9"
     }
 
     func checkForUpdates() {

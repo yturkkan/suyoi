@@ -65,7 +65,9 @@ struct DashboardView: View {
             if let report = model.cleanup {
                 CleanupPreviewView(
                     report: report,
+                    recheckingCandidateIDs: model.recheckingCandidateIDs,
                     onTrashCandidate: { model.trashCandidate($0) },
+                    onRecheckCandidate: { model.recheckCandidate($0) },
                     onTrashAllEligible: { model.trashAllReviewable() },
                     onDismiss: { model.isShowingCleanupPreview = false }
                 )
@@ -512,10 +514,13 @@ struct DashboardView: View {
                         CleanupCandidateCardRow(
                             candidate: candidate,
                             assessment: model.assessment(for: candidate),
+                            diagnostic: model.diagnosticDetail(for: candidate),
                             isHighImpact: model.isHighImpactCandidate(candidate),
+                            isRechecking: model.recheckingCandidateIDs.contains(candidate.id),
                             isHovered: model.hoveredRowID == rowID,
                             onHover: { model.hoveredRowID = $0 ? rowID : (model.hoveredRowID == rowID ? nil : model.hoveredRowID) },
                             onTrash: { model.trashCandidate(candidate) },
+                            onRecheck: { model.recheckCandidate(candidate) },
                             onOpenPreview: { model.isShowingCleanupPreview = true }
                         )
                     }
@@ -1032,10 +1037,13 @@ private struct ServerGroupCardRow: View {
 private struct CleanupCandidateCardRow: View {
     let candidate: CleanupCandidate
     let assessment: SafetyAssessment?
+    let diagnostic: SafetyDiagnosticDetail?
     let isHighImpact: Bool
+    let isRechecking: Bool
     let isHovered: Bool
     let onHover: (Bool) -> Void
     let onTrash: () -> Void
+    let onRecheck: () -> Void
     let onOpenPreview: () -> Void
 
     private var isReviewable: Bool {
@@ -1043,6 +1051,9 @@ private struct CleanupCandidateCardRow: View {
     }
 
     private var blockedTooltip: String {
+        if let diagnostic {
+            return "\(diagnostic.headline) (\(diagnostic.checkName)) — \(diagnostic.remediationHint)"
+        }
         if isReviewable && isHighImpact {
             return "High-impact cache or environment (excluded from bulk Trash All Ready; can be moved to Trash individually)"
         }
@@ -1135,7 +1146,41 @@ private struct CleanupCandidateCardRow: View {
                     }
                     .buttonStyle(.plain)
                     .help("Move to macOS Trash")
+                } else if diagnostic?.canRecheck == true {
+                    Button(action: onRecheck) {
+                        HStack(spacing: 3) {
+                            if isRechecking {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                            }
+                            Text("Recheck")
+                                .font(.system(size: 9.5, weight: .medium))
+                        }
+                        .foregroundStyle(leafGreen)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(leafGreen.opacity(0.10), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isRechecking)
+                    .help(diagnostic?.remediationHint ?? "Recheck safety for this item")
                 }
+            }
+
+            if !isReviewable, let diagnostic {
+                HStack(spacing: 4) {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    Text("\(diagnostic.headline) · \(diagnostic.remediationHint)")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .help("\(diagnostic.headline) (\(diagnostic.checkName)): \(diagnostic.remediationHint)")
             }
         }
         .padding(.horizontal, 11)

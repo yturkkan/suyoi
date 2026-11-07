@@ -1,14 +1,18 @@
 import Foundation
 
 public struct CleanupScanner: CleanupScanning {
+    private static let sharedMeasurementCache = IncrementalDirectoryCache()
     private let identityReader: @Sendable (URL) -> FileIdentity?
+    private let measurementCache: IncrementalDirectoryCache?
 
     public init() {
         self.identityReader = { FileMetadataReader().identity(at: $0) }
+        self.measurementCache = Self.sharedMeasurementCache
     }
 
     init(identityReader: @escaping @Sendable (URL) -> FileIdentity?) {
         self.identityReader = identityReader
+        self.measurementCache = nil
     }
 
     public func scan(root: URL, entryLimit: Int = 100_000, timeLimit: TimeInterval = 10) -> CleanupReport {
@@ -78,7 +82,18 @@ public struct CleanupScanner: CleanupScanning {
             let sliceDeadline = now + max(0, projectDeadline - now) / Double(count)
             let valid = reader.canonicalPath(item.0, relativeTo: canonicalRoot) != nil
             let preIdentity = identityReader(item.0)
-            let measurement = valid ? reader.measure(item.0, entryLimit: highBudget ? remaining : remaining / count, deadline: highBudget ? projectDeadline : sliceDeadline) : FileMetadataReader.Measurement(partial: true, warnings: ["Candidate changed during scan."])
+            let measurement: FileMetadataReader.Measurement
+            if valid, entryLimit >= 100_000, let cached = measurementCache?.cachedBytes(for: item.0) {
+                measurement = FileMetadataReader.Measurement(bytes: cached, allocatedBytes: cached, allocatedAvailable: true, entries: 1, partial: false)
+            } else if valid {
+                let measured = reader.measure(item.0, entryLimit: highBudget ? remaining : remaining / count, deadline: highBudget ? projectDeadline : sliceDeadline)
+                if !measured.partial {
+                    measurementCache?.record(bytes: measured.bytes, for: item.0)
+                }
+                measurement = measured
+            } else {
+                measurement = FileMetadataReader.Measurement(partial: true, warnings: ["Candidate changed during scan."])
+            }
             let postIdentity = identityReader(item.0)
             let identityChanged = preIdentity == nil || preIdentity != postIdentity
             let candidatePartial = measurement.partial || identityChanged

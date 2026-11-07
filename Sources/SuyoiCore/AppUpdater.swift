@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -7,19 +8,25 @@ public struct AppReleaseInfo: Equatable, Sendable {
     public let releaseURL: URL
     public let downloadURL: URL
     public let assetSizeBytes: Int64
+    public let expectedSHA256: String?
+    public let sha256AssetURL: URL?
 
     public init(
         version: String,
         tagName: String,
         releaseURL: URL,
         downloadURL: URL,
-        assetSizeBytes: Int64
+        assetSizeBytes: Int64,
+        expectedSHA256: String? = nil,
+        sha256AssetURL: URL? = nil
     ) {
         self.version = version
         self.tagName = tagName
         self.releaseURL = releaseURL
         self.downloadURL = downloadURL
         self.assetSizeBytes = assetSizeBytes
+        self.expectedSHA256 = expectedSHA256
+        self.sha256AssetURL = sha256AssetURL
     }
 }
 
@@ -93,10 +100,18 @@ public struct AppUpdater: AppUpdating, Sendable {
     public static let allowedReleaseURLPrefix = "https://github.com/yturkkan/suyoi/releases/"
     public static let allowedDownloadURLPrefix = "https://github.com/yturkkan/suyoi/releases/download/"
     public static let expectedAssetName = "Suyoi.app.zip"
+    public static let expectedChecksumAssetName = "Suyoi.app.zip.sha256"
     public static let allowedBundleIdentifiers: Set<String> = ["local.suyoi.app", "io.suyoi.app"]
     public static let maxAssetBytes: Int64 = 100 * 1024 * 1024
 
-    public init() {}
+    private let downloadArchive: (@Sendable (URLRequest) async throws -> (URL, URLResponse))?
+
+    public init() { downloadArchive = nil }
+
+    // Allows archive verification to be exercised without a live release request.
+    init(downloadArchive: @escaping @Sendable (URLRequest) async throws -> (URL, URLResponse)) {
+        self.downloadArchive = downloadArchive
+    }
 
     public func checkForUpdates(currentVersion: String) async throws -> AppUpdateCheckResult {
         let session = Self.makeEphemeralSession(timeout: 12)
@@ -148,11 +163,18 @@ public struct AppUpdater: AppUpdating, Sendable {
         do {
             let zipURL = stagingDir.appendingPathComponent(Self.expectedAssetName, isDirectory: false)
             let session = Self.makeEphemeralSession(timeout: 60)
+            defer { session.invalidateAndCancel() }
             var request = URLRequest(url: release.downloadURL)
             request.httpMethod = "GET"
             request.setValue("Suyoi-Updater", forHTTPHeaderField: "User-Agent")
 
-            let (tempDownloadURL, response) = try await session.download(for: request)
+            let (tempDownloadURL, response): (URL, URLResponse)
+            if let downloadArchive {
+                (tempDownloadURL, response) = try await downloadArchive(request)
+            } else {
+                (tempDownloadURL, response) = try await session.download(for: request)
+            }
+            defer { try? FileManager.default.removeItem(at: tempDownloadURL) }
             guard let http = response as? HTTPURLResponse,
                   (200..<300).contains(http.statusCode) else {
                 throw AppUpdaterError.downloadFailed
@@ -168,6 +190,22 @@ public struct AppUpdater: AppUpdating, Sendable {
                 try FileManager.default.removeItem(at: zipURL)
             }
             try FileManager.default.moveItem(at: tempDownloadURL, to: zipURL)
+
+            let expectedHash: String?
+            if let suppliedHash = release.expectedSHA256 {
+                guard let hash = Self.parseSHA256File(suppliedHash) else {
+                    throw AppUpdaterError.bundleVerificationFailed("invalid SHA-256 checksum")
+                }
+                expectedHash = hash
+            } else if let checksumURL = release.sha256AssetURL {
+                expectedHash = try await Self.fetchChecksum(at: checksumURL)
+            } else {
+                expectedHash = nil
+            }
+            if let expectedHash,
+               try Self.computeSHA256Hex(of: zipURL).lowercased() != expectedHash.lowercased() {
+                throw AppUpdaterError.bundleVerificationFailed("SHA-256 checksum mismatch")
+            }
 
             let extractDir = stagingDir.appendingPathComponent("extracted", isDirectory: true)
             try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
@@ -223,15 +261,21 @@ public struct AppUpdater: AppUpdating, Sendable {
 
         if /bin/mv "$new_app" "$target_app"; then
             /usr/bin/xattr -dr com.apple.quarantine "$target_app" >/dev/null 2>&1 || true
-            /bin/rm -rf "$staging_dir" >/dev/null 2>&1 || true
-            /usr/bin/open "$target_app"
-            exit 0
-        else
-            if [ -e "$backup_app" ] && [ ! -e "$target_app" ]; then
-                /bin/mv "$backup_app" "$target_app" >/dev/null 2>&1 || true
+            if /usr/bin/open "$target_app"; then
+                /bin/rm -rf "$staging_dir" >/dev/null 2>&1 || true
+                exit 0
             fi
-            exit 1
         fi
+
+        if [ -e "$backup_app" ]; then
+            if [ -e "$target_app" ]; then
+                /bin/mv "$target_app" "${staging_dir}/Suyoi-failed.app" || exit 1
+            fi
+            /bin/mv "$backup_app" "$target_app" || exit 1
+            /bin/rm -rf "$staging_dir" >/dev/null 2>&1 || true
+            /usr/bin/open "$target_app" >/dev/null 2>&1 || true
+        fi
+        exit 1
         """
 
         let process = Process()
@@ -282,22 +326,26 @@ public struct AppUpdater: AppUpdating, Sendable {
         }
 
         var matchedDownloadURL: URL?
+        var matchedChecksumURL: URL?
         var matchedSize: Int64 = 0
         for asset in assets {
             guard let name = asset["name"] as? String,
-                  name == expectedAssetName,
                   let rawURL = asset["browser_download_url"] as? String,
                   rawURL.hasPrefix(allowedDownloadURLPrefix),
                   let url = URL(string: rawURL) else {
                 continue
             }
+            if name == expectedChecksumAssetName {
+                matchedChecksumURL = url
+                continue
+            }
+            guard name == expectedAssetName, matchedDownloadURL == nil else { continue }
             let size = (asset["size"] as? NSNumber)?.int64Value ?? 0
             guard size > 0, size <= maxAssetBytes else {
                 continue
             }
             matchedDownloadURL = url
             matchedSize = size
-            break
         }
 
         guard let downloadURL = matchedDownloadURL else {
@@ -310,7 +358,8 @@ public struct AppUpdater: AppUpdating, Sendable {
                 tagName: rawTag,
                 releaseURL: releaseURL,
                 downloadURL: downloadURL,
-                assetSizeBytes: matchedSize
+                assetSizeBytes: matchedSize,
+                sha256AssetURL: matchedChecksumURL
             )
         )
     }
@@ -348,6 +397,62 @@ public struct AppUpdater: AppUpdating, Sendable {
     }
 
     // MARK: - Verification Helpers
+
+    public static func computeSHA256Hex(of fileURL: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        var hash = SHA256()
+        while let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
+            hash.update(data: chunk)
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func parseSHA256File(_ text: String) -> String? {
+        guard text.utf8.count <= 4096 else { return nil }
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hash = String(value.prefix(64))
+        guard hash.utf8.count == 64,
+              hash.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }) else {
+            return nil
+        }
+        let suffix = value.dropFirst(64)
+        guard suffix.isEmpty || suffix == "  \(expectedAssetName)" || suffix == " *\(expectedAssetName)" else {
+            return nil
+        }
+        return hash.lowercased()
+    }
+
+    private static func fetchChecksum(at url: URL) async throws -> String {
+        guard url.absoluteString.hasPrefix(allowedDownloadURLPrefix) else {
+            throw AppUpdaterError.bundleVerificationFailed("invalid SHA-256 checksum URL")
+        }
+        let session = makeEphemeralSession(timeout: 12)
+        defer { session.invalidateAndCancel() }
+        do {
+            var request = URLRequest(url: url)
+            request.setValue("Suyoi-Updater", forHTTPHeaderField: "User-Agent")
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode), response.expectedContentLength <= 4096 else {
+                throw AppUpdaterError.bundleVerificationFailed("invalid SHA-256 checksum response")
+            }
+            var data = Data()
+            for try await byte in bytes {
+                guard data.count < 4096 else {
+                    throw AppUpdaterError.bundleVerificationFailed("invalid SHA-256 checksum response")
+                }
+                data.append(byte)
+            }
+            guard let text = String(data: data, encoding: .utf8), let hash = parseSHA256File(text) else {
+                throw AppUpdaterError.bundleVerificationFailed("invalid SHA-256 checksum")
+            }
+            return hash
+        } catch {
+            if let error = error as? AppUpdaterError { throw error }
+            throw AppUpdaterError.bundleVerificationFailed("SHA-256 checksum download failed")
+        }
+    }
 
     private static func verifyExtractedBundle(at appURL: URL, expectedVersion: String) throws {
         var isDir: ObjCBool = false

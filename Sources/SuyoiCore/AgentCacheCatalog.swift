@@ -1,6 +1,7 @@
 import Foundation
 
 public struct AgentCacheCatalog: Sendable {
+    private static let sharedMeasurementCache = IncrementalDirectoryCache()
     public init() {}
 
     static let locations: [(String, String)] = [
@@ -123,7 +124,16 @@ public struct AgentCacheCatalog: Sendable {
             let now = ProcessInfo.processInfo.systemUptime
             let sliceDeadline = now + max(0, deadline - now) / Double(count)
             let pre = reader.identity(at: item.0)
-            let measurement = reader.measure(item.0, entryLimit: entryLimit >= 1_000_000 ? remaining : slice, deadline: entryLimit >= 1_000_000 ? deadline : sliceDeadline, excluding: { Self.isForbiddenPath($0, homeDirectory: home) })
+            let measurement: FileMetadataReader.Measurement
+            if entryLimit >= 100_000, let cached = Self.sharedMeasurementCache.cachedBytes(for: item.0) {
+                measurement = FileMetadataReader.Measurement(bytes: cached, allocatedBytes: cached, allocatedAvailable: true, entries: 1, partial: false)
+            } else {
+                let measured = reader.measure(item.0, entryLimit: entryLimit >= 1_000_000 ? remaining : slice, deadline: entryLimit >= 1_000_000 ? deadline : sliceDeadline, excluding: { Self.isForbiddenPath($0, homeDirectory: home) })
+                if !measured.partial {
+                    Self.sharedMeasurementCache.record(bytes: measured.bytes, for: item.0)
+                }
+                measurement = measured
+            }
             let post = reader.identity(at: item.0)
             let itemPartial = measurement.partial || pre == nil || pre != post
             remaining -= measurement.entries

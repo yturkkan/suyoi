@@ -105,7 +105,7 @@ Suyoi/
 │   ├── SuyoiCore/        # Process inspection, tree grouping, quotas, cleanup safety & steering
 │   └── SuyoiApp/         # AppKit status bar controller, SwiftUI popover views & CLI entrypoint
 ├── Tests/
-│   └── SuyoiCoreTests/   # Unit and fixture tests (173 tests across 21 suites)
+│   └── SuyoiCoreTests/   # Unit and fixture tests (202 tests across 24 suites)
 ├── Resources/            # AppIcon.icns & artwork
 ├── scripts/
 │   ├── build-app.sh      # Release bundle & archive builder

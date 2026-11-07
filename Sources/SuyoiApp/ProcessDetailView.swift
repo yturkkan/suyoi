@@ -173,43 +173,45 @@ struct ProcessDetailView: View {
 
     @ViewBuilder
     private func agentContent(_ obs: AgentObservation) -> some View {
-        if obs.sessionTitle != nil || obs.currentTask != nil || obs.sessionID != nil || steerModeLabel != nil {
-            detailSection("Session & Live Task") {
-                if let title = obs.sessionTitle {
-                    detailRow("Session Title", value: title)
-                }
-                if let task = obs.currentTask {
-                    detailRow("Current Task", value: task, monospaced: true)
-                }
-                if let sid = obs.sessionID {
-                    detailRow("Session ID", value: sid, monospaced: true)
-                }
-                if let steerModeLabel {
-                    detailRow("Steer Channel", value: steerModeLabel)
-                    HStack(spacing: 6) {
-                        TextField("Send instruction to \(obs.agentName)…", text: $steerPromptText)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 11))
-                            .disabled(isSteering)
-                            .onSubmit {
-                                onSteerAgent?(obs)
-                            }
-                        Button {
+        detailSection("Session & Live Task") {
+            if let title = obs.sessionTitle {
+                detailRow("Session Title", value: title)
+            }
+            if let task = obs.currentTask {
+                detailRow("Current Task", value: task, monospaced: true)
+            }
+            if let sid = obs.sessionID {
+                detailRow("Session ID", value: sid, monospaced: true)
+            }
+            if let steerModeLabel {
+                detailRow("Steer Channel", value: steerModeLabel)
+                HStack(spacing: 6) {
+                    TextField("Send instruction to \(obs.agentName)…", text: $steerPromptText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11))
+                        .disabled(isSteering)
+                        .onSubmit {
                             onSteerAgent?(obs)
-                        } label: {
-                            if isSteering {
-                                ProgressView().controlSize(.mini)
-                            } else {
-                                Label("Send", systemImage: "paperplane.fill")
-                                    .font(.system(size: 10.5, weight: .semibold))
-                            }
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .disabled(isSteering || steerPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button {
+                        onSteerAgent?(obs)
+                    } label: {
+                        if isSteering {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Label("Send", systemImage: "paperplane.fill")
+                                .font(.system(size: 10.5, weight: .semibold))
+                        }
                     }
-                    .padding(.top, 2)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(isSteering || steerPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
+                .padding(.top, 2)
+            } else {
+                let diag = SafetyDiagnostics.explainSteeringUnavailable(for: obs)
+                detailRow("Steering Status", value: "\(diag.headline) (\(diag.checkName))")
+                detailRow("Next Step", value: diag.remediationHint)
             }
         }
 

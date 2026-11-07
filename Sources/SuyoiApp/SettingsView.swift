@@ -225,6 +225,65 @@ struct SettingsView: View {
                         .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.5)
                 )
             }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("NOTIFICATIONS & STARTUP")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.4)
+                    .foregroundStyle(.secondary)
+
+                VStack(spacing: 0) {
+                    HStack(alignment: .center, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Agent Waiting & Quota Alerts")
+                                .font(.system(size: 11.5, weight: .medium))
+                            Text("Notifies when a coding agent is waiting for input or a quota window crosses 85% / 95%.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Toggle("", isOn: Binding(
+                            get: { model.areNotificationsEnabled },
+                            set: { model.setNotificationsEnabled($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+
+                    Divider()
+                        .padding(.leading, 12)
+
+                    HStack(alignment: .center, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Launch Suyoi at Login")
+                                .font(.system(size: 11.5, weight: .medium))
+                            Text("Starts Suyoi in the macOS menu bar automatically when you sign in.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Toggle("", isOn: Binding(
+                            get: { model.isLaunchAtLoginEnabled },
+                            set: { model.setLaunchAtLoginEnabled($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                }
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.5)
+                )
+            }
         }
     }
 
