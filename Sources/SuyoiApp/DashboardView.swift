@@ -13,6 +13,11 @@ struct DashboardView: View {
             tabBar
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
+            if let release = model.availableUpdate {
+                updateBar(release)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
+            }
             if let banner = model.actionBanner {
                 bannerBar(banner)
                     .padding(.horizontal, 14)
@@ -134,6 +139,45 @@ struct DashboardView: View {
         .padding(.horizontal, 14)
         .padding(.top, 11)
         .padding(.bottom, 8)
+    }
+
+    private func updateBar(_ release: AppReleaseInfo) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(leafGreen)
+            Text("Suyoi v\(release.version) is available")
+                .font(.system(size: 11, weight: .semibold))
+                .lineLimit(1)
+            Spacer()
+            Button {
+                model.installAvailableUpdate()
+            } label: {
+                if model.isInstallingUpdate {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.mini)
+                        Text("Updating…")
+                            .font(.system(size: 10.5, weight: .semibold))
+                    }
+                } else {
+                    Text("Update & Relaunch")
+                        .font(.system(size: 10.5, weight: .semibold))
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.mini)
+            .disabled(model.isInstallingUpdate)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            leafGreen.opacity(0.10),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(leafGreen.opacity(0.35), lineWidth: 0.5)
+        )
     }
 
     private func bannerBar(_ banner: ActionBanner) -> some View {
@@ -568,6 +612,17 @@ struct DashboardView: View {
                 .accessibilityLabel("Refresh local inventory")
 
                 Menu {
+                    if let release = model.availableUpdate {
+                        Button("Update to v\(release.version) & Relaunch") {
+                            model.installAvailableUpdate()
+                        }
+                        .disabled(model.isInstallingUpdate)
+                    }
+                    Button(model.isCheckingForUpdates ? "Checking for Updates…" : "Check for Updates…") {
+                        model.checkForUpdates()
+                    }
+                    .disabled(model.isCheckingForUpdates || model.isInstallingUpdate)
+                    Divider()
                     Button("Settings…") {
                         model.settingsTab = .general
                         model.isShowingSettings = true

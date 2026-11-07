@@ -34,6 +34,8 @@ A prebuilt ad-hoc signed macOS bundle is included in this repository and on the 
 open build/Suyoi.app
 ```
 
+To update an installed copy of Suyoi, open the `…` menu in the bottom-right corner of the popover (or **Settings → About Suyoi**) and click **Check for Updates…** → **Update & Relaunch**. Suyoi downloads the latest `Suyoi.app.zip` from GitHub Releases, verifies its bundle identifier and code signature, replaces the app bundle, and relaunches automatically.
+
 ### Build from Source
 
 Requirements: **macOS 14.0+** and **Xcode / Swift 6 Command Line Tools**. No third-party packages are required.
@@ -103,7 +105,7 @@ Suyoi/
 │   ├── SuyoiCore/        # Process inspection, tree grouping, quotas, cleanup safety & steering
 │   └── SuyoiApp/         # AppKit status bar controller, SwiftUI popover views & CLI entrypoint
 ├── Tests/
-│   └── SuyoiCoreTests/   # Unit and fixture tests (168 tests across 20 suites)
+│   └── SuyoiCoreTests/   # Unit and fixture tests (173 tests across 21 suites)
 ├── Resources/            # AppIcon.icns & artwork
 ├── scripts/
 │   ├── build-app.sh      # Release bundle & archive builder

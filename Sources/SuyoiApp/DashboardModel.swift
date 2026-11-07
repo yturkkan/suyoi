@@ -76,6 +76,9 @@ final class DashboardModel: ObservableObject {
     @Published var scannedWorkspaceRoots: [URL] = []
     @Published var hoveredRowID: String?
     @Published var actionBanner: ActionBanner?
+    @Published var availableUpdate: AppReleaseInfo?
+    @Published var isCheckingForUpdates = false
+    @Published var isInstallingUpdate = false
 
     private static let providerOrderKey = "suyoi.quotaProviderOrder"
     private static let hiddenProvidersKey = "suyoi.hiddenQuotaProviders"
@@ -89,6 +92,7 @@ final class DashboardModel: ObservableObject {
     private let quotaInspector: any QuotaInspecting
     private let liveQuotaPoller: any LiveQuotaPolling
     private let agentSteerer: any AgentSteering
+    private let appUpdater: any AppUpdating
     private var livePollTask: Task<Void, Never>?
     private var livePollGeneration: UInt64 = 0
     private var cleanupScanTask: Task<Void, Never>?
@@ -98,12 +102,14 @@ final class DashboardModel: ObservableObject {
         actionExecutor: any ActionExecuting = ActionExecutor(),
         quotaInspector: any QuotaInspecting = LocalQuotaInspector(),
         liveQuotaPoller: any LiveQuotaPolling = LiveQuotaPoller(),
-        agentSteerer: any AgentSteering = AgentSteerer()
+        agentSteerer: any AgentSteering = AgentSteerer(),
+        appUpdater: any AppUpdating = AppUpdater()
     ) {
         self.actionExecutor = actionExecutor
         self.quotaInspector = quotaInspector
         self.liveQuotaPoller = liveQuotaPoller
         self.agentSteerer = agentSteerer
+        self.appUpdater = appUpdater
         let home = FileManager.default.homeDirectoryForCurrentUser
         let resolvedRoot: URL
         if let savedRoot = UserDefaults.standard.string(forKey: Self.cleanupRootPathKey),
@@ -741,6 +747,56 @@ final class DashboardModel: ObservableObject {
             } else {
                 let err = report.outcomes.first?.error ?? report.warnings.first ?? "No items could be moved to Trash"
                 showBanner(err, isError: true)
+            }
+        }
+    }
+
+    var currentAppVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.8"
+    }
+
+    func checkForUpdates() {
+        guard !isCheckingForUpdates, !isInstallingUpdate else { return }
+        isCheckingForUpdates = true
+        let updater = appUpdater
+        let currentVersion = currentAppVersion
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try await updater.checkForUpdates(currentVersion: currentVersion)
+                }.value
+                isCheckingForUpdates = false
+                switch result {
+                case .upToDate(let version):
+                    availableUpdate = nil
+                    showBanner("Suyoi v\(version) is up to date")
+                case .updateAvailable(let release):
+                    availableUpdate = release
+                    showBanner("Suyoi v\(release.version) is ready to install")
+                }
+            } catch {
+                isCheckingForUpdates = false
+                showBanner(error.localizedDescription, isError: true)
+            }
+        }
+    }
+
+    func installAvailableUpdate() {
+        guard let release = availableUpdate, !isInstallingUpdate else { return }
+        isInstallingUpdate = true
+        let updater = appUpdater
+        let bundleURL = Bundle.main.bundleURL
+        let pid = getpid()
+        Task {
+            do {
+                let staged = try await Task.detached(priority: .userInitiated) {
+                    try await updater.stageUpdate(release, currentBundleURL: bundleURL)
+                }.value
+                try updater.launchReplacementAndRelaunch(staged, currentPID: pid)
+                NSApplication.shared.terminate(nil)
+            } catch {
+                isInstallingUpdate = false
+                showBanner(error.localizedDescription, isError: true)
             }
         }
     }

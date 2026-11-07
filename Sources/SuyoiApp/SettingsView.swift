@@ -243,7 +243,7 @@ struct SettingsView: View {
                     HStack(spacing: 6) {
                         Text("Suyoi")
                             .font(.system(size: 16, weight: .bold))
-                        Text("v.\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.7")")
+                        Text("v.\(model.currentAppVersion)")
                             .font(.system(size: 10, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 6)
@@ -367,6 +367,34 @@ struct SettingsView: View {
             )
 
             HStack(spacing: 8) {
+                if let release = model.availableUpdate {
+                    Button {
+                        model.installAvailableUpdate()
+                    } label: {
+                        Label(
+                            model.isInstallingUpdate ? "Updating…" : "Update to v\(release.version) & Relaunch",
+                            systemImage: "arrow.down.circle.fill"
+                        )
+                        .font(.system(size: 11, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(model.isInstallingUpdate)
+                } else {
+                    Button {
+                        model.checkForUpdates()
+                    } label: {
+                        Label(
+                            model.isCheckingForUpdates ? "Checking…" : "Check for Updates…",
+                            systemImage: "arrow.triangle.2.circlepath"
+                        )
+                        .font(.system(size: 11, weight: .medium))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(model.isCheckingForUpdates || model.isInstallingUpdate)
+                }
+
                 Button {
                     if let url = URL(string: "https://github.com/yturkkan/suyoi") {
                         NSWorkspace.shared.open(url)
