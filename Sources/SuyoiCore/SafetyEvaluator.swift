@@ -86,10 +86,14 @@ public struct SafetyEvaluator: SafetyEvaluating, Sendable {
         }
         if usage == .unknown { reasons.append("Active usage could not be verified") }
         if usage == .inUse && reasons.isEmpty { reasons.append("Candidate has open files") }
-        var seen = Set<String>()
-        reasons = reasons.filter { seen.insert($0).inserted }
         let verified: Bool
         switch regenerability { case .lockfileVerified, .cacheDirectory: verified = true; case .unverified: verified = false }
+        if reasons.isEmpty, usage == .clear, verified, let expected = candidate.fileIdentity,
+           let blocker = reader.trashDescendantBlocker(at: url, expectedIdentity: expected, homeDirectory: homeDirectory) {
+            reasons.append(blocker)
+        }
+        var seen = Set<String>()
+        reasons = reasons.filter { seen.insert($0).inserted }
         return SafetyAssessment(candidateID: candidate.id, usage: usage, regenerability: regenerability, blockedReasons: reasons,
                                 isReviewableForTrash: reasons.isEmpty && usage == .clear && verified && !candidate.partial && candidate.fileIdentity != nil)
     }

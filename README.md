@@ -14,7 +14,7 @@ Modern software development on macOS often involves running multiple coding agen
 
 **Suyoi** lives in the macOS menu bar and provides a single, low-overhead control plane to:
 
-- **Inspect & steer coding agents** — Detect native and runtime-wrapped (`node`, `bun`, `deno`, `python`) agent processes via `libproc` and bounded `KERN_PROCARGS2` inspection, view active session tasks, focus the host terminal/IDE window, or send follow-up instructions directly via Terminal/iTerm2 TTY or native CLI session continuation.
+- **Inspect & steer coding agents** — Detect native and runtime-wrapped (`node`, `bun`, `deno`, `python`) agent processes via `libproc` and bounded `KERN_PROCARGS2` inspection, view local task metadata, focus the host terminal/IDE window, and send follow-up instructions to verified foreground agents in Terminal or iTerm2.
 - **Group & manage localhost dev servers** — Map listening TCP ports to their owning process trees, git branches, and frameworks (`Next.js`, `Vite`, `SwiftPM`, `Cargo`, `Python`, `Go`) with one-click browser launch, URL copy, and safe process-group termination.
 - **Track 5-hour & 7-day AI quotas** — Combine offline local rolling token counters (`300m` and `10080m` windows) with optional in-memory OAuth quota window checks (`Codex`, `Claude`, `Gemini`, `OpenCode`, `Cursor`), including reset countdowns and customizable provider ordering.
 - **Reclaim build & cache storage safely** — Scan workspace build directories (`node_modules`, `.build`, `.next`, `target`, `dist`, `.turbo`, `__pycache__`) and 50+ developer/AI cache locations, verify live process/open-file/lockfile safety at execution time, and move eligible items to **macOS Trash** (`FileManager.trashItem`) — never `rm -rf`.
@@ -39,7 +39,7 @@ open build/Suyoi.app
 Requirements: **macOS 14.0+** and **Xcode / Swift 6 Command Line Tools**. No third-party packages are required.
 
 ```bash
-# Run the test suite (149 unit & integration tests)
+# Run the test suite
 ./scripts/swift-local.sh test
 
 # Build release binary and package build/Suyoi.app + build/Suyoi.app.zip
@@ -82,11 +82,13 @@ Suyoi is designed around strict fail-closed invariants:
 2. **Process Identity Re-Verification (`ProcessIdentity`)**
    Before sending `SIGTERM` (or an explicit user-requested `SIGKILL`), `ActionExecutor` re-verifies `pid`, `uid`, `startTimeMicroseconds`, and `executable` against the live kernel process table to prevent signaling a reused PID.
 3. **Interactive Shell & Agent Boundaries (`ProcessTree`)**
-   Server process-group traversal never crosses upward into interactive shells (`zsh`, `bash`, `fish`, `sh`) or parent coding agents. Stopping a development server stops the server workers without closing your terminal tab or killing the agent that spawned it.
-4. **Live Pre-Trash Safety Re-Evaluation (`TOCTOU` Protection)**
-   Cleanup scanning records pre- and post-measurement `FileIdentity` (`st_dev`, `st_ino`). Immediately before moving any directory to macOS Trash, Suyoi re-runs live process `cwd`, open-file (`lsof`), git worktree, and lockfile verification so a project started after the initial scan is never trashed.
+   Server grouping respects interactive shells, coding agents, GUI processes, and project boundaries when walking the process tree or merging related listeners on a shared port.
+4. **Live Pre-Trash Safety Re-Evaluation**
+   Suyoi collects fresh evidence for each item, including during a bulk operation. A bounded metadata check blocks directories with protected descendants or an incomplete traversal. The final macOS Trash call is path-based, so a change can still occur between the last check and the move.
 5. **High-Impact Cache Protection (`Manual Trash`)**
    Large model stores and environments (`HuggingFace` model weights, `uv`, `CoreSimulator`, `.venv`, and uncataloged `~/.cache/*` directories) are separated from disposable build caches and excluded from bulk **Trash All Ready** operations.
+6. **Verified Steering Targets**
+   Suyoi checks the selected agent's live identity, controlling TTY, and foreground ownership before sending to Terminal or iTerm2. The foreground group must contain only the selected agent. Native Codex and OpenCode continuation is unavailable in the default app because displayed session metadata cannot establish live process ownership.
 
 For deeper implementation details, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -101,20 +103,21 @@ Suyoi/
 │   ├── SuyoiCore/        # Process inspection, tree grouping, quotas, cleanup safety & steering
 │   └── SuyoiApp/         # AppKit status bar controller, SwiftUI popover views & CLI entrypoint
 ├── Tests/
-│   └── SuyoiCoreTests/   # 149 unit and fixture tests across 18 suites
+│   └── SuyoiCoreTests/   # Unit and fixture tests (168 tests across 20 suites)
 ├── Resources/            # AppIcon.icns & artwork
 ├── scripts/
 │   ├── build-app.sh      # Release bundle & archive builder
 │   └── swift-local.sh    # Toolchain wrapper for Swift Testing
 ├── docs/
 │   └── ARCHITECTURE.md   # System design & safety invariants
+├── LICENSE               # MIT License
 └── THIRD_PARTY_NOTICES.md
 ```
 
 ---
 
-## Acknowledgments & Notices
+## License & Acknowledgments
 
-Suyoi is an independent clean-room implementation. Engineering patterns informed by open-source macOS utilities are documented with full license notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Suyoi is an independent clean-room implementation released under the [MIT License](LICENSE). Engineering patterns informed by open-source macOS utilities are documented with full license notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-© 2026 **Y. Türkkan** ([@yturkkan](https://github.com/yturkkan)). All rights reserved.
+MIT License · © 2026 **Y. Türkkan** ([@yturkkan](https://github.com/yturkkan))

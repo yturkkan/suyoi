@@ -24,7 +24,19 @@ public protocol SafetyEvaluating: Sendable {
 public protocol ActionExecuting: Sendable {
     func stopProcess(identity: ProcessIdentity, force: Bool, uid: Int) -> ProcessExecutionReport
     func stopServerGroup(group: ServerGroup, processes: [ObservedProcess], force: Bool, uid: Int) -> ProcessExecutionReport
-    func moveCandidatesToTrash(candidates: [CleanupCandidate], assessments: [String: SafetyAssessment]) -> TrashExecutionReport
+    /// Collect live evidence when called for each candidate. Return nil if it cannot be assessed.
+    func moveCandidatesToTrash(candidates: [CleanupCandidate],
+                               freshAssessment: @Sendable (CleanupCandidate) -> SafetyAssessment?) -> TrashExecutionReport
+}
+
+public extension ActionExecuting {
+    /// Kept for existing callers. A precomputed assessment cannot authorize a Trash operation.
+    func moveCandidatesToTrash(candidates: [CleanupCandidate], assessments _: [String: SafetyAssessment]) -> TrashExecutionReport {
+        TrashExecutionReport(outcomes: candidates.map {
+            TrashItemOutcome(candidateID: $0.id, path: $0.path, bytes: 0, succeeded: false,
+                             error: "Trash requires a live safety assessment for each candidate")
+        })
+    }
 }
 
 /// Explicit user action only. Revalidate current-user process and target identity

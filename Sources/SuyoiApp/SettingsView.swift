@@ -243,7 +243,7 @@ struct SettingsView: View {
                     HStack(spacing: 6) {
                         Text("Suyoi")
                             .font(.system(size: 16, weight: .bold))
-                        Text("v.\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.6")")
+                        Text("v.\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.7")")
                             .font(.system(size: 10, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 6)

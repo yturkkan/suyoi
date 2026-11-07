@@ -95,7 +95,8 @@ public struct ActionExecutor: ActionExecuting, Sendable {
         return ProcessExecutionReport(outcomes: outcomes, warnings: warnings)
     }
 
-    public func moveCandidatesToTrash(candidates: [CleanupCandidate], assessments: [String: SafetyAssessment]) -> TrashExecutionReport {
+    public func moveCandidatesToTrash(candidates: [CleanupCandidate],
+                                      freshAssessment: @Sendable (CleanupCandidate) -> SafetyAssessment?) -> TrashExecutionReport {
         // Choose ancestors first regardless of input order; never count or execute descendants twice.
         let ordered = candidates.enumerated().sorted {
             let a = URL(fileURLWithPath: $0.element.path).standardizedFileURL.pathComponents.count
@@ -105,6 +106,7 @@ public struct ActionExecutor: ActionExecuting, Sendable {
         var selectedPaths: [String] = []
         var outcomes: [TrashItemOutcome] = []
         var reclaimedBytes: Int64 = 0
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.resolvingSymlinksInPath()
         for item in ordered {
             let candidate = item.element
             let url = URL(fileURLWithPath: candidate.path).standardizedFileURL
@@ -116,10 +118,22 @@ public struct ActionExecutor: ActionExecuting, Sendable {
                 continue
             }
             selectedPaths.append(url.path)
-            guard !candidate.partial, let expectedIdentity = candidate.fileIdentity,
-                  let assessment = assessments[candidate.id], assessment.candidateID == candidate.id,
-                  assessment.isReviewableForTrash, assessment.blockedReasons.isEmpty, assessment.usage == .clear else {
-                outcomes.append(failed("Candidate is partial, unidentified, or not approved by a safety assessment"))
+            guard !candidate.partial, let expectedIdentity = candidate.fileIdentity else {
+                outcomes.append(failed("Candidate is partial or unidentified"))
+                continue
+            }
+            guard candidate.path.hasPrefix("/"), url.path != "/", candidate.scope != .worktree,
+                  !AgentCacheCatalog.isForbiddenPath(url, homeDirectory: URL(fileURLWithPath: "/")),
+                  Self.hasNoSymlinkComponents(url) else {
+                outcomes.append(failed("Candidate path is unsafe or contains a symlink"))
+                continue
+            }
+            guard let assessment = freshAssessment(candidate), assessment.candidateID == candidate.id else {
+                outcomes.append(failed("Live safety assessment is unavailable for this candidate"))
+                continue
+            }
+            guard assessment.isReviewableForTrash, assessment.blockedReasons.isEmpty, assessment.usage == .clear else {
+                outcomes.append(failed(assessment.blockedReasons.first ?? "Candidate failed the live safety assessment"))
                 continue
             }
             switch assessment.regenerability {
@@ -128,9 +142,7 @@ public struct ActionExecutor: ActionExecuting, Sendable {
                 continue
             case .cacheDirectory, .lockfileVerified: break
             }
-            guard candidate.path.hasPrefix("/"), url.path != "/", candidate.scope != .worktree,
-                  !AgentCacheCatalog.isForbiddenPath(url, homeDirectory: URL(fileURLWithPath: "/")),
-                  Self.hasNoSymlinkComponents(url), identityReader(url) == expectedIdentity,
+            guard Self.hasNoSymlinkComponents(url), identityReader(url) == expectedIdentity,
                   Self.hasNoSymlinkComponents(url) else {
                 outcomes.append(failed("Candidate path is unsafe, contains a symlink, or file identity changed"))
                 continue
@@ -140,6 +152,11 @@ public struct ActionExecutor: ActionExecuting, Sendable {
                     outcomes.append(failed("Project manifest or lockfile changed since the safety assessment"))
                     continue
                 }
+            }
+            let policyRoot = url.path.hasPrefix(home.path + "/") ? home : URL(fileURLWithPath: "/")
+            if let blocker = FileMetadataReader().trashDescendantBlocker(at: url, expectedIdentity: expectedIdentity, homeDirectory: policyRoot) {
+                outcomes.append(failed(blocker))
+                continue
             }
             do {
                 let trashed = try trashHandler(url)

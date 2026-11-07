@@ -711,18 +711,17 @@ final class DashboardModel: ObservableObject {
     }
 
     func trashCandidate(_ candidate: CleanupCandidate) {
-        guard let assessments = cleanup?.assessments else { return }
-        trashItems([candidate], assessments: assessments)
+        guard cleanup != nil else { return }
+        trashItems([candidate])
     }
 
     func trashAllReviewable() {
-        guard let assessments = cleanup?.assessments else { return }
         let eligible = reviewableCleanupCandidates
         guard !eligible.isEmpty else { return }
-        trashItems(eligible, assessments: assessments)
+        trashItems(eligible)
     }
 
-    private func trashItems(_ candidates: [CleanupCandidate], assessments: [String: SafetyAssessment]) {
+    private func trashItems(_ candidates: [CleanupCandidate]) {
         guard !isPerformingAction else { return }
         isPerformingAction = true
         let executor = actionExecutor
@@ -730,8 +729,9 @@ final class DashboardModel: ObservableObject {
         Task {
             let report = await Task.detached(priority: .userInitiated) {
                 let service = InventoryService(safetyEvaluator: SafetyEvaluator(), worktreeInspector: WorktreeInspector())
-                let freshAssessments = service.reassessCandidatesForTrash(candidates, homeDirectory: home)
-                return executor.moveCandidatesToTrash(candidates: candidates, assessments: freshAssessments)
+                return executor.moveCandidatesToTrash(candidates: candidates) {
+                    service.assessCandidateForTrash($0, homeDirectory: home)
+                }
             }.value
             isPerformingAction = false
             if report.trashedCount > 0 {

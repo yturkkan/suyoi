@@ -227,6 +227,74 @@ struct SafetyEvaluatorTests {
         #expect(SafetyEvaluator(homeDirectory: fixture.root).assess(candidate: candidate, processes: safetyObservation([]), worktrees: safetyObservation([])).usage == .clear)
     }
 
+    @Test(arguments: [CleanupScope.agentCache, .projectArtifact])
+    func newlyProtectedDescendantInvalidatesAssessmentAndBlocksStaleApproval(_ scope: CleanupScope) throws {
+        let fixture = try SafetyFixture(); defer { fixture.remove() }
+        let relative = scope == .agentCache ? ".cache/opencode" : "app/dist"
+        let candidate = try fixture.candidate(relative, scope: scope)
+        let evaluator = SafetyEvaluator(homeDirectory: fixture.root, openFileCheck: { _ in .clear })
+        let report = ActionExecutor(trashHandler: { _ in
+            Issue.record("A stale approval reached the Trash handler")
+            return nil
+        }).moveCandidatesToTrash(candidates: [candidate]) { candidate in
+            let approved = evaluator.assess(candidate: candidate, processes: safetyObservation([]), worktrees: safetyObservation([]))
+            #expect(approved.isReviewableForTrash)
+            do {
+                _ = try fixture.directory(relative + "/nested")
+                try fixture.file(relative + "/nested/.env")
+            } catch {
+                Issue.record(error)
+            }
+            return approved
+        }
+        #expect(FileMetadataReader().identity(at: URL(fileURLWithPath: candidate.path)) == candidate.fileIdentity)
+        let fresh = evaluator.assess(candidate: candidate, processes: safetyObservation([]), worktrees: safetyObservation([]))
+        #expect(!fresh.isReviewableForTrash)
+        #expect(report.trashedCount == 0)
+    }
+
+    @Test func safeCacheMayContainSymlinksWithoutInspectingTheirTargets() throws {
+        let fixture = try SafetyFixture(); defer { fixture.remove() }
+        let candidate = try fixture.candidate(".cache/opencode", scope: .agentCache)
+        _ = try fixture.directory(".cache/opencode/nested")
+        try fixture.file(".cache/opencode/nested/index")
+        let external = try fixture.directory("external")
+        try fixture.file("external/.env")
+        try FileManager.default.createSymbolicLink(at: fixture.root.appendingPathComponent(".cache/opencode/linked"),
+                                                   withDestinationURL: external)
+
+        let evaluator = SafetyEvaluator(homeDirectory: fixture.root)
+        let report = ActionExecutor(trashHandler: { $0 })
+            .moveCandidatesToTrash(candidates: [candidate]) { candidate in
+                let approved = evaluator.assess(candidate: candidate, processes: safetyObservation([]), worktrees: safetyObservation([]))
+                #expect(approved.isReviewableForTrash)
+                return approved
+            }
+        #expect(report.trashedCount == 1)
+    }
+
+    @Test func depthBudgetExhaustionBlocksTrash() throws {
+        let fixture = try SafetyFixture(); defer { fixture.remove() }
+        let candidate = try fixture.candidate(".cache/opencode", scope: .agentCache)
+        let evaluator = SafetyEvaluator(homeDirectory: fixture.root)
+        let report = ActionExecutor(trashHandler: { _ in
+            Issue.record("An incompletely inspected directory reached the Trash handler")
+            return nil
+        }).moveCandidatesToTrash(candidates: [candidate]) { candidate in
+            let approved = evaluator.assess(candidate: candidate, processes: safetyObservation([]), worktrees: safetyObservation([]))
+            #expect(approved.isReviewableForTrash)
+            do {
+                _ = try fixture.directory(".cache/opencode/" + Array(repeating: "deep", count: 70).joined(separator: "/"))
+            } catch {
+                Issue.record(error)
+            }
+            return approved
+        }
+        let fresh = evaluator.assess(candidate: candidate, processes: safetyObservation([]), worktrees: safetyObservation([]))
+        #expect(!fresh.isReviewableForTrash)
+        #expect(report.trashedCount == 0)
+    }
+
     @Test func worktreeEvidenceIsPropagated() throws {
         let fixture = try SafetyFixture(); defer { fixture.remove() }
         let candidate = try fixture.candidate("app/.vite")

@@ -31,7 +31,7 @@ Agent activity state (`active`, `waiting`, `idle`, `stopped`) is derived from ve
 ### Server Tree Grouping (`ProcessTree`)
 Listening TCP sockets collected via `lsof -nP -iTCP -sTCP:LISTEN` are grouped by walking parent-child relationships in `ProcessTree`:
 - Multi-worker servers and reloader hierarchies are consolidated into a single `ServerGroup` with deduplicated memory and CPU totals.
-- Upward traversal halts at **interactive shells** (`zsh`, `bash`, `fish`, `sh`, `tcsh`, `ksh`, `login`), **coding agents**, **GUI bundles**, and **project boundaries**, ensuring that stopping a server group never terminates the user's interactive terminal session or parent agent.
+- Upward traversal halts at **interactive shells** (`zsh`, `bash`, `fish`, `sh`, `tcsh`, `ksh`, `login`), **coding agents**, **GUI bundles**, and **project boundaries**. A shared-port merge between separate groups requires an ancestor path that respects those boundaries, even when both groups belong to the same project.
 - Each `ServerGroup` records immutable `memberIdentities` (`[ProcessIdentity]`) at capture time.
 
 ---
@@ -71,7 +71,14 @@ A candidate is marked reviewable for Trash only when all safety checks pass:
 - **Verified regenerability:** Project dependency directories (`node_modules`) require both a manifest (`package.json`) and a lockfile (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, or `bun.lockb`) on disk.
 - **High-impact isolation:** Model weight stores (`HuggingFace`), virtual environments (`.venv`/`venv`), `uv`, `CoreSimulator`, and unknown `~/.cache/*` directories are classified as `Manual Trash` and excluded from bulk **Trash All Ready** actions.
 
-### Execution-Time Re-Verification (`ActionExecutor` & `AgentSteerer`)
-- **Pre-Trash Live Reassessment (`reassessCandidatesForTrash`):** Immediately prior to calling `FileManager.default.trashItem`, Suyoi re-evaluates live processes, open files, worktrees, lockfiles, non-symlink ancestry, and `FileIdentity(device, inode)`. Permanent deletion (`removeItem` / `rm -rf`) is never used.
-- **Process Signaling (`stopProcess` / `stopServerGroup`):** Re-verifies `ProcessIdentity` (`pid`, `uid`, `startTimeMicroseconds`, `executable`) and `ServerGroup.memberIdentities` immediately before sending `SIGTERM` (or explicit `SIGKILL`).
-- **Agent Steering (`AgentSteerer`):** Re-verifies `ProcessIdentity` and target TTY/session ownership before delivering user-submitted prompts via parameterized AppleScript (`osascript` argv) or native CLI continuation (`opencode run --session`, `codex exec resume`).
+### Execution-Time Re-Verification (`ActionExecutor`)
+
+- **Pre-Trash live reassessment.** The executor requests a fresh `assessCandidateForTrash` result for each item in order. The assessment checks live process and listener evidence, open files, worktrees where applicable, and regenerability. The executor then verifies the path, device and inode, applicable lockfile, and descendant safety before calling `FileManager.default.trashItem`. A batch preview alone cannot authorize the move.
+- **Protected descendants.** A bounded metadata-only walk checks the names of descendant files and directories against the protected-path policy. It never follows child symlinks. Each walk has a two-second deadline and entry and depth limits. Trash can perform a walk during live assessment and again after the executor's other checks. Large trees, unreadable entries, and changes detected during the walk can prevent verification and block Trash. A final race remains because macOS Trash accepts a path.
+- **Process signaling.** `stopProcess` and `stopServerGroup` re-verify `ProcessIdentity` (`pid`, `uid`, `startTimeMicroseconds`, `executable`) before sending `SIGTERM` or an explicitly requested `SIGKILL`.
+
+## 5. Agent Steering (`AgentSteerer`)
+
+- **Terminal and iTerm2.** After rechecking process identity and the controlling TTY, Suyoi requires the selected agent to be the sole member and leader of the terminal's live foreground process group. A foreground helper can make the target unavailable. The fixed AppleScript receives the TTY and prompt as separate arguments and checks for a unique matching tab or session. The process can still change between the final kernel check and the Apple Event.
+- **Native CLI.** Codex and OpenCode continuation requires independent, live proof that the selected process owns the requested session. A displayed session ID, a recent record, a shared working directory, or the absence of peers cannot authorize steering. The default app supplies no authoritative verifier, so native continuation is unavailable there.
+- **Native process lifetime.** With verified ownership, `NativeAgentJobLauncher` starts the local process with null standard streams and returns after spawn. The launcher keeps the process handle until exit and imposes no command timeout. Success describes the local launch only.

@@ -7,26 +7,13 @@ DerivedData/
 *.xcuserstate
 .DS_Store
 
-# Keep only the packaged app bundle & zip in build/
+# Keep only the packaged app bundle & archive in build/
 build/*
 !build/Suyoi.app
 !build/Suyoi.app/**
 !build/Suyoi.app.zip
 
-# Local agent instructions & internal notes
-AGENTS.md
-CLAUDE.md
-.claude/
-.codex/
-.gemini/
-.opencode/
-docs/COLLABORATION.md
-docs/IMPLEMENTATION.md
-docs/PROJECT_BRIEF.md
-docs/REFERENCES.md
-docs/VERIFICATION.md
-
-# Secrets, credentials, environment & local logs
+# Local environment & logs
 .env
 .env.*
 *.pem
@@ -34,8 +21,6 @@ docs/VERIFICATION.md
 *.p12
 *.cer
 *.mobileprovision
-*.credentials.json
-auth.json
 *.log
 *.sqlite
 *.sqlite3

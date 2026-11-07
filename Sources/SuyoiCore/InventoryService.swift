@@ -140,20 +140,50 @@ public struct InventoryService: Sendable {
             discoveredCount: discoveredCount)
     }
 
-    /// Obtain fresh usage evidence immediately before a user-authorized Trash action.
+    /// Read-only preview. Trash execution requires a separate assessment for each candidate.
     public func reassessCandidatesForTrash(_ candidates: [CleanupCandidate], homeDirectory: URL? = nil) -> [String: SafetyAssessment] {
         let processes = processInspector.inspectProcesses(uid: Int(getuid()))
         let listeners = listenerInspector.inspectListeners(uid: Int(getuid()))
-        let roots = Self.uniqueRoots(candidates.filter { $0.scope != .agentCache }.map { candidate in
-            let url = URL(fileURLWithPath: candidate.path)
-            if candidate.scope == .worktree { return url }
-            return projectResolver.resolveProject(at: url.deletingLastPathComponent()).value.map {
-                URL(fileURLWithPath: $0.rootPath)
-            } ?? url.deletingLastPathComponent()
-        })
+        let roots = Self.uniqueRoots(candidates.filter { $0.scope != .agentCache }.map(trashWorktreeRoot(for:)))
         let worktrees = inspectWorktrees(roots: roots, processes: processes)
         return liveSafetyEvaluator(homeDirectory: homeDirectory).evaluate(
             candidates: candidates, processes: processes, listeners: listeners, worktrees: worktrees)
+    }
+
+    /// Collect current evidence for one candidate during execution.
+    public func assessCandidateForTrash(_ candidate: CleanupCandidate, homeDirectory: URL? = nil) -> SafetyAssessment {
+        func incomplete(_ reason: String) -> SafetyAssessment {
+            SafetyAssessment(candidateID: candidate.id, usage: .unknown,
+                             regenerability: .unverified("Live safety evidence is incomplete"),
+                             blockedReasons: [reason], isReviewableForTrash: false)
+        }
+        let uid = Int(getuid())
+        let processes = processInspector.inspectProcesses(uid: uid)
+        guard processes.status == .complete else {
+            return incomplete("Process inventory could not be fully verified")
+        }
+        let listeners = listenerInspector.inspectListeners(uid: uid)
+        guard listeners.status == .complete else {
+            return incomplete("Listener inventory could not be fully verified")
+        }
+        let worktrees: Observation<[WorktreeRecord]>
+        if candidate.scope == .agentCache {
+            worktrees = Observation(value: [], status: .complete, warnings: [], capturedAt: Date())
+        } else {
+            worktrees = inspectWorktrees(roots: [trashWorktreeRoot(for: candidate)], processes: processes)
+            guard worktrees.status == .complete else {
+                return incomplete("Worktree inventory could not be fully verified")
+            }
+        }
+        return liveSafetyEvaluator(homeDirectory: homeDirectory).assess(
+            candidate: candidate, processes: processes, worktrees: worktrees)
+    }
+
+    private func trashWorktreeRoot(for candidate: CleanupCandidate) -> URL {
+        let url = URL(fileURLWithPath: candidate.path)
+        if candidate.scope == .worktree { return url }
+        let parent = url.deletingLastPathComponent()
+        return projectResolver.resolveProject(at: parent).value.map { URL(fileURLWithPath: $0.rootPath) } ?? parent
     }
 
     private func liveSafetyEvaluator(homeDirectory: URL?) -> any SafetyEvaluating {

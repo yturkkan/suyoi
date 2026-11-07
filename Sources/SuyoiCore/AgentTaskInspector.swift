@@ -3,6 +3,7 @@ import Darwin
 import SQLite3
 
 public struct AgentTaskContext: Equatable, Sendable {
+    /// Session metadata selected for display. It carries no proof of live process ownership.
     public let sessionID: String?
     public let sessionTitle: String?
     public let currentTask: String?
@@ -59,8 +60,8 @@ public struct AgentTaskInspector: Sendable {
         case "Codex": context = codex(directory: specificDir, running: running)
         default: context = AgentTaskContext(currentTask: running)
         }
-        // Generic-directory metadata remains visible, but cannot select a session
-        // for steering while another process of this provider could own it.
+        // Keep generic-directory labels visible while omitting the ambiguous
+        // identifier when another live process of this provider could own it.
         let hasProviderPeer = allProcesses.contains {
             $0.pid != process.pid && $0.uid == process.uid && !$0.isStopped &&
             AgentRecognizer.agentName(for: $0) == agentName

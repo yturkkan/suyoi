@@ -27,6 +27,100 @@ public struct FileMetadataReader: Sendable {
         return current
     }
 
+    /// Returns nil only after a complete metadata check of the directory about to be trashed.
+    func trashDescendantBlocker(at directory: URL, expectedIdentity: FileIdentity, homeDirectory: URL) -> String? {
+        let entryLimit = 250_000
+        let depthLimit = 64
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        let incomplete = "Candidate contents could not be fully checked for sensitive paths"
+        let directoryFlags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW_ANY
+        var entries = 0
+
+        func openRoot() -> Int32 {
+            let path = directory.path
+            let descriptor = open(path, directoryFlags)
+            // Foundation preserves these macOS aliases in otherwise canonical URLs.
+            // Validate the literal link, then open its physical path without following links.
+            guard descriptor < 0, errno == ELOOP,
+                  let alias = ["/var", "/tmp", "/etc"].first(where: { path.hasPrefix($0 + "/") }),
+                  let target = try? FileManager.default.destinationOfSymbolicLink(atPath: alias),
+                  target == "private" + alias || target == "/private" + alias else { return descriptor }
+            return open("/private" + path, directoryFlags)
+        }
+
+        func unchanged(_ before: stat, _ after: stat) -> Bool {
+            before.st_dev == after.st_dev && before.st_ino == after.st_ino
+                && before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec
+                && before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec
+                && before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec
+                && before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec
+        }
+
+        // Each child is checked relative to an already-open directory. Only real
+        // directories are opened; symlink entries are checked by name alone.
+        func inspect(_ descriptor: Int32, path: URL, before: stat, depth: Int) -> String? {
+            guard let stream = fdopendir(descriptor) else {
+                close(descriptor)
+                return incomplete
+            }
+            defer { closedir(stream) }
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                errno = 0
+                guard let entry = readdir(stream) else {
+                    var after = stat()
+                    return errno == 0 && fstat(descriptor, &after) == 0 && unchanged(before, after) ? nil : incomplete
+                }
+                let name = withUnsafeBytes(of: &entry.pointee.d_name) { bytes in
+                    bytes.baseAddress.flatMap { String(validatingUTF8: $0.assumingMemoryBound(to: CChar.self)) }
+                }
+                guard let name else { return incomplete }
+                if name == "." || name == ".." { continue }
+                guard entries < entryLimit else { return incomplete }
+                entries += 1
+                let childPath = path.appendingPathComponent(name, isDirectory: false)
+                if AgentCacheCatalog.isForbiddenPath(childPath, homeDirectory: homeDirectory) {
+                    return "Candidate contains a forbidden or sensitive path"
+                }
+                var child = stat()
+                guard fstatat(descriptor, name, &child, AT_SYMLINK_NOFOLLOW) == 0,
+                      child.st_dev == before.st_dev, child.st_ino == entry.pointee.d_ino else { return incomplete }
+                if (child.st_mode & S_IFMT) != S_IFDIR { continue }
+                guard depth < depthLimit else { return incomplete }
+                let childDescriptor = openat(descriptor, name, directoryFlags)
+                guard childDescriptor >= 0 else { return incomplete }
+                var opened = stat()
+                guard fstat(childDescriptor, &opened) == 0, unchanged(child, opened) else {
+                    close(childDescriptor)
+                    return incomplete
+                }
+                if let blocker = inspect(childDescriptor, path: childPath, before: opened, depth: depth + 1) {
+                    return blocker
+                }
+            }
+            return incomplete
+        }
+
+        let descriptor = openRoot()
+        guard descriptor >= 0 else { return incomplete }
+        var before = stat()
+        guard fstat(descriptor, &before) == 0,
+              FileIdentity(device: before.st_dev, inode: UInt64(before.st_ino)) == expectedIdentity else {
+            close(descriptor)
+            return incomplete
+        }
+        if let blocker = inspect(descriptor, path: directory, before: before, depth: 0) { return blocker }
+
+        // The final Trash call still uses a path. Check that it resolves to the
+        // inspected root without symlinks after walking its contents.
+        let finalDescriptor = openRoot()
+        guard finalDescriptor >= 0 else { return incomplete }
+        defer { close(finalDescriptor) }
+        var after = stat()
+        guard fstat(finalDescriptor, &after) == 0, unchanged(before, after),
+              ProcessInfo.processInfo.systemUptime < deadline else { return incomplete }
+        return nil
+    }
+
     struct Measurement {
         var bytes: Int64 = 0
         var allocatedBytes: Int64 = 0

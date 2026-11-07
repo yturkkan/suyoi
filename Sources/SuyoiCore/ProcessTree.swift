@@ -66,6 +66,10 @@ public struct ProcessTree: Sendable {
             var listeners: [Listener]
             var boundary: Bool
         }
+        func isBoundary(_ process: ObservedProcess) -> Bool {
+            agentBoundary(process) || Self.isShell(process.name) || Self.isGUI(process)
+        }
+
         var candidates: [Candidate] = []
         for listener in listeners {
             var root = listener.pid
@@ -75,7 +79,9 @@ public struct ProcessTree: Sendable {
             for _ in 0..<64 {
                 guard let child = processesByPID[root], let parent = processesByPID[child.parentPID], child.uid == parent.uid else { break }
                 if agentBoundary(parent) { boundary = true; break }
-                guard !Self.isGUI(parent), !visited.contains(parent.pid), Self.isRunner(parent.name) else { break }
+                // A protected process that owns a listener stays in its own group.
+                guard !isBoundary(child), !Self.isGUI(parent), !visited.contains(parent.pid),
+                      Self.isRunner(parent.name) else { break }
                 let siblings = childrenByParent[parent.pid] ?? []
                 // Shells remain user launch contexts even with a single child.
                 if Self.isShell(parent.name) { break }
@@ -89,20 +95,17 @@ public struct ProcessTree: Sendable {
             }
             candidates.append(Candidate(root: root, members: members, listeners: [listener], boundary: boundary))
         }
-        func projectRoot(_ pid: Int) -> String? {
-            guard let cwd = processesByPID[pid]?.cwd, cwd != "/" else { return nil }
-            return projectsByPath[cwd]?.rootPath
-        }
         func safelyRelated(_ descendant: Int, _ ancestor: Int) -> Bool {
-            guard let pathEnd = ancestors(of: descendant).firstIndex(of: ancestor) else { return false }
-            let path = [descendant] + Array(ancestors(of: descendant).prefix(pathEnd + 1))
+            let lineage = ancestors(of: descendant)
+            guard let pathEnd = lineage.firstIndex(of: ancestor) else { return false }
+            let path = [descendant] + Array(lineage.prefix(through: pathEnd))
             let projects = Set(path.compactMap { pid -> String? in
                 guard let cwd = processesByPID[pid]?.cwd, cwd != "/" else { return nil }
                 return projectsByPath[cwd]?.rootPath ?? cwd
             })
             return projects.count <= 1 && path.allSatisfy { pid in
                 guard let process = processesByPID[pid] else { return false }
-                return !agentBoundary(process) && !Self.isShell(process.name) && !Self.isGUI(process)
+                return !isBoundary(process)
             }
         }
         // A fixed-point merge handles chains of reloader/shared-port relationships.
@@ -113,15 +116,10 @@ public struct ProcessTree: Sendable {
                 for j in candidates.indices where j > i {
                     let a = candidates[i], b = candidates[j]
                     let sharedPort = !Set(a.listeners.map(\.port)).isDisjoint(with: b.listeners.map(\.port))
-                    let related = !a.members.isDisjoint(with: b.members)
-                        || a.members.contains(where: { m in b.members.contains(where: { ancestors(of: m).contains($0) }) })
-                        || b.members.contains(where: { m in a.members.contains(where: { ancestors(of: m).contains($0) }) })
-                    let sameProject = projectRoot(a.root) != nil && projectRoot(a.root) == projectRoot(b.root)
-                    let safeConnection = a.members.contains { m in
-                        b.members.contains { safelyRelated(m, $0) || safelyRelated($0, m) }
+                    let safeConnection = sharedPort && a.members.contains { member in
+                        b.members.contains { safelyRelated(member, $0) || safelyRelated($0, member) }
                     }
-                    guard a.root == b.root || !a.members.isDisjoint(with: b.members)
-                        || (sharedPort && related && (sameProject || safeConnection)) else { continue }
+                    guard !a.members.isDisjoint(with: b.members) || safeConnection else { continue }
                     let root = ancestors(of: a.root).contains(b.root) ? b.root : a.root
                     candidates[i] = Candidate(root: root, members: a.members.union(b.members), listeners: a.listeners + b.listeners, boundary: a.boundary || b.boundary)
                     candidates.remove(at: j)
@@ -143,7 +141,7 @@ public struct ProcessTree: Sendable {
                 let (pid, depth) = queue[offset]; offset += 1
                 guard depth <= 64, seen.insert(pid).inserted else { continue }
                 if let process = processesByPID[pid] {
-                    guard !agentBoundary(process), !Self.isShell(process.name), !Self.isGUI(process),
+                    guard !isBoundary(process),
                           process.uid == processesByPID[item.root]?.uid,
                           process.cwd == nil || cwd == nil || process.cwd == cwd else { continue }
                     members.insert(pid)

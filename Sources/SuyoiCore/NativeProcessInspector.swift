@@ -31,9 +31,14 @@ struct DarwinProcessReader: NativeProcessReading {
         guard written > 0 else { return nil }
         return Array(pids.prefix(Int(written))).filter { $0 > 0 }
     }
-    func readProcess(pid: Int32, uid: Int) -> ProcessReadOutcome {
+    static func bsdInfo(pid: Int32) -> proc_bsdinfo? {
         var bsd = proc_bsdinfo()
-        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, Int32(MemoryLayout.size(ofValue: bsd))) == MemoryLayout<proc_bsdinfo>.size else {
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, size) == size else { return nil }
+        return bsd
+    }
+    func readProcess(pid: Int32, uid: Int) -> ProcessReadOutcome {
+        guard let bsd = Self.bsdInfo(pid: pid) else {
             return errno == EPERM ? .otherUser : .unreadable
         }
         guard Int(bsd.pbi_uid) == uid else { return .otherUser }
@@ -41,9 +46,7 @@ struct DarwinProcessReader: NativeProcessReading {
         return .matched(row)
     }
     func process(pid: Int32, uid: Int) -> ObservedProcess? {
-        var bsd = proc_bsdinfo()
-        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, Int32(MemoryLayout.size(ofValue: bsd))) == MemoryLayout<proc_bsdinfo>.size,
-              Int(bsd.pbi_uid) == uid else { return nil }
+        guard var bsd = Self.bsdInfo(pid: pid), Int(bsd.pbi_uid) == uid else { return nil }
         let name = withUnsafePointer(to: &bsd.pbi_comm) { $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) { String(cString: $0) } }
         var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
         let pathSize = proc_pidpath(pid, &path, UInt32(path.count))

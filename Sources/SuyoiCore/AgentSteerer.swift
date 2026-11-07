@@ -7,12 +7,41 @@ public struct AgentSteerer: AgentSteering, Sendable {
     private let runner: any CommandRunning
     private let executableResolver: (@Sendable (String) -> String?)?
     private let homeDirectory: URL
+    private let verifySessionOwnership: (@Sendable (ProcessIdentity, AgentSteerMode, String) -> Bool)?
+    private let nativeJobLauncher: any NativeAgentJobLaunching
+    private let terminalForegroundVerifier: TerminalForegroundVerifier
 
-    public init(processLookup: (@Sendable (Int32, Int) -> ObservedProcess?)? = nil, runner: any CommandRunning = CommandRunner(), executableResolver: (@Sendable (String) -> String?)? = nil, homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) {
+    /// The optional verifier must independently confirm the live process owns the requested provider session.
+    /// Without a verifier, native session steering is unavailable.
+    public init(
+        processLookup: (@Sendable (Int32, Int) -> ObservedProcess?)? = nil,
+        runner: any CommandRunning = CommandRunner(),
+        executableResolver: (@Sendable (String) -> String?)? = nil,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        verifySessionOwnership: (@Sendable (ProcessIdentity, AgentSteerMode, String) -> Bool)? = nil,
+        nativeJobLauncher: any NativeAgentJobLaunching = NativeAgentJobLauncher()
+    ) {
+        self.init(processLookup: processLookup, runner: runner, executableResolver: executableResolver,
+                  homeDirectory: homeDirectory, verifySessionOwnership: verifySessionOwnership,
+                  nativeJobLauncher: nativeJobLauncher, terminalForegroundVerifier: TerminalForegroundVerifier())
+    }
+
+    init(
+        processLookup: (@Sendable (Int32, Int) -> ObservedProcess?)? = nil,
+        runner: any CommandRunning = CommandRunner(),
+        executableResolver: (@Sendable (String) -> String?)? = nil,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        verifySessionOwnership: (@Sendable (ProcessIdentity, AgentSteerMode, String) -> Bool)? = nil,
+        nativeJobLauncher: any NativeAgentJobLaunching = NativeAgentJobLauncher(),
+        terminalForegroundVerifier: TerminalForegroundVerifier
+    ) {
         self.processLookup = processLookup ?? { DarwinProcessReader().process(pid: $0, uid: $1) }
         self.runner = runner
         self.executableResolver = executableResolver
         self.homeDirectory = homeDirectory
+        self.verifySessionOwnership = verifySessionOwnership
+        self.nativeJobLauncher = nativeJobLauncher
+        self.terminalForegroundVerifier = terminalForegroundVerifier
     }
 
     public static func isValidSessionID(_ value: String) -> Bool { AgentContextValidation.sessionID(value) != nil }
@@ -22,23 +51,29 @@ public struct AgentSteerer: AgentSteering, Sendable {
         return name.utf8.allSatisfy { (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) }
     }
 
+    /// Availability for the default UI. Native steering requires live ownership proof beyond observation metadata.
     public static func preferredMode(for agent: AgentObservation) -> AgentSteerMode? {
         guard agent.process.identity.isActionEligible else { return nil }
         if let tty = agent.process.tty, isValidTTY(tty), ["Terminal", "iTerm2"].contains(agent.terminalApp) { return .terminalTTY }
-        if agent.agentName == "OpenCode", let sid = agent.sessionID, isValidSessionID(sid) { return .openCodeSession }
-        if agent.agentName == "Codex", let sid = agent.sessionID, isValidSessionID(sid) { return .codexResume }
         return nil
     }
     public static func canSteer(_ agent: AgentObservation) -> Bool { preferredMode(for: agent) != nil }
 
     public func steer(agent: AgentObservation, prompt: String, uid: Int = Int(getuid())) -> AgentSteerOutcome {
-        let selected = Self.preferredMode(for: agent)
+        let terminalMode = Self.preferredMode(for: agent)
+        let nativeMode: AgentSteerMode? = switch agent.agentName {
+        case "OpenCode": .openCodeSession
+        case "Codex": .codexResume
+        default: nil
+        }
         // The contract requires a mode even for a rejected, unsupported target.
-        let mode = selected ?? (agent.agentName == "OpenCode" ? .openCodeSession : .codexResume)
+        let mode = terminalMode ?? nativeMode ?? .codexResume
         func failure(_ error: String) -> AgentSteerOutcome {
             AgentSteerOutcome(agentID: agent.id, mode: mode, succeeded: false, error: error)
         }
-        guard selected != nil else { return failure("No verified steering target is available") }
+        guard terminalMode != nil || (nativeMode != nil && verifySessionOwnership != nil) else {
+            return failure("No verified steering target is available")
+        }
         let clean = String(prompt.unicodeScalars.filter { $0 == "\t" || !CharacterSet.controlCharacters.contains($0) })
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, clean.count <= 2000 else { return failure("Instruction must contain 1 to 2000 characters") }
@@ -48,8 +83,6 @@ public struct AgentSteerer: AgentSteering, Sendable {
         guard let live = processLookup(pid, uid), live.identity == identity, !live.isStopped else {
             return failure("Process identity changed, is stopped or process already exited")
         }
-        let request: CommandRequest
-        let detail: String
         switch mode {
         case .terminalTTY:
             guard let tty = agent.process.tty, Self.isValidTTY(tty), live.tty == tty,
@@ -57,25 +90,34 @@ public struct AgentSteerer: AgentSteering, Sendable {
                 return failure("Terminal association changed or is unavailable")
             }
             let device = tty.hasPrefix("/dev/") ? tty : "/dev/" + tty
-            request = CommandRequest(executable: "/usr/bin/osascript", arguments: ["-e", terminal == "Terminal" ? Self.terminalScript : Self.iTermScript, device, clean], timeout: 8)
-            detail = "Sent instruction to \(terminal) (\(tty))"
+            let request = CommandRequest(executable: "/usr/bin/osascript", arguments: ["-e", terminal == "Terminal" ? Self.terminalScript : Self.iTermScript, device, clean], timeout: 8)
+            // Apple Events cannot atomically bind delivery to the kernel's foreground process.
+            guard terminalForegroundVerifier.verify(agent: agent, live: live, device: device) else {
+                return failure("Selected agent is not the verified foreground receiver of this terminal")
+            }
+            do {
+                let result = try runner.run(request)
+                guard result.exitCode == 0, !result.timedOut, !result.truncated else {
+                    return failure(result.timedOut ? "Steering command timed out; delivery is unconfirmed" : "Steering command did not confirm delivery")
+                }
+                return AgentSteerOutcome(agentID: agent.id, mode: mode, succeeded: true, detail: "Sent instruction to \(terminal) (\(tty))")
+            } catch { return failure("Unable to execute steering command") }
         case .openCodeSession, .codexResume:
             guard let sid = agent.sessionID, Self.isValidSessionID(sid) else { return failure("Session identifier is invalid") }
             let name = mode == .openCodeSession ? "opencode" : "codex"
             guard let executable = resolve(name, agent: agent) else { return failure("Agent executable is unavailable") }
             // The explicit option terminator also protects prompts beginning with '-'.
             let arguments = mode == .openCodeSession ? ["run", "--session", sid, "--", clean] : ["exec", "resume", sid, "--", clean]
-            request = CommandRequest(executable: executable, arguments: arguments, timeout: 60,
-                                     workingDirectory: workingDirectory(for: agent), includeStandardUserPaths: true)
-            detail = mode == .openCodeSession ? "Sent instruction to OpenCode session" : "Resumed Codex session"
-        }
-        do {
-            let result = try runner.run(request)
-            guard result.exitCode == 0, !result.timedOut, !result.truncated else {
-                return failure(result.timedOut ? "Steering command timed out; delivery is unconfirmed" : "Steering command did not confirm delivery")
+            let directory = workingDirectory(for: agent)
+            guard verifySessionOwnership?(live.identity, mode, sid) == true else {
+                return failure("Live process ownership of this session could not be verified")
             }
-            return AgentSteerOutcome(agentID: agent.id, mode: mode, succeeded: true, detail: detail)
-        } catch { return failure("Unable to execute steering command") }
+            do {
+                try nativeJobLauncher.launch(executable: executable, arguments: arguments, workingDirectory: directory)
+                let provider = mode == .openCodeSession ? "OpenCode" : "Codex"
+                return AgentSteerOutcome(agentID: agent.id, mode: mode, succeeded: true, detail: "Started local \(provider) continuation process")
+            } catch { return failure("Unable to start local continuation process") }
+        }
     }
 
     private func workingDirectory(for agent: AgentObservation) -> URL? {
@@ -142,6 +184,8 @@ public struct AgentSteerer: AgentSteering, Sendable {
             end repeat
             if (count of matches) is not 1 then error "Terminal target is unavailable or ambiguous"
             set s to item 1 of matches
+            if not (exists s) then error "Terminal target no longer exists"
+            if tty of s is not targetTTY then error "Terminal association changed"
             tell s to write text promptText
         end tell
     end run

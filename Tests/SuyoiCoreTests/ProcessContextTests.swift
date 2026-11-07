@@ -95,6 +95,27 @@ struct ProcessContextTests {
         #expect(ProcessTree(processes: python).groupServers(listeners: [listener(11, 8000)]).first?.rootPID == 10)
     }
 
+    @Test(arguments: ["/bin/zsh", "/Applications/Example.app/Contents/MacOS/node"])
+    func sharedPortDoesNotCrossSameProjectBoundary(boundary: String) {
+        let processes = [process(10), process(11, 10, boundary), process(12, 11)]
+        let project = ProjectContext(rootPath: "/projects/app", name: "app", framework: nil,
+            gitBranch: nil, gitCommit: nil, isWorktree: false)
+        let groups = ProcessTree(processes: processes).groupServers(
+            listeners: [listener(10, 3000), listener(12, 3000, address: "::1")],
+            projectsByPath: [project.rootPath: project])
+        #expect(groups.map(\.rootPID) == [10, 12])
+        #expect(groups.map { $0.memberIdentities.map(\.pid) } == [[10], [12]])
+    }
+
+    @Test(arguments: ["/bin/zsh", "/bin/codex", "/Applications/Example.app/Contents/MacOS/node"])
+    func boundaryWithListenerCannotJoinParentServer(boundary: String) {
+        let processes = [process(10), process(11, 10, boundary), process(12, 11)]
+        let groups = ProcessTree(processes: processes).groupServers(
+            listeners: [listener(10, 3000), listener(11, 3000, address: "::1"), listener(12, 4000)])
+        #expect(groups.map(\.rootPID) == [10, 11, 12])
+        #expect(groups.map(\.memberPIDs) == [[10], [11], [12]])
+    }
+
     @Test func transitiveSharedPortReloaderGrouping() throws {
         // Non-runner worker names prevent upward root coalescing; shared sockets
         // still join the ancestor-related components, transitively.
