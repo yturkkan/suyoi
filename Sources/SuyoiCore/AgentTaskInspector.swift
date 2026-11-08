@@ -46,10 +46,24 @@ public struct AgentTaskInspector: Sendable {
             let p = URL(fileURLWithPath: raw).standardizedFileURL.path
             return (p == "/" || p == homePath) ? nil : p
         }
+        let selfDescendants = tree.descendants(of: process.pid)
+        func isSameProcessLineage(_ other: ObservedProcess) -> Bool {
+            if selfDescendants.contains(other.pid) || tree.descendants(of: other.pid).contains(process.pid) {
+                return true
+            }
+            if process.parentPID > 1 && other.parentPID == process.parentPID {
+                return true
+            }
+            if process.cwd != "/" && other.cwd == "/" {
+                return true
+            }
+            return false
+        }
         if let target = specificDir {
             // Project metadata cannot disambiguate two live agents of the same kind in one project.
             let peers = allProcesses.filter {
-                $0.pid != process.pid && $0.uid == process.uid && AgentRecognizer.agentName(for: $0) == agentName &&
+                $0.pid != process.pid && $0.uid == process.uid && !isSameProcessLineage($0) &&
+                AgentRecognizer.agentName(for: $0) == agentName &&
                 $0.cwd.map { URL(fileURLWithPath: $0).standardizedFileURL.path } == target
             }
             guard peers.isEmpty else { return AgentTaskContext(currentTask: running) }
@@ -64,6 +78,7 @@ public struct AgentTaskInspector: Sendable {
         // identifier when another live process of this provider could own it.
         let hasProviderPeer = allProcesses.contains {
             $0.pid != process.pid && $0.uid == process.uid && !$0.isStopped &&
+            !isSameProcessLineage($0) &&
             AgentRecognizer.agentName(for: $0) == agentName
         }
         guard specificDir == nil, hasProviderPeer else { return context }

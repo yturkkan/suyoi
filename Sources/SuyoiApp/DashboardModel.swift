@@ -109,7 +109,11 @@ final class DashboardModel: ObservableObject {
         actionExecutor: any ActionExecuting = ActionExecutor(),
         quotaInspector: any QuotaInspecting = LocalQuotaInspector(),
         liveQuotaPoller: any LiveQuotaPolling = LiveQuotaPoller(),
-        agentSteerer: any AgentSteering = AgentSteerer(),
+        agentSteerer: any AgentSteering = AgentSteerer(
+            verifySessionOwnership: { identity, _, sessionID in
+                identity.isActionEligible && AgentSteerer.isValidSessionID(sessionID)
+            }
+        ),
         appUpdater: any AppUpdating = AppUpdater()
     ) {
         self.actionExecutor = actionExecutor
@@ -713,7 +717,7 @@ final class DashboardModel: ObservableObject {
     }
 
     func steerMode(for obs: AgentObservation) -> AgentSteerMode? {
-        AgentSteerer.preferredMode(for: obs)
+        AgentSteerer.preferredMode(for: obs, allowNativeSessions: true)
     }
 
     func steerModeLabel(for obs: AgentObservation) -> String? {
@@ -864,7 +868,7 @@ final class DashboardModel: ObservableObject {
     }
 
     var currentAppVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.9"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.10"
     }
 
     func checkForUpdates() {

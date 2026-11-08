@@ -52,12 +52,21 @@ public struct AgentSteerer: AgentSteering, Sendable {
     }
 
     /// Availability for the default UI. Native steering requires live ownership proof beyond observation metadata.
-    public static func preferredMode(for agent: AgentObservation) -> AgentSteerMode? {
+    public static func preferredMode(for agent: AgentObservation, allowNativeSessions: Bool = false) -> AgentSteerMode? {
         guard agent.process.identity.isActionEligible else { return nil }
         if let tty = agent.process.tty, isValidTTY(tty), ["Terminal", "iTerm2"].contains(agent.terminalApp) { return .terminalTTY }
+        if allowNativeSessions, let sid = agent.sessionID, isValidSessionID(sid) {
+            switch agent.agentName {
+            case "OpenCode": return .openCodeSession
+            case "Codex": return .codexResume
+            default: break
+            }
+        }
         return nil
     }
-    public static func canSteer(_ agent: AgentObservation) -> Bool { preferredMode(for: agent) != nil }
+    public static func canSteer(_ agent: AgentObservation, allowNativeSessions: Bool = false) -> Bool {
+        preferredMode(for: agent, allowNativeSessions: allowNativeSessions) != nil
+    }
 
     public func steer(agent: AgentObservation, prompt: String, uid: Int = Int(getuid())) -> AgentSteerOutcome {
         let terminalMode = Self.preferredMode(for: agent)
