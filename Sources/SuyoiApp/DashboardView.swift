@@ -39,10 +39,12 @@ struct DashboardView: View {
             }
             footer
         }
+        .fontDesign(model.themeTokens.usesMonospacedChrome ? .monospaced : .default)
         .frame(width: 440, height: 580)
         .sheet(item: $model.selectedAgent) { agent in
             ProcessDetailView(
                 subject: .agent(agent),
+                turnPreview: model.turnPreview(for: agent),
                 steerModeLabel: model.steerModeLabel(for: agent),
                 steerPromptText: $model.steerPromptText,
                 isSteering: model.isSteering,
@@ -269,6 +271,20 @@ struct DashboardView: View {
 
     private var agentsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if !model.pendingApprovals.isEmpty {
+                sectionSubheader(
+                    title: "Pending Approvals (\(model.pendingApprovals.count))",
+                    trailing: "Approve · auto-approve · deny"
+                )
+                ForEach(model.pendingApprovals) { req in
+                    PendingApprovalCardView(
+                        request: req,
+                        onDecision: { decision in
+                            model.submitApprovalDecision(decision, for: req)
+                        }
+                    )
+                }
+            }
             sectionSubheader(
                 title: "Active Coding Agents",
                 trailing: "Focus · steer · reveal · stop"
@@ -278,7 +294,7 @@ struct DashboardView: View {
                 if rows.isEmpty {
                     emptyState(
                         "No active coding agents found",
-                        detail: "Supported agents (Claude Code, Codex, OpenCode, Aider, Gemini CLI — including Node/Python wrappers) will appear here when running.",
+                        detail: "Supported agents (Claude Code, Codex, OpenCode, Gemini CLI, Antigravity CLI, Hermes Agent, Qwen Code, Kimi CLI, OpenClaw, Pi, Aider, Cursor, Windsurf, Copilot, Goose, Amp, Droid, Kiro) will appear here when running.",
                         symbol: "terminal"
                     )
                 } else {
@@ -286,6 +302,9 @@ struct DashboardView: View {
                         let rowID = "agent-\(row.id)"
                         AgentCardRow(
                             obs: row,
+                            visualProfile: model.visualProfile(for: row.agentName),
+                            turnPreview: model.turnPreview(for: row),
+                            isAutoApproved: model.isSessionAutoApproved(row.sessionID),
                             quotaItem: model.combinedQuotaItem(forAgentName: row.agentName),
                             steerModeLabel: model.steerModeLabel(for: row),
                             isSteerComposerOpen: model.steeringAgentID == row.id,
@@ -709,8 +728,99 @@ struct DashboardView: View {
 
 // MARK: - Interactive Row Subviews
 
+private struct PendingApprovalCardView: View {
+    let request: PendingApprovalRequest
+    let onDecision: (ApprovalDecision) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: request.questionOptions.isEmpty ? "hand.raised.fill" : "questionmark.bubble.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color(nsColor: .systemOrange))
+                Text(request.agentName)
+                    .font(.system(size: 11.5, weight: .semibold))
+                statusBadge(request.toolName, tint: Color(nsColor: .systemOrange))
+                Spacer()
+                if let pid = request.pid {
+                    Text("PID \(pid)")
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Text(request.summary)
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(.primary.opacity(0.9))
+                .lineLimit(2)
+
+            if !request.questionOptions.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(request.questionOptions.prefix(4), id: \.self) { option in
+                        Button(option) {
+                            onDecision(.answerQuestion(selectedOption: option))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                    }
+                    Spacer()
+                    Button("Dismiss") {
+                        onDecision(.deny(reason: "Dismissed"))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
+            } else {
+                HStack(spacing: 6) {
+                    Button {
+                        onDecision(.allowOnce)
+                    } label: {
+                        Label("Approve", systemImage: "checkmark.circle.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.mini)
+
+                    Button {
+                        onDecision(.allowForSession)
+                    } label: {
+                        Text("Auto-Approve Session")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+
+                    Spacer()
+
+                    Button(role: .destructive) {
+                        onDecision(.deny(reason: "Denied by user in Suyoi"))
+                    } label: {
+                        Label("Deny", systemImage: "xmark.circle")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
+            }
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
+        .background(
+            Color(nsColor: .systemOrange).opacity(0.08),
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(Color(nsColor: .systemOrange).opacity(0.45), lineWidth: 0.7)
+        )
+    }
+}
+
 private struct AgentCardRow: View {
     let obs: AgentObservation
+    let visualProfile: AgentClientVisualProfile
+    let turnPreview: SessionTurnPreview?
+    let isAutoApproved: Bool
     let quotaItem: CombinedProviderQuotaItem?
     let steerModeLabel: String?
     let isSteerComposerOpen: Bool
@@ -746,6 +856,11 @@ private struct AgentCardRow: View {
     var body: some View {
         let memory = obs.process.footprintBytes ?? obs.process.residentBytes
         let badgeInfo = activityBadge
+        let profileAccent = Color(
+            red: visualProfile.accentRed,
+            green: visualProfile.accentGreen,
+            blue: visualProfile.accentBlue
+        )
 
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .center, spacing: 10) {
@@ -753,11 +868,11 @@ private struct AgentCardRow: View {
                     HStack(alignment: .center, spacing: 10) {
                         ZStack(alignment: .bottomTrailing) {
                             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(Color.primary.opacity(0.06))
+                                .fill(profileAccent.opacity(0.14))
                                 .frame(width: 28, height: 28)
-                            Image(systemName: "terminal")
-                                .font(.system(size: 12.5, weight: .medium))
-                                .foregroundStyle(.primary.opacity(0.85))
+                            Image(systemName: visualProfile.symbolName)
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(profileAccent)
                                 .frame(width: 28, height: 28)
                             Circle()
                                 .fill(badgeInfo.tint)
@@ -771,6 +886,9 @@ private struct AgentCardRow: View {
                                 Text(obs.agentName)
                                     .font(.system(size: 12.5, weight: .semibold))
                                 statusBadge(badgeInfo.label, tint: badgeInfo.tint)
+                                if isAutoApproved {
+                                    statusBadge("Auto-OK", tint: leafGreen)
+                                }
                                 if let terminal = obs.terminalApp {
                                     statusBadge(terminal, tint: .secondary)
                                 }
@@ -820,6 +938,28 @@ private struct AgentCardRow: View {
                                     Text(task)
                                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                                         .foregroundStyle(leafGreen)
+                                        .lineLimit(1)
+                                }
+                            } else if let reply = turnPreview?.lastAssistantReplyPreview ?? turnPreview?.lastUserPromptPreview {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "text.bubble.fill")
+                                        .font(.system(size: 8.5))
+                                        .foregroundStyle(.secondary)
+                                    Text(reply)
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+
+                            if let tool = turnPreview?.recentTools.first {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "wrench.and.screwdriver.fill")
+                                        .font(.system(size: 8.5))
+                                        .foregroundStyle(profileAccent)
+                                    Text("\(tool.toolName)\(tool.targetSummary.map { " · \($0)" } ?? "")")
+                                        .font(.system(size: 9.5, design: .monospaced))
+                                        .foregroundStyle(.secondary)
                                         .lineLimit(1)
                                 }
                             }

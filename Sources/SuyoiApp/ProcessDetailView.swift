@@ -9,6 +9,7 @@ struct ProcessDetailView: View {
     }
 
     let subject: Subject
+    let turnPreview: SessionTurnPreview?
     let steerModeLabel: String?
     @Binding var steerPromptText: String
     let isSteering: Bool
@@ -23,6 +24,7 @@ struct ProcessDetailView: View {
 
     init(
         subject: Subject,
+        turnPreview: SessionTurnPreview? = nil,
         steerModeLabel: String? = nil,
         steerPromptText: Binding<String> = .constant(""),
         isSteering: Bool = false,
@@ -35,6 +37,7 @@ struct ProcessDetailView: View {
         onDismiss: @escaping () -> Void
     ) {
         self.subject = subject
+        self.turnPreview = turnPreview
         self.steerModeLabel = steerModeLabel
         self._steerPromptText = steerPromptText
         self.isSteering = isSteering
@@ -52,9 +55,10 @@ struct ProcessDetailView: View {
             HStack {
                 switch subject {
                 case .agent(let obs):
-                    Label(obs.agentName, systemImage: "terminal.fill")
+                    let profile = SessionJumpRouter.visualProfile(for: obs.agentName)
+                    Label(obs.agentName, systemImage: profile.symbolName)
                         .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(leafGreen)
+                        .foregroundStyle(Color(red: profile.accentRed, green: profile.accentGreen, blue: profile.accentBlue))
                 case .server(let group):
                     Label(group.project?.name ?? group.name, systemImage: "network")
                         .font(.system(size: 15, weight: .semibold))
@@ -212,6 +216,27 @@ struct ProcessDetailView: View {
                 let diag = SafetyDiagnostics.explainSteeringUnavailable(for: obs)
                 detailRow("Steering Status", value: "\(diag.headline) (\(diag.checkName))")
                 detailRow("Next Step", value: diag.remediationHint)
+            }
+        }
+
+        if let turnPreview,
+           (turnPreview.lastUserPromptPreview != nil || turnPreview.lastAssistantReplyPreview != nil || !turnPreview.recentTools.isEmpty) {
+            detailSection("Live Turn & Tool Activity Preview") {
+                if let prompt = turnPreview.lastUserPromptPreview {
+                    detailRow("Last User Prompt", value: prompt)
+                }
+                if let reply = turnPreview.lastAssistantReplyPreview {
+                    detailRow("Assistant Reply", value: reply)
+                }
+                if !turnPreview.recentTools.isEmpty {
+                    let toolsText = turnPreview.recentTools.map { tool in
+                        if let target = tool.targetSummary, !target.isEmpty {
+                            return "\(tool.toolName) (\(target)) [\(tool.status)]"
+                        }
+                        return "\(tool.toolName) [\(tool.status)]"
+                    }.joined(separator: " · ")
+                    detailRow("Recent Tools", value: toolsText, monospaced: true)
+                }
             }
         }
 

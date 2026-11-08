@@ -19,6 +19,15 @@ struct ProcessArgumentsReader {
         case "opencode", "opencode-cli": return ("OpenCode", "opencode")
         case "aider": return ("Aider", "aider")
         case "gemini": return ("Gemini CLI", "gemini")
+        case "antigravity", "agy": return ("Antigravity CLI", "antigravity")
+        case "hermes", "hermes-agent", "hermes_cli": return ("Hermes Agent", "hermes")
+        case "qwen": return ("Qwen Code", "qwen")
+        case "kimi", "kimi-cli": return ("Kimi CLI", "kimi")
+        case "openclaw": return ("OpenClaw", "openclaw")
+        case "omp", "oh-my-pi": return ("Oh My Pi", "omp")
+        case "codebuddy": return ("CodeBuddy", "codebuddy")
+        case "qoder", "qodercli": return ("Qoder", "qoder")
+        case "copilot": return ("GitHub Copilot", "copilot")
         default: return nil
         }
     }
@@ -72,7 +81,10 @@ struct ProcessArgumentsReader {
             let packages: [(String, String, String, String)] = [
                 ("@anthropic-ai", "claude-code", "Claude Code", "claude"),
                 ("@openai", "codex", "Codex", "codex"),
-                ("@google", "gemini-cli", "Gemini CLI", "gemini")
+                ("@google", "gemini-cli", "Gemini CLI", "gemini"),
+                ("@qwen-code", "qwen-code", "Qwen Code", "qwen"),
+                ("@moonshot-ai", "kimi-cli", "Kimi CLI", "kimi"),
+                ("@github", "copilot", "GitHub Copilot", "copilot")
             ]
             for (scope, package, name, entry) in packages where parts.count >= 2 {
                 if zip(parts, parts.dropFirst()).contains(where: { $0.0 == scope && $0.1 == package }) {

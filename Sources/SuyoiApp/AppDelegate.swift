@@ -8,6 +8,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let model = DashboardModel()
+    private lazy var islandController = IslandWindowController(
+        onOpenDashboard: { [weak self] in
+            self?.showPopoverIfNeeded()
+        },
+        onFocusPrimaryAgent: { [weak self] in
+            self?.model.focusPrimaryAgent()
+        }
+    )
     private var refreshTimer: Timer?
     private var globalClickMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
@@ -32,6 +40,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 self?.updateStatusItemBadge()
+                self?.updateIslandSurface()
+            }
+            .store(in: &cancellables)
+
+        model.$pendingApprovals
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateStatusItemBadge()
+                self?.updateIslandSurface()
+            }
+            .store(in: &cancellables)
+
+        model.$surfaceMode
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateIslandSurface()
             }
             .store(in: &cancellables)
 
@@ -44,7 +68,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             .store(in: &cancellables)
 
         model.refresh()
+        updateIslandSurface()
         scheduleRefreshTimer(interval: 10)
+    }
+
+    private func updateIslandSurface() {
+        islandController.setMode(model.surfaceMode, snapshot: model.islandSurfaceSnapshot)
+    }
+
+    private func showPopoverIfNeeded() {
+        guard let button = statusItem.button, !popover.isShown else { return }
+        popover.behavior = model.isPopoverPinned ? .applicationDefined : .transient
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
     }
 
     private func updateStatusItemBadge() {

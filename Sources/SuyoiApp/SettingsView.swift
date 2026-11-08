@@ -99,6 +99,163 @@ struct SettingsView: View {
     private var generalContent: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 6) {
+                Text("SURFACE, THEME & AUDIO CUES")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.4)
+                    .foregroundStyle(.secondary)
+
+                VStack(spacing: 0) {
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Display Surface")
+                                .font(.system(size: 11.5, weight: .medium))
+                            Text("Menu bar popover, top-center Notch Dynamic Island, or movable Floating Companion.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 6)
+                        Picker("", selection: Binding(
+                            get: { model.surfaceMode },
+                            set: { model.setSurfaceMode($0) }
+                        )) {
+                            ForEach(SuyoiSurfaceMode.allCases, id: \.self) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .controlSize(.small)
+                        .frame(width: 165)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+
+                    Divider()
+                        .padding(.leading, 12)
+
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Experience Theme")
+                                .font(.system(size: 11.5, weight: .medium))
+                            Text("Switches accent palette, card geometry, and pixel/monospaced styling.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 6)
+                        Picker("", selection: Binding(
+                            get: { model.experienceTheme },
+                            set: { model.setExperienceTheme($0) }
+                        )) {
+                            ForEach(SuyoiExperienceTheme.allCases, id: \.self) { theme in
+                                Text(theme.rawValue).tag(theme)
+                            }
+                        }
+                        .labelsHidden()
+                        .controlSize(.small)
+                        .frame(width: 165)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+
+                    Divider()
+                        .padding(.leading, 12)
+
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Semantic Audio Cues")
+                                .font(.system(size: 11.5, weight: .medium))
+                            Text("Plays sounds on agent attention, completion, and quota alerts.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 6)
+                        Button("Test") {
+                            model.playTestSound()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Picker("", selection: Binding(
+                            get: { model.soundMode },
+                            set: { model.setSoundMode($0) }
+                        )) {
+                            ForEach(SuyoiSoundMode.allCases, id: \.self) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .controlSize(.small)
+                        .frame(width: 145)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+
+                    if model.soundMode == .soundPack {
+                        Divider()
+                            .padding(.leading, 12)
+
+                        HStack(alignment: .center, spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("OpenPeon Sound Pack")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                Text(model.availableSoundPacks.isEmpty
+                                     ? "No packs found in ~/.openpeon/packs (falling back to macOS sounds)."
+                                     : "\(model.availableSoundPacks.count) CESP pack(s) discovered.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 6)
+                            if !model.availableSoundPacks.isEmpty {
+                                Picker("", selection: Binding(
+                                    get: { model.selectedSoundPackID ?? model.availableSoundPacks.first?.id ?? "" },
+                                    set: { model.setSelectedSoundPackID($0) }
+                                )) {
+                                    ForEach(model.availableSoundPacks) { pack in
+                                        Text(pack.displayName).tag(pack.id)
+                                    }
+                                }
+                                .labelsHidden()
+                                .controlSize(.small)
+                                .frame(width: 140)
+                            }
+                            Button("Rescan") {
+                                model.reloadSoundPacks()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                    }
+
+                    Divider()
+                        .padding(.leading, 12)
+
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("In-Panel Tool Approval Hook")
+                                .font(.system(size: 11.5, weight: .medium))
+                            Text("Copy read-only hook command snippet for Claude Code / Codex approval cards.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 6)
+                        Button("Copy Hook Snippet") {
+                            model.copyHookSnippet()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                }
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.5)
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline) {
                     Text("AI SUBSCRIPTIONS & DISPLAY ORDER")
                         .font(.system(size: 10, weight: .semibold))

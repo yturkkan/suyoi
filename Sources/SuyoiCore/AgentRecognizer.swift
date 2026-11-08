@@ -17,6 +17,16 @@ public enum AgentRecognizer {
         case "droid": return "Droid"
         case "qwen": return "Qwen Code"
         case "kiro": return "Kiro"
+        case "antigravity", "agy": return "Antigravity CLI"
+        case "hermes", "hermes-agent": return "Hermes Agent"
+        case "kimi", "kimi-cli": return "Kimi CLI"
+        case "openclaw": return "OpenClaw"
+        case "pi", "pi-agent": return "Pi Agent"
+        case "omp", "oh-my-pi": return "Oh My Pi"
+        case "qoder", "qodercli", "qoderclicn": return "Qoder"
+        case "codebuddy", "workbuddy": return "CodeBuddy"
+        case "copilot", "github-copilot-cli": return "GitHub Copilot"
+        case "windsurf-agent": return "Windsurf"
         default: return nil
         }
     }

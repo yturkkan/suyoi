@@ -85,6 +85,13 @@ final class DashboardModel: ObservableObject {
     @Published var isLaunchAtLoginEnabled: Bool
     @Published var recheckingCandidateIDs: Set<String> = []
     @Published var trashedHistory: [TrashedItemRecord] = []
+    @Published var surfaceMode: SuyoiSurfaceMode
+    @Published var experienceTheme: SuyoiExperienceTheme
+    @Published var soundMode: SuyoiSoundMode
+    @Published var availableSoundPacks: [OpenPeonSoundPack] = []
+    @Published var selectedSoundPackID: String?
+    @Published var pendingApprovals: [PendingApprovalRequest] = []
+    @Published var agentTurnPreviews: [Int: SessionTurnPreview] = [:]
 
     private static let providerOrderKey = "suyoi.quotaProviderOrder"
     private static let hiddenProvidersKey = "suyoi.hiddenQuotaProviders"
@@ -92,6 +99,10 @@ final class DashboardModel: ObservableObject {
     private static let liveQuotaEnabledKey = "suyoi.isLiveQuotaEnabled"
     private static let scanAllWorkspacesKey = "suyoi.scanAllWorkspaces"
     private static let notificationsEnabledKey = "suyoi.areNotificationsEnabled"
+    private static let surfaceModeKey = "suyoi.surfaceMode"
+    private static let experienceThemeKey = "suyoi.experienceTheme"
+    private static let soundModeKey = "suyoi.soundMode"
+    private static let selectedSoundPackIDKey = "suyoi.selectedSoundPackID"
 
     let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
     private let inspector = SystemInspector()
@@ -102,6 +113,12 @@ final class DashboardModel: ObservableObject {
     private let appUpdater: any AppUpdating
     private let trashRecoveryStore = TrashRecoveryStore()
     private let worktreeCleanupExecutor = WorktreeCleanupExecutor()
+    private let sessionJumpRouter = SessionJumpRouter()
+    private let turnPreviewInspector = SessionTurnPreviewInspector()
+    private let approvalController = AgentApprovalController()
+    private let soundPlayer = SoundEffectPlayer()
+    private var previousAgentStates: [Int: AgentActivityState] = [:]
+    private var hasCompletedInitialRefresh = false
     private var alertTracker = AlertStateTracker()
     private var livePollTask: Task<Void, Never>?
     private var livePollGeneration: UInt64 = 0
@@ -167,6 +184,32 @@ final class DashboardModel: ObservableObject {
         }
         self.areNotificationsEnabled = UserDefaults.standard.bool(forKey: Self.notificationsEnabledKey)
         self.isLaunchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
+        if let rawSurface = UserDefaults.standard.string(forKey: Self.surfaceModeKey),
+           let mode = SuyoiSurfaceMode(rawValue: rawSurface) {
+            self.surfaceMode = mode
+        } else {
+            self.surfaceMode = .menuBarPopover
+        }
+        if let rawTheme = UserDefaults.standard.string(forKey: Self.experienceThemeKey),
+           let theme = SuyoiExperienceTheme(rawValue: rawTheme) {
+            self.experienceTheme = theme
+        } else {
+            self.experienceTheme = .nativeGlass
+        }
+        if let rawSound = UserDefaults.standard.string(forKey: Self.soundModeKey),
+           let mode = SuyoiSoundMode(rawValue: rawSound) {
+            self.soundMode = mode
+        } else {
+            self.soundMode = .muted
+        }
+        let discoveredPacks = ExperienceThemeCatalog.discoverSoundPacks(homeDirectory: home)
+        self.availableSoundPacks = discoveredPacks
+        let savedPackID = UserDefaults.standard.string(forKey: Self.selectedSoundPackIDKey)
+        if let savedPackID, discoveredPacks.contains(where: { $0.id == savedPackID }) {
+            self.selectedSoundPackID = savedPackID
+        } else {
+            self.selectedSoundPackID = discoveredPacks.first?.id
+        }
     }
 
     var agentRows: [AgentObservation] {
@@ -453,13 +496,26 @@ final class DashboardModel: ObservableObject {
         isRefreshing = true
         let currentInspector = inspector
         let currentQuotaInspector = quotaInspector
+        let previewInspector = turnPreviewInspector
         Task {
-            async let invResult = Task.detached(priority: .utility) { currentInspector.snapshot() }.value
+            async let invResult = Task.detached(priority: .utility) { () -> (InventorySnapshot, [Int: SessionTurnPreview]) in
+                let snap = currentInspector.snapshot()
+                var previews: [Int: SessionTurnPreview] = [:]
+                for obs in snap.agentObservations {
+                    if let preview = previewInspector.inspectPreview(for: obs, allProcesses: snap.processes) {
+                        previews[obs.id] = preview
+                    }
+                }
+                return (snap, previews)
+            }.value
             async let quotaResult = Task.detached(priority: .utility) { currentQuotaInspector.inspectQuotas(at: Date()) }.value
-            let (newSnapshot, newQuotas) = await (invResult, quotaResult)
+            let ((newSnapshot, newPreviews), newQuotas) = await (invResult, quotaResult)
             snapshot = newSnapshot
+            agentTurnPreviews = newPreviews
             quotaSnapshot = newQuotas
             isRefreshing = false
+            pollApprovalInboxSpool()
+            evaluateAgentStateAudioTransitions(currentAgents: agentRows)
             evaluateAndDeliverAlerts()
             if isLiveQuotaEnabled {
                 pollLiveQuotas(trigger: .automatic)
@@ -660,6 +716,16 @@ final class DashboardModel: ObservableObject {
             }
         }
         let events = alertTracker.evaluate(agents: agentRows, quotas: combinedQuotaMap)
+        for event in events {
+            switch event.kind {
+            case .agentWaiting:
+                soundPlayer.play(.attentionRequired, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+            case .quotaWarning, .quotaCritical:
+                soundPlayer.play(.quotaWarning, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+            case .quotaReset:
+                soundPlayer.play(.taskCompleted, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+            }
+        }
         guard areNotificationsEnabled, !events.isEmpty else { return }
         for event in events {
             showBanner("\(event.title): \(event.body)", isError: event.kind == .quotaCritical)
@@ -673,13 +739,220 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    // MARK: - Surface Mode, Themes, Audio & Approvals
+
+    var selectedSoundPack: OpenPeonSoundPack? {
+        if let selectedSoundPackID,
+           let matched = availableSoundPacks.first(where: { $0.id == selectedSoundPackID }) {
+            return matched
+        }
+        return availableSoundPacks.first
+    }
+
+    var themeTokens: ThemeVisualTokens {
+        ExperienceThemeCatalog.tokens(for: experienceTheme)
+    }
+
+    var islandSurfaceSnapshot: IslandSurfaceSnapshot {
+        let agents = agentRows
+        let activeCount = agents.filter { $0.activityState == .active }.count
+        let waitingCount = agents.filter { $0.activityState == .waiting }.count
+        let primaryAgent = agents.first(where: { $0.activityState == .waiting })
+            ?? agents.first(where: { $0.activityState == .active })
+            ?? agents.first
+        let primaryTask = primaryAgent.flatMap { obs in
+            obs.currentTask ?? agentTurnPreviews[obs.id]?.lastAssistantReplyPreview ?? obs.sessionTitle
+        }
+        return IslandSurfaceSnapshot(
+            activeAgentCount: activeCount,
+            waitingAgentCount: waitingCount,
+            pendingApprovalCount: pendingApprovals.count,
+            serverCount: developmentServerGroups.count,
+            primaryAgentName: primaryAgent?.agentName,
+            primaryAgentTask: primaryTask,
+            isWaitingForInput: waitingCount > 0 || !pendingApprovals.isEmpty
+        )
+    }
+
+    func focusPrimaryAgent() {
+        let agents = agentRows
+        guard let primary = agents.first(where: { $0.activityState == .waiting })
+                ?? agents.first(where: { $0.activityState == .active })
+                ?? agents.first else {
+            return
+        }
+        focusTerminalOrIDE(for: primary)
+    }
+
+    func setSurfaceMode(_ mode: SuyoiSurfaceMode) {
+        surfaceMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: Self.surfaceModeKey)
+        showBanner("Display surface set to \(mode.rawValue)")
+    }
+
+    func setExperienceTheme(_ theme: SuyoiExperienceTheme) {
+        experienceTheme = theme
+        UserDefaults.standard.set(theme.rawValue, forKey: Self.experienceThemeKey)
+        showBanner("Theme changed to \(theme.rawValue)")
+    }
+
+    func setSoundMode(_ mode: SuyoiSoundMode) {
+        soundMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: Self.soundModeKey)
+        if mode == .soundPack {
+            reloadSoundPacks()
+        }
+        showBanner("Audio cues set to \(mode.rawValue)")
+    }
+
+    func setSelectedSoundPackID(_ id: String?) {
+        selectedSoundPackID = id
+        if let id {
+            UserDefaults.standard.set(id, forKey: Self.selectedSoundPackIDKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.selectedSoundPackIDKey)
+        }
+    }
+
+    func reloadSoundPacks() {
+        let packs = ExperienceThemeCatalog.discoverSoundPacks(homeDirectory: homeDirectory)
+        availableSoundPacks = packs
+        if let selectedSoundPackID, packs.contains(where: { $0.id == selectedSoundPackID }) {
+            return
+        }
+        selectedSoundPackID = packs.first?.id
+    }
+
+    func playTestSound(_ event: SuyoiAudioEvent = .taskCompleted) {
+        let effectiveMode = soundMode == .muted ? .systemSounds : soundMode
+        soundPlayer.play(event, mode: effectiveMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+        showBanner("Played \(event.rawValue) audio cue")
+    }
+
+    func visualProfile(for agentName: String) -> AgentClientVisualProfile {
+        SessionJumpRouter.visualProfile(for: agentName)
+    }
+
+    func mascotState(for obs: AgentObservation) -> MascotAnimationState {
+        let hasPending = pendingApprovals.contains { req in
+            req.pid == obs.process.pid || (obs.sessionID != nil && req.sessionID == obs.sessionID)
+        }
+        return ExperienceThemeCatalog.mascotState(for: obs, hasPendingApproval: hasPending)
+    }
+
+    func turnPreview(for obs: AgentObservation) -> SessionTurnPreview? {
+        agentTurnPreviews[obs.id]
+    }
+
+    func isSessionAutoApproved(_ sessionID: String?) -> Bool {
+        guard let sessionID else { return false }
+        return approvalController.isSessionAutoApproved(sessionID)
+    }
+
+    func submitApprovalDecision(_ decision: ApprovalDecision, for request: PendingApprovalRequest) {
+        let resolved = approvalController.submitDecision(decision, forRequestID: request.id)
+        pendingApprovals = approvalController.pendingRequests()
+        guard resolved else { return }
+        switch decision {
+        case .allowOnce:
+            showBanner("Approved \(request.toolName) for \(request.agentName)")
+        case .allowForSession:
+            showBanner("Auto-approved session for \(request.agentName)")
+        case .deny:
+            showBanner("Denied \(request.toolName) for \(request.agentName)")
+        case .answerQuestion(let option):
+            showBanner("Answered \(request.agentName): \(option)")
+        }
+    }
+
+    func copyHookSnippet(for agentName: String = "Claude Code") {
+        let spoolInbox = homeDirectory
+            .appendingPathComponent("Library/Application Support/Suyoi/approvals/inbox")
+            .path
+        let bridgePath = Bundle.main.executableURL?.path ?? "/Applications/Suyoi.app/Contents/MacOS/SuyoiApp"
+        let snippet = AgentApprovalController.hookSnippet(for: agentName, bridgeExecutablePath: bridgePath)
+            + "\n# Or drop hook JSON payloads into: \(spoolInbox)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(snippet, forType: .string)
+        showBanner("Copied \(agentName) hook integration snippet")
+    }
+
+    private func pollApprovalInboxSpool() {
+        let baseDir = homeDirectory.appendingPathComponent("Library/Application Support/Suyoi/approvals", isDirectory: true)
+        let inboxDir = baseDir.appendingPathComponent("inbox", isDirectory: true)
+        let outboxDir = baseDir.appendingPathComponent("outbox", isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: inboxDir,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            pendingApprovals = approvalController.pendingRequests()
+            return
+        }
+        try? FileManager.default.createDirectory(at: outboxDir, withIntermediateDirectories: true)
+        var addedNewRequest = false
+        for fileURL in entries where fileURL.pathExtension == "json" {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  let data = try? Data(contentsOf: fileURL),
+                  data.count <= 65_536 else {
+                try? FileManager.default.removeItem(at: fileURL)
+                continue
+            }
+            let responseFileURL = outboxDir.appendingPathComponent(fileURL.deletingPathExtension().lastPathComponent + ".response.json")
+            try? FileManager.default.removeItem(at: fileURL)
+            let created = approvalController.ingestHookEvent(data) { replyData in
+                try? replyData.write(to: responseFileURL, options: .atomic)
+            }
+            if created != nil {
+                addedNewRequest = true
+            }
+        }
+        pendingApprovals = approvalController.pendingRequests()
+        if addedNewRequest {
+            soundPlayer.play(.attentionRequired, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+        }
+    }
+
+    private func evaluateAgentStateAudioTransitions(currentAgents: [AgentObservation]) {
+        var nextStates: [Int: AgentActivityState] = [:]
+        var playedEvent: SuyoiAudioEvent?
+        for obs in currentAgents {
+            let state = obs.activityState ?? .idle
+            nextStates[obs.id] = state
+            guard hasCompletedInitialRefresh else { continue }
+            if let previous = previousAgentStates[obs.id] {
+                if previous == .active && state == .idle {
+                    playedEvent = .taskCompleted
+                }
+            } else {
+                playedEvent = .sessionStarted
+            }
+        }
+        previousAgentStates = nextStates
+        hasCompletedInitialRefresh = true
+        if let playedEvent {
+            soundPlayer.play(playedEvent, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+        }
+    }
+
     // MARK: - User-Initiated Actions
 
     func focusTerminalOrIDE(for obs: AgentObservation) {
-        if let pid = obs.terminalPID,
-           let app = NSRunningApplication(processIdentifier: pid_t(pid)),
-           app.activate(options: [.activateAllWindows]) {
-            showBanner("Focused \(obs.terminalApp ?? app.localizedName ?? "Terminal")")
+        let router = sessionJumpRouter
+        let outcome = router.executeJump(
+            for: obs,
+            activatePID: { pid in
+                guard let app = NSRunningApplication(processIdentifier: pid_t(pid)) else { return false }
+                return app.activate(options: [.activateAllWindows])
+            },
+            openURL: { url in
+                NSWorkspace.shared.open(url)
+            }
+        )
+        if outcome.succeeded {
+            showBanner(outcome.summary)
             return
         }
         if let hostName = obs.terminalApp?.lowercased() {
@@ -697,7 +970,7 @@ final class DashboardModel: ObservableObject {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
             showBanner("Revealed \(URL(fileURLWithPath: path).lastPathComponent) in Finder")
         } else {
-            showBanner("Could not locate a host window to focus", isError: true)
+            showBanner(outcome.error ?? "Could not locate a host window to focus", isError: true)
         }
     }
 
@@ -965,7 +1238,7 @@ final class DashboardModel: ObservableObject {
     }
 
     var currentAppVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.2.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.0"
     }
 
     func checkForUpdates() {

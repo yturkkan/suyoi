@@ -10,11 +10,12 @@ Created by **Y. Türkkan** ([`@yturkkan`](https://github.com/yturkkan) · [X](ht
 
 ## Overview
 
-Modern software development on macOS often involves running multiple coding agents (`Codex`, `Claude Code`, `OpenCode`, `Gemini CLI`, `Aider`), background language servers, multi-worker localhost dev servers, and tens of gigabytes of build artifacts and caches across workspaces.
+Modern software development on macOS often involves running multiple coding agents (`Claude Code`, `Codex`, `OpenCode`, `Gemini CLI`, `Antigravity CLI`, `Hermes Agent`, `Qwen Code`, `Kimi CLI`, `OpenClaw`, `Pi Agent`, `Aider`, `Cursor`, `Windsurf`, `GitHub Copilot`, `Goose`, `Amp`, `Droid`, `Kiro`), background language servers, multi-worker localhost dev servers, and tens of gigabytes of build artifacts and caches across workspaces.
 
-**Suyoi** lives in the macOS menu bar and provides a single, low-overhead control plane to:
+**Suyoi** lives in the macOS menu bar (or as a **Notch Dynamic Island** / **Floating Companion**) and provides a single, low-overhead control plane to:
 
-- **Inspect & steer coding agents** — Detect native and runtime-wrapped (`node`, `bun`, `deno`, `python`) agent processes via `libproc` and bounded `KERN_PROCARGS2` inspection, view local task metadata, focus the host terminal/IDE window, and send follow-up instructions to verified foreground agents in Terminal or iTerm2.
+- **Inspect, jump to & steer 18+ coding agents** — Detect native and runtime-wrapped (`node`, `bun`, `deno`, `python`) agent processes via `libproc` and bounded `KERN_PROCARGS2` inspection, view secret-redacted live turn & tool call previews, jump directly to the exact `tmux` window/pane, `Terminal.app`/`iTerm2` tab, or IDE workspace (`cursor://`, `vscode://`, `windsurf://`, `zed://`, `antigravity://`), respond to in-panel tool approval/question hooks (`Approve`, `Auto-Approve Session`, `Deny`), and send follow-up instructions via Terminal/iTerm2 TTY or native CLI sessions.
+- **Switch between 3 display surfaces, 4 themes & semantic audio packs** — Operate Suyoi as a standard **Menu Bar Popover**, a top-center **Notch Dynamic Island** pill that expands on attention, or a draggable **Floating Companion ("Buddy")**, paired with **Suyoi Glass**, **macOS Native**, **Pixel Arcade**, or **Game Boy Olive** themes and macOS system sounds or **OpenPeon (`openpeon.json`)** CESP audio packs.
 - **Group & manage localhost dev servers** — Map listening TCP ports to their owning process trees, git branches, and frameworks (`Next.js`, `Vite`, `SwiftPM`, `Cargo`, `Python`, `Go`) with RFC 1123 named `http://<project>.localhost:<port>` URLs, stale/idle (`Idle 2h+`) & uptime badges, one-click browser launch, URL copy, and safe process-group termination.
 - **Track 5-hour & 7-day AI quotas** — Combine offline local rolling token counters (`300m` and `10080m` windows) with optional in-memory OAuth quota window checks (`Codex`, `Claude`, `Gemini`, `OpenCode`, `Cursor`), including reset countdowns and customizable provider ordering.
 - **Reclaim build, cache & merged git worktree storage safely** — Scan workspace build directories (`node_modules`, `.build`, `.next`, `target`, `dist`, `.turbo`, `__pycache__`), 50+ developer/AI cache locations, and clean merged secondary git worktrees; verify live process/open-file/lockfile safety at execution time; move eligible items to **macOS Trash** (`FileManager.trashItem`) — never `rm -rf` — and restore recently trashed items with one-click **Put Back** recovery.
@@ -105,7 +106,7 @@ Suyoi/
 │   ├── SuyoiCore/        # Process inspection, tree grouping, quotas, cleanup safety & steering
 │   └── SuyoiApp/         # AppKit status bar controller, SwiftUI popover views & CLI entrypoint
 ├── Tests/
-│   └── SuyoiCoreTests/   # Unit and fixture tests (250 tests across 27 suites)
+│   └── SuyoiCoreTests/   # Unit and fixture tests (361 tests across 32 suites)
 ├── Resources/            # AppIcon.icns & artwork
 ├── scripts/
 │   ├── build-app.sh      # Release bundle & archive builder
