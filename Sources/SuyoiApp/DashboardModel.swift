@@ -84,6 +84,7 @@ final class DashboardModel: ObservableObject {
     @Published var areNotificationsEnabled: Bool
     @Published var isLaunchAtLoginEnabled: Bool
     @Published var recheckingCandidateIDs: Set<String> = []
+    @Published var trashedHistory: [TrashedItemRecord] = []
 
     private static let providerOrderKey = "suyoi.quotaProviderOrder"
     private static let hiddenProvidersKey = "suyoi.hiddenQuotaProviders"
@@ -99,6 +100,8 @@ final class DashboardModel: ObservableObject {
     private let liveQuotaPoller: any LiveQuotaPolling
     private let agentSteerer: any AgentSteering
     private let appUpdater: any AppUpdating
+    private let trashRecoveryStore = TrashRecoveryStore()
+    private let worktreeCleanupExecutor = WorktreeCleanupExecutor()
     private var alertTracker = AlertStateTracker()
     private var livePollTask: Task<Void, Never>?
     private var livePollGeneration: UInt64 = 0
@@ -698,22 +701,46 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    func serverHealthBadge(for group: ServerGroup) -> ServerHealthBadge? {
+        ServerPresentation.healthBadge(for: group)
+    }
+
+    func namedServerURL(for group: ServerGroup) -> URL? {
+        ServerPresentation.namedLocalhostURL(for: group)
+    }
+
     func openServerInBrowser(_ group: ServerGroup) {
-        guard let port = group.listeners.first?.port,
-              let url = URL(string: "http://localhost:\(port)") else {
+        guard let url = ServerPresentation.standardLocalhostURL(for: group) else {
             showBanner("No valid localhost port to open", isError: true)
             return
         }
         NSWorkspace.shared.open(url)
-        showBanner("Opened http://localhost:\(port)")
+        showBanner("Opened \(url.absoluteString)")
+    }
+
+    func openServerNamedLocalhost(_ group: ServerGroup) {
+        guard let url = ServerPresentation.namedLocalhostURL(for: group)
+                ?? ServerPresentation.standardLocalhostURL(for: group) else {
+            showBanner("No valid localhost URL to open", isError: true)
+            return
+        }
+        NSWorkspace.shared.open(url)
+        showBanner("Opened \(url.absoluteString)")
     }
 
     func copyServerURL(_ group: ServerGroup) {
-        guard let port = group.listeners.first?.port else { return }
-        let urlString = "http://localhost:\(port)"
+        guard let url = ServerPresentation.standardLocalhostURL(for: group) else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(urlString, forType: .string)
-        showBanner("Copied \(urlString)")
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        showBanner("Copied \(url.absoluteString)")
+    }
+
+    func copyServerNamedLocalhostURL(_ group: ServerGroup) {
+        guard let url = ServerPresentation.namedLocalhostURL(for: group)
+                ?? ServerPresentation.standardLocalhostURL(for: group) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        showBanner("Copied \(url.absoluteString)")
     }
 
     func steerMode(for obs: AgentObservation) -> AgentSteerMode? {
@@ -848,6 +875,7 @@ final class DashboardModel: ObservableObject {
         isPerformingAction = true
         let executor = actionExecutor
         let home = homeDirectory
+        let candidatesByID = Dictionary(candidates.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         Task {
             let report = await Task.detached(priority: .userInitiated) {
                 let service = InventoryService(safetyEvaluator: SafetyEvaluator(), worktreeInspector: WorktreeInspector())
@@ -856,6 +884,21 @@ final class DashboardModel: ObservableObject {
                 }
             }.value
             isPerformingAction = false
+            for outcome in report.outcomes where outcome.succeeded {
+                if let trashedPath = outcome.trashedURL {
+                    let candidate = candidatesByID[outcome.candidateID]
+                    let category = candidate?.agentName.map { "\($0) · \(candidate?.category ?? "Cache")" }
+                        ?? candidate?.category
+                        ?? "Cleanup Item"
+                    trashRecoveryStore.record(
+                        originalPath: outcome.path,
+                        trashedURL: URL(fileURLWithPath: trashedPath),
+                        category: category,
+                        bytes: outcome.bytes
+                    )
+                }
+            }
+            trashedHistory = trashRecoveryStore.records()
             if report.trashedCount > 0 {
                 let sizeText = ByteCountFormatter.string(fromByteCount: report.reclaimedBytes, countStyle: .file)
                 showBanner("Moved \(report.trashedCount) item\(report.trashedCount == 1 ? "" : "s") (\(sizeText)) to Trash")
@@ -867,8 +910,62 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    func trashWorktree(_ wt: WorktreeRecord) {
+        guard !isPerformingAction else { return }
+        isPerformingAction = true
+        let executor = worktreeCleanupExecutor
+        let worktreeURL = URL(fileURLWithPath: wt.path)
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) {
+                executor.moveToTrash(worktree: wt, parentRoot: worktreeURL)
+            }.value
+            isPerformingAction = false
+            if outcome.trashed {
+                if let trashedURL = outcome.trashedURL {
+                    let branchLabel = wt.branch?.replacingOccurrences(of: "refs/heads/", with: "") ?? "merged"
+                    trashRecoveryStore.record(
+                        originalPath: outcome.path,
+                        trashedURL: trashedURL,
+                        category: "Git Worktree (\(branchLabel))",
+                        bytes: 0
+                    )
+                    trashedHistory = trashRecoveryStore.records()
+                }
+                showBanner("Moved worktree \(worktreeURL.lastPathComponent) to Trash")
+                scanCleanup(forceRestart: true)
+            } else {
+                showBanner(outcome.error ?? "Could not move worktree to Trash", isError: true)
+            }
+        }
+    }
+
+    func restoreTrashedItem(_ item: TrashedItemRecord) {
+        guard !isPerformingAction else { return }
+        isPerformingAction = true
+        let store = trashRecoveryStore
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) {
+                store.restore(item)
+            }.value
+            isPerformingAction = false
+            trashedHistory = store.records()
+            if outcome.restored {
+                let name = URL(fileURLWithPath: item.originalPath).lastPathComponent
+                showBanner("Restored \(name) to \(shortenPathForBanner(item.originalPath))")
+                scanCleanup(forceRestart: true)
+            } else {
+                showBanner(outcome.error ?? "Could not restore item from Trash", isError: true)
+            }
+        }
+    }
+
+    private func shortenPathForBanner(_ path: String) -> String {
+        let home = homeDirectory.path
+        return path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
+    }
+
     var currentAppVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.10"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.2.0"
     }
 
     func checkForUpdates() {

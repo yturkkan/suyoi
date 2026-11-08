@@ -270,6 +270,37 @@ struct ProcessDetailView: View {
             detailRow("Root Process", value: "\(group.name) (PID \(group.rootPID))", monospaced: true)
             detailRow("Member PIDs", value: group.memberPIDs.map(String.init).joined(separator: ", "), monospaced: true)
             detailRow("Ports", value: group.listeners.map { "\($0.address):\($0.port) (\($0.exposure))" }.joined(separator: " · "), monospaced: true)
+            if let namedURL = ServerPresentation.namedLocalhostURL(for: group) {
+                HStack(alignment: .center, spacing: 8) {
+                    Text("Named URL")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 120, alignment: .leading)
+                    Button {
+                        NSWorkspace.shared.open(namedURL)
+                    } label: {
+                        Text(namedURL.absoluteString)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(leafGreen)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open \(namedURL.absoluteString) in browser")
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(namedURL.absoluteString, forType: .string)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy \(namedURL.absoluteString)")
+                    Spacer(minLength: 0)
+                }
+            }
+            if let badge = ServerPresentation.healthBadge(for: group) {
+                detailRow("Health & Uptime", value: "\(badge.label) — \(badge.detail)")
+            }
             if let startedAt = group.startedAt {
                 detailRow("Started", value: startedAt.formatted(date: .abbreviated, time: .shortened))
             }

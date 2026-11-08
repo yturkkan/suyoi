@@ -5,8 +5,11 @@ import SuyoiCore
 struct CleanupPreviewView: View {
     let report: CleanupReport
     let recheckingCandidateIDs: Set<String>
+    let trashedHistory: [TrashedItemRecord]
     let onTrashCandidate: ((CleanupCandidate) -> Void)?
     let onRecheckCandidate: ((CleanupCandidate) -> Void)?
+    let onTrashWorktree: ((WorktreeRecord) -> Void)?
+    let onRestoreTrashedItem: ((TrashedItemRecord) -> Void)?
     let onTrashAllEligible: (() -> Void)?
     let onDismiss: () -> Void
     private let leafGreen = Color(red: 0.22, green: 0.53, blue: 0.39)
@@ -14,15 +17,21 @@ struct CleanupPreviewView: View {
     init(
         report: CleanupReport,
         recheckingCandidateIDs: Set<String> = [],
+        trashedHistory: [TrashedItemRecord] = [],
         onTrashCandidate: ((CleanupCandidate) -> Void)? = nil,
         onRecheckCandidate: ((CleanupCandidate) -> Void)? = nil,
+        onTrashWorktree: ((WorktreeRecord) -> Void)? = nil,
+        onRestoreTrashedItem: ((TrashedItemRecord) -> Void)? = nil,
         onTrashAllEligible: (() -> Void)? = nil,
         onDismiss: @escaping () -> Void
     ) {
         self.report = report
         self.recheckingCandidateIDs = recheckingCandidateIDs
+        self.trashedHistory = trashedHistory
         self.onTrashCandidate = onTrashCandidate
         self.onRecheckCandidate = onRecheckCandidate
+        self.onTrashWorktree = onTrashWorktree
+        self.onRestoreTrashedItem = onRestoreTrashedItem
         self.onTrashAllEligible = onTrashAllEligible
         self.onDismiss = onDismiss
     }
@@ -107,6 +116,13 @@ struct CleanupPreviewView: View {
                         sectionHeader("Git Worktrees (\(report.worktrees.count))")
                         ForEach(report.worktrees, id: \.path) { wt in
                             worktreeCard(wt)
+                        }
+                    }
+
+                    if !trashedHistory.isEmpty {
+                        sectionHeader("Recently Moved to Trash (\(trashedHistory.count))")
+                        ForEach(trashedHistory) { item in
+                            trashedItemCard(item)
                         }
                     }
                 }
@@ -232,24 +248,93 @@ struct CleanupPreviewView: View {
     }
 
     private func worktreeCard(_ wt: WorktreeRecord) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let isEligible = !wt.isMain && wt.blockedReasons.isEmpty && wt.isMergedToDefault == true && !wt.isDirty && !wt.isLocked && wt.usage == .clear
+        return VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(wt.branch ?? wt.headCommit ?? "Detached worktree")
+                Text(wt.branch?.replacingOccurrences(of: "refs/heads/", with: "") ?? wt.headCommit ?? "Detached worktree")
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 Spacer()
-                Text(wt.blockedReasons.isEmpty ? "Clean & merged" : "Protected")
+                Text(isEligible ? "Clean & merged" : "Protected")
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(wt.blockedReasons.isEmpty ? leafGreen : .secondary)
+                    .foregroundStyle(isEligible ? leafGreen : .secondary)
             }
-            Text(displayPath(wt.path))
-                .font(.system(size: 9.5, design: .monospaced))
-                .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Text(displayPath(wt.path))
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: wt.path)])
+                } label: {
+                    Image(systemName: "folder")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(leafGreen)
+                }
+                .buttonStyle(.plain)
+                .help("Reveal worktree in Finder")
+
+                if isEligible, let onTrashWorktree {
+                    Button {
+                        onTrashWorktree(wt)
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 10))
+                            Text("Trash")
+                                .font(.system(size: 9.5, weight: .medium))
+                        }
+                        .foregroundStyle(.red)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Move clean, merged secondary worktree to macOS Trash")
+                }
+            }
             if !wt.blockedReasons.isEmpty {
                 Text(wt.blockedReasons.joined(separator: " · "))
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
+        }
+        .padding(9)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func trashedItemCard(_ item: TrashedItemRecord) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(item.category)
+                    .font(.system(size: 11, weight: .semibold))
+                Spacer()
+                if item.bytes > 0 {
+                    Text(bytes(item.bytes))
+                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                if let onRestoreTrashedItem {
+                    Button {
+                        onRestoreTrashedItem(item)
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.uturn.backward.circle.fill")
+                                .font(.system(size: 10.5))
+                            Text("Put Back")
+                                .font(.system(size: 9.5, weight: .semibold))
+                        }
+                        .foregroundStyle(leafGreen)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Restore \(displayPath(item.originalPath)) from macOS Trash")
+                }
+            }
+            Text(displayPath(item.originalPath))
+                .font(.system(size: 9.5, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
         .padding(9)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))

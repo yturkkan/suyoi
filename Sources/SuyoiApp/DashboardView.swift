@@ -66,8 +66,11 @@ struct DashboardView: View {
                 CleanupPreviewView(
                     report: report,
                     recheckingCandidateIDs: model.recheckingCandidateIDs,
+                    trashedHistory: model.trashedHistory,
                     onTrashCandidate: { model.trashCandidate($0) },
                     onRecheckCandidate: { model.recheckCandidate($0) },
+                    onTrashWorktree: { model.trashWorktree($0) },
+                    onRestoreTrashedItem: { model.restoreTrashedItem($0) },
                     onTrashAllEligible: { model.trashAllReviewable() },
                     onDismiss: { model.isShowingCleanupPreview = false }
                 )
@@ -326,10 +329,14 @@ struct DashboardView: View {
                         let rowID = "server-\(group.id)"
                         ServerGroupCardRow(
                             group: group,
+                            healthBadge: model.serverHealthBadge(for: group),
+                            namedURL: model.namedServerURL(for: group),
                             isHovered: model.hoveredRowID == rowID,
                             onHover: { model.hoveredRowID = $0 ? rowID : (model.hoveredRowID == rowID ? nil : model.hoveredRowID) },
                             onOpenBrowser: { model.openServerInBrowser(group) },
+                            onOpenNamedURL: { model.openServerNamedLocalhost(group) },
                             onCopyURL: { model.copyServerURL(group) },
+                            onCopyNamedURL: { model.copyServerNamedLocalhostURL(group) },
                             onStop: { model.stopServer(group) },
                             onSelect: { model.selectedServer = group }
                         )
@@ -474,6 +481,49 @@ struct DashboardView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .disabled(model.isScanning)
+            }
+
+            if !model.trashedHistory.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Label("Recently Moved to Trash (\(model.trashedHistory.count))", systemImage: "arrow.uturn.backward.circle.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(leafGreen)
+                        Spacer()
+                    }
+                    ForEach(model.trashedHistory.prefix(3)) { item in
+                        HStack(spacing: 6) {
+                            Text(URL(fileURLWithPath: item.originalPath).lastPathComponent)
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .lineLimit(1)
+                            Text("· \(item.category)")
+                                .font(.system(size: 9.5))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                            Button {
+                                model.restoreTrashedItem(item)
+                            } label: {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "arrow.uturn.backward")
+                                        .font(.system(size: 9, weight: .semibold))
+                                    Text("Put Back")
+                                        .font(.system(size: 9.5, weight: .semibold))
+                                }
+                                .foregroundStyle(leafGreen)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(leafGreen.opacity(0.12), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(model.isPerformingAction)
+                            .help("Restore \(shortenHomePath(item.originalPath)) from macOS Trash")
+                        }
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .surfaceCardStyle(isHovered: false)
             }
 
             if let report = model.cleanup {
@@ -905,12 +955,24 @@ private struct AgentCardRow: View {
 
 private struct ServerGroupCardRow: View {
     let group: ServerGroup
+    let healthBadge: ServerHealthBadge?
+    let namedURL: URL?
     let isHovered: Bool
     let onHover: (Bool) -> Void
     let onOpenBrowser: () -> Void
+    let onOpenNamedURL: () -> Void
     let onCopyURL: () -> Void
+    let onCopyNamedURL: () -> Void
     let onStop: () -> Void
     let onSelect: () -> Void
+
+    private func badgeTint(for badge: ServerHealthBadge) -> Color {
+        switch badge.state {
+        case .idleStale: return Color(nsColor: .systemOrange)
+        case .active: return Color(nsColor: .systemGreen)
+        case .warm: return .secondary
+        }
+    }
 
     var body: some View {
         let primaryPort = group.listeners.first.map { ":\($0.port)" } ?? "—"
@@ -947,6 +1009,35 @@ private struct ServerGroupCardRow: View {
                             }
                             if group.stoppedByAgentBoundary {
                                 statusBadge("Agent child", tint: .blue)
+                            }
+                            if let healthBadge {
+                                statusBadge(healthBadge.label, tint: badgeTint(for: healthBadge))
+                                    .help(healthBadge.detail)
+                            }
+                        }
+
+                        if let namedURL, let host = namedURL.host, let port = namedURL.port {
+                            HStack(spacing: 5) {
+                                Button(action: onOpenNamedURL) {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "link")
+                                            .font(.system(size: 8.5, weight: .semibold))
+                                        Text("\(host):\(port)")
+                                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                                            .lineLimit(1)
+                                    }
+                                    .foregroundStyle(leafGreen)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Open \(namedURL.absoluteString) in browser")
+
+                                Button(action: onCopyNamedURL) {
+                                    Image(systemName: "doc.on.doc")
+                                        .font(.system(size: 8.5))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Copy \(namedURL.absoluteString)")
                             }
                         }
 

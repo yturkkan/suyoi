@@ -15,9 +15,9 @@ Modern software development on macOS often involves running multiple coding agen
 **Suyoi** lives in the macOS menu bar and provides a single, low-overhead control plane to:
 
 - **Inspect & steer coding agents** — Detect native and runtime-wrapped (`node`, `bun`, `deno`, `python`) agent processes via `libproc` and bounded `KERN_PROCARGS2` inspection, view local task metadata, focus the host terminal/IDE window, and send follow-up instructions to verified foreground agents in Terminal or iTerm2.
-- **Group & manage localhost dev servers** — Map listening TCP ports to their owning process trees, git branches, and frameworks (`Next.js`, `Vite`, `SwiftPM`, `Cargo`, `Python`, `Go`) with one-click browser launch, URL copy, and safe process-group termination.
+- **Group & manage localhost dev servers** — Map listening TCP ports to their owning process trees, git branches, and frameworks (`Next.js`, `Vite`, `SwiftPM`, `Cargo`, `Python`, `Go`) with RFC 1123 named `http://<project>.localhost:<port>` URLs, stale/idle (`Idle 2h+`) & uptime badges, one-click browser launch, URL copy, and safe process-group termination.
 - **Track 5-hour & 7-day AI quotas** — Combine offline local rolling token counters (`300m` and `10080m` windows) with optional in-memory OAuth quota window checks (`Codex`, `Claude`, `Gemini`, `OpenCode`, `Cursor`), including reset countdowns and customizable provider ordering.
-- **Reclaim build & cache storage safely** — Scan workspace build directories (`node_modules`, `.build`, `.next`, `target`, `dist`, `.turbo`, `__pycache__`) and 50+ developer/AI cache locations, verify live process/open-file/lockfile safety at execution time, and move eligible items to **macOS Trash** (`FileManager.trashItem`) — never `rm -rf`.
+- **Reclaim build, cache & merged git worktree storage safely** — Scan workspace build directories (`node_modules`, `.build`, `.next`, `target`, `dist`, `.turbo`, `__pycache__`), 50+ developer/AI cache locations, and clean merged secondary git worktrees; verify live process/open-file/lockfile safety at execution time; move eligible items to **macOS Trash** (`FileManager.trashItem`) — never `rm -rf` — and restore recently trashed items with one-click **Put Back** recovery.
 
 ---
 
@@ -105,7 +105,7 @@ Suyoi/
 │   ├── SuyoiCore/        # Process inspection, tree grouping, quotas, cleanup safety & steering
 │   └── SuyoiApp/         # AppKit status bar controller, SwiftUI popover views & CLI entrypoint
 ├── Tests/
-│   └── SuyoiCoreTests/   # Unit and fixture tests (202 tests across 24 suites)
+│   └── SuyoiCoreTests/   # Unit and fixture tests (250 tests across 27 suites)
 ├── Resources/            # AppIcon.icns & artwork
 ├── scripts/
 │   ├── build-app.sh      # Release bundle & archive builder
