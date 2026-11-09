@@ -32,6 +32,20 @@ struct NativeAgentJobLauncherTests {
         try await waitUntil { Darwin.kill(pid, 0) == -1 && errno == ESRCH }
     }
 
+    @Test func providerStoresAreScopedToTheChildEnvironment() throws {
+        let fixture = try QuotaFixture()
+        defer { fixture.clean() }
+        let catalog = NativeSessionCatalog(homeDirectory: fixture.home)
+        let codex = NativeAgentJobLauncher.environment(for: "/tools/codex", catalog: catalog)
+        let openCode = NativeAgentJobLauncher.environment(for: "/tools/opencode", catalog: catalog)
+        #expect(codex["CODEX_HOME"] == catalog.codexHome.path)
+        #expect(codex["CODEX_SQLITE_HOME"] == catalog.codexHome.path)
+        #expect(codex["OPENCODE_DB"] == nil)
+        #expect(openCode["OPENCODE_DB"] == catalog.openCodeDB.path)
+        #expect(openCode["CODEX_HOME"] == nil)
+        #expect(Set(openCode.keys) == ["PATH", "LC_ALL", "GIT_OPTIONAL_LOCKS", "OPENCODE_DB"])
+    }
+
     @Test func launchRejectsRelativeExecutablesAndMissingDirectories() throws {
         let fixture = try QuotaFixture()
         defer { fixture.clean() }

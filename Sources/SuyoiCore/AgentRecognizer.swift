@@ -91,7 +91,7 @@ public enum AgentRecognizer {
                 }
             }.flatMap { $0.listeners.map(\.port) }
             let host = terminalHost(for: process, processesByPID: tree.processesByPID)
-            let activity = AgentActivityEvaluator().evaluate(process: process, allProcesses: processes, homeDirectory: homeDirectory)
+            let activity = AgentActivityEvaluator().evaluate(process: process, allProcesses: processes)
             let project = cwd.flatMap { projectsByPath[$0] }
             let context = AgentTaskInspector(homeDirectory: homeDirectory).inspect(agentName: name, process: process, projectRoot: project?.rootPath ?? cwd, allProcesses: processes)
             return AgentObservation(id: process.pid, agentName: name, process: process,

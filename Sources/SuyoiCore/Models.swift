@@ -564,14 +564,17 @@ public struct TrashItemOutcome: Codable, Equatable, Sendable {
     public let bytes: Int64
     public let succeeded: Bool
     public let error: String?
+    public let recovery: TrashRecoveryEvidence?
 
-    public init(candidateID: String, path: String, trashedURL: String? = nil, bytes: Int64, succeeded: Bool, error: String? = nil) {
+    public init(candidateID: String, path: String, trashedURL: String? = nil, bytes: Int64, succeeded: Bool,
+                error: String? = nil, recovery: TrashRecoveryEvidence? = nil) {
         self.candidateID = candidateID
         self.path = path
         self.trashedURL = trashedURL
         self.bytes = bytes
         self.succeeded = succeeded
         self.error = error
+        self.recovery = recovery
     }
 }
 

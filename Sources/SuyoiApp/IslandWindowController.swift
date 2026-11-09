@@ -216,15 +216,25 @@ final class IslandWindowController: NSObject {
     }
 
     private func positionNotch(_ panel: NSPanel, on screen: NSScreen, animated: Bool) {
+        let screenSnapshot = ScreenGeometrySnapshot(
+            frame: screen.frame,
+            visibleFrame: screen.visibleFrame,
+            safeAreaTopInset: screen.safeAreaInsets.top,
+            auxiliaryTopLeftWidth: screen.auxiliaryTopLeftArea?.width ?? 0,
+            auxiliaryTopRightWidth: screen.auxiliaryTopRightArea?.width ?? 0
+        )
+        let baseFrame = IslandSurfaceCalculator.notchPanelFrame(
+            for: screenSnapshot,
+            state: state.isNotchExpanded ? .attentionBanner : .compactPill
+        )
         let size: NSSize
         if state.snapshot.firstApprovalID != nil {
-            size = NSSize(width: 410, height: 104)
+            size = NSSize(width: 420, height: 112)
         } else if state.isNotchExpanded {
-            size = NSSize(width: 390, height: 92)
+            size = NSSize(width: baseFrame.width, height: max(baseFrame.height, 96))
         } else {
-            size = NSSize(width: 220, height: 32)
+            size = baseFrame.size
         }
-        // Keep the content below the physical camera cutout on built-in displays.
         let top = screen.frame.maxY - screen.safeAreaInsets.top
         let frame = NSRect(
             x: screen.frame.midX - size.width / 2, y: top - size.height,
@@ -355,26 +365,31 @@ private struct NotchIslandView: View {
                     .frame(height: 16)
 
                     if state.isNotchExpanded {
-                        HStack(spacing: 10) {
+                        HStack(alignment: .top, spacing: 10) {
                             Image(systemName: state.snapshot.needsAttention ? "hand.raised.fill" : "sparkles")
                                 .foregroundStyle(state.accentColor)
+                                .padding(.top, 2)
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(state.snapshot.firstApprovalID != nil
                                      ? state.snapshot.approvalToolName : state.snapshot.agentName)
-                                    .font(.system(size: 12, weight: .semibold))
+                                    .font(.system(size: 12.5, weight: .semibold))
+                                    .lineLimit(1)
                                 Text(state.snapshot.firstApprovalID != nil
                                      ? state.snapshot.approvalSummary
                                      : (state.snapshot.needsAttention
                                         ? state.snapshot.attentionSummary : state.snapshot.taskSummary))
                                     .font(.system(size: 11))
-                                    .foregroundStyle(.white.opacity(0.7))
+                                    .foregroundStyle(.white.opacity(0.75))
+                                    .lineLimit(2)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                             Spacer(minLength: 0)
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundStyle(.white.opacity(0.6))
+                                .padding(.top, 4)
                         }
-                        .frame(height: 32)
+                        .frame(minHeight: 34)
                         .transition(.opacity)
                     }
                 }
@@ -422,7 +437,6 @@ private struct NotchIslandView: View {
                 .transition(.opacity)
             }
         }
-        .lineLimit(1)
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

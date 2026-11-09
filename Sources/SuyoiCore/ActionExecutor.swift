@@ -158,12 +158,17 @@ public struct ActionExecutor: ActionExecuting, Sendable {
                 outcomes.append(failed(blocker))
                 continue
             }
+            guard let recovery = TrashRecoveryEvidence.prepare(original: url, expectedIdentity: expectedIdentity) else {
+                outcomes.append(failed("Candidate identity or parent directory could not be verified"))
+                continue
+            }
             do {
                 let trashed = try trashHandler(url)
                 let bytes = max(0, candidate.bytes)
                 reclaimedBytes = reclaimedBytes > Int64.max - bytes ? Int64.max : reclaimedBytes + bytes
                 outcomes.append(TrashItemOutcome(candidateID: candidate.id, path: candidate.path,
-                    trashedURL: trashed?.path, bytes: bytes, succeeded: true))
+                    trashedURL: trashed?.path, bytes: bytes, succeeded: true,
+                    recovery: recovery.completed(at: trashed)))
             } catch {
                 outcomes.append(failed("Could not move candidate to Trash: \(error.localizedDescription)"))
             }

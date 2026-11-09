@@ -31,7 +31,11 @@ struct SessionTurnPreviewInspectorTests {
             try write(JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]), to: path)
         }
         func inspect(_ agent: AgentObservation, processes: [ObservedProcess] = []) -> SessionTurnPreview? {
-            SessionTurnPreviewInspector(homeDirectory: home).inspectPreview(for: agent, allProcesses: processes)
+            let inspector = SessionTurnPreviewInspector(homeDirectory: home)
+            if let sessionID = agent.sessionID {
+                return inspector.inspectSelectedSession(sessionID, for: agent, allProcesses: processes)
+            }
+            return inspector.inspectPreview(for: agent, allProcesses: processes)
         }
     }
 
@@ -75,6 +79,8 @@ struct SessionTurnPreviewInspectorTests {
         "AIza" + String(repeating: "i", count: 24),
         "Bearer " + String(repeating: "j", count: 24) + ".abc_def-123",
         "bearer\n" + String(repeating: "k", count: 24),
+        "Bearer /fixture+key~with_padding==",
+        "Bearer sk-fixture123456789/with+padding==",
         "eyJ" + String(repeating: "l", count: 16) + "." + String(repeating: "m", count: 16),
         "eyJ" + String(repeating: "n", count: 16) + "." + String(repeating: "o", count: 16) + ".signature"
     ]
@@ -109,6 +115,16 @@ struct SessionTurnPreviewInspectorTests {
                                          recentTools: [SessionToolCallSummary(toolName: "Read", targetSummary: "file.swift", status: "completed")],
                                          updatedAt: Date(timeIntervalSince1970: 1_800_000_000))
         #expect(try JSONDecoder().decode(SessionTurnPreview.self, from: JSONEncoder().encode(preview)) == preview)
+    }
+
+    @Test func liveRowsCannotReadUnverifiedSessionText() throws {
+        let f = try Fixture(); defer { f.clean() }
+        try f.write([meta(), event("user_message", "Unrelated conversation")], to: codexPath)
+        try f.write([claude("user", content: "Unrelated conversation")], to: claudePath)
+        let inspector = SessionTurnPreviewInspector(homeDirectory: f.home)
+        for row in [agent(sessionID: nil), agent(), agent("Claude Code", sessionID: nil), agent("Claude Code")] {
+            #expect(inspector.inspectPreview(for: row)?.lastUserPromptPreview == nil)
+        }
     }
 
     @Test func codexLatestMessagesAndAllowedRoles() throws {
@@ -200,7 +216,7 @@ struct SessionTurnPreviewInspectorTests {
         #expect(f.inspect(agent()) == nil)
     }
 
-    @Test func projectFallbackSelectsLatestMatchingCodexFile() throws {
+    @Test func explicitSelectionDoesNotUseProjectRecency() throws {
         let f = try Fixture(); defer { f.clean() }
         let older = ".codex/sessions/2026/11/07/older.jsonl"
         let unrelated = ".codex/sessions/2026/11/08/unrelated.jsonl"
@@ -208,7 +224,7 @@ struct SessionTurnPreviewInspectorTests {
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 100)], ofItemAtPath: f.home.appendingPathComponent(older).path)
         try f.write([meta(), event("user_message", "Current request")], to: codexPath)
         try f.write([meta("unrelated", root: "/workspace/other"), event("user_message", "Unrelated request")], to: unrelated)
-        let preview = try #require(f.inspect(agent(sessionID: nil, root: "/workspace/app/.")))
+        let preview = try #require(f.inspect(agent(root: "/workspace/app/.")))
         #expect(preview.sessionID == "turn-a")
         #expect(preview.lastUserPromptPreview == "Current request")
         #expect(f.inspect(agent(sessionID: nil, root: "/workspace/ap")) == nil)
@@ -221,7 +237,8 @@ struct SessionTurnPreviewInspectorTests {
         let f = try Fixture(); defer { f.clean() }
         let record: [String: Any] = ["type": "user", "message": ["content": "Directory-associated request"]]
         try f.write([record], to: claudePath)
-        #expect(f.inspect(agent("Claude Code", sessionID: nil))?.lastUserPromptPreview == "Directory-associated request")
+        #expect(f.inspect(agent("Claude Code", sessionID: nil)) == nil)
+        #expect(f.inspect(agent("Claude Code"))?.lastUserPromptPreview == "Directory-associated request")
         #expect(f.inspect(agent("Claude Code"))?.sessionID == "turn-a")
         #expect(f.inspect(agent("Claude Code", sessionID: nil, root: "/workspace/other")) == nil)
         // Explicit identifiers work across projects without associating a different session by cwd.
@@ -234,7 +251,7 @@ struct SessionTurnPreviewInspectorTests {
         try f.write([meta("older"), event("user_message", "Old request")], to: older)
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 100)], ofItemAtPath: f.home.appendingPathComponent(older).path)
         try f.write([meta()], to: codexPath)
-        #expect(f.inspect(agent(sessionID: nil)) == nil)
+        #expect(f.inspect(agent()) == nil)
     }
 
     @Test func largeCodexTailSkipsPartialRecordsAndOldHeadMessages() throws {
@@ -246,7 +263,7 @@ struct SessionTurnPreviewInspectorTests {
         data.append(try JSONSerialization.data(withJSONObject: event("agent_message", "Recent reply")))
         data.append(Data("\n{malformed}\n{\"incomplete\":".utf8))
         try f.write(data, to: codexPath)
-        let preview = try #require(f.inspect(agent(sessionID: nil)))
+        let preview = try #require(f.inspect(agent()))
         #expect(preview.sessionID == "turn-a")
         #expect(preview.lastUserPromptPreview == nil)
         #expect(preview.lastAssistantReplyPreview == "Recent reply")
@@ -259,7 +276,7 @@ struct SessionTurnPreviewInspectorTests {
         data.append(Data((String(repeating: " ", count: 100_000) + "\n").utf8))
         data.append(try JSONSerialization.data(withJSONObject: claude("user", content: "Recent request")))
         try f.write(data, to: claudePath)
-        #expect(f.inspect(agent("Claude Code", sessionID: nil))?.lastUserPromptPreview == "Recent request")
+        #expect(f.inspect(agent("Claude Code"))?.lastUserPromptPreview == "Recent request")
     }
 
     @Test func oversizedOnlyMessageAndMalformedFilesAreUnavailable() throws {

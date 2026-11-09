@@ -8,8 +8,8 @@ private final class SteeringRunner: CommandRunning, @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [CommandRequest] = []
     let result: CommandResult
-    init(exit: Int32 = 0, timeout: Bool = false) {
-        result = CommandResult(exitCode: exit, stdout: Data("PRIVATE OUTPUT".utf8), stderr: Data("PRIVATE ERROR".utf8), timedOut: timeout, truncated: false)
+    init(exit: Int32 = 0, timeout: Bool = false, stdout: String = "PRIVATE OUTPUT") {
+        result = CommandResult(exitCode: exit, stdout: Data(stdout.utf8), stderr: Data("PRIVATE ERROR".utf8), timedOut: timeout, truncated: false)
     }
     var requests: [CommandRequest] { lock.lock(); defer { lock.unlock() }; return storage }
     func run(_ request: CommandRequest) throws -> CommandResult {
@@ -78,12 +78,11 @@ struct AgentSteererTests {
     private func steerer(
         _ runner: SteeringRunner,
         live: ObservedProcess,
-        verifySessionOwnership: (@Sendable (ProcessIdentity, AgentSteerMode, String) -> Bool)? = nil,
         foreground: TerminalForegroundVerifier? = nil,
         launcher: SteeringLauncher = SteeringLauncher()
     ) -> AgentSteerer {
         AgentSteerer(processLookup: { _, _ in live }, runner: runner, executableResolver: { "/tools/\($0)" },
-                     verifySessionOwnership: verifySessionOwnership, nativeJobLauncher: launcher,
+                     nativeJobLauncher: launcher,
                      terminalForegroundVerifier: foreground ?? terminalVerifier())
     }
 
@@ -98,14 +97,13 @@ struct AgentSteererTests {
                                    ttyDevice: { $0 == "/dev/ttys001" ? deviceNumber : nil },
                                    currentUID: { currentUID })
     }
-    private func sessionOwner(
-        _ identity: ProcessIdentity,
-        mode: AgentSteerMode,
-        session: String = "session-1"
-    ) -> @Sendable (ProcessIdentity, AgentSteerMode, String) -> Bool {
-        { liveIdentity, requestedMode, requestedSession in
-            liveIdentity == identity && requestedMode == mode && requestedSession == session
-        }
+    private func codexTarget(in fixture: QuotaFixture, for row: AgentObservation) throws -> NativeSessionTarget {
+        let id = "4fa50a5b-6037-477d-899b-98257d4e707b"
+        let project = fixture.home.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try fixture.write([["type": "session_meta", "payload": ["id": id, "cwd": project.path]]],
+                          to: ".codex/sessions/2026/11/07/rollout-2026-11-07T10-30-00-\(id).jsonl")
+        return try #require(AgentTaskInspector(homeDirectory: fixture.home).nativeSessionTargets(for: row).first)
     }
 
     @Test func selectsModesAndRejectsUnsafeMetadata() {
@@ -118,7 +116,7 @@ struct AgentSteererTests {
         for id in ["--help", "-session", "bad/id", "bad\nID", "é", "", String(repeating: "a", count: 97)] {
             #expect(!AgentSteerer.canSteer(agent(session: id)))
             let runner = SteeringRunner(), launcher = SteeringLauncher()
-            let steerer = steerer(runner, live: process(), verifySessionOwnership: { _, _, _ in true }, launcher: launcher)
+            let steerer = steerer(runner, live: process(), launcher: launcher)
             #expect(!steerer.steer(agent: agent(session: id), prompt: "hello", uid: 501).succeeded)
             #expect(runner.requests.isEmpty && launcher.requests.isEmpty)
         }
@@ -128,7 +126,7 @@ struct AgentSteererTests {
     @Test func identityAndTTYReverificationFailuresNeverLaunch() {
         for live in [process(pid: 401), process(start: 101), process(uid: 502)] {
             let runner = SteeringRunner(), launcher = SteeringLauncher()
-            let steerer = steerer(runner, live: live, verifySessionOwnership: sessionOwner(live.identity, mode: .codexResume), launcher: launcher)
+            let steerer = steerer(runner, live: live, launcher: launcher)
             #expect(!steerer.steer(agent: agent(), prompt: "hello", uid: 501).succeeded)
             #expect(runner.requests.isEmpty && launcher.requests.isEmpty)
         }
@@ -138,7 +136,7 @@ struct AgentSteererTests {
         #expect(!steerer(runner, live: process(tty: "ttys001", stopped: true)).steer(agent: target, prompt: "hello", uid: 501).succeeded)
         #expect(!steerer(runner, live: process()).steer(agent: target, prompt: "hello", uid: 501).succeeded)
         let launcher = SteeringLauncher()
-        let native = steerer(runner, live: process(), verifySessionOwnership: sessionOwner(process().identity, mode: .codexResume), launcher: launcher)
+        let native = steerer(runner, live: process(), launcher: launcher)
         #expect(!native.steer(agent: agent(), prompt: "hello", uid: 502).succeeded)
         #expect(runner.requests.isEmpty && launcher.requests.isEmpty)
     }
@@ -238,53 +236,163 @@ struct AgentSteererTests {
         #expect(rejected.requests.isEmpty)
     }
 
-    @Test func cliUsesSafeArgvAndReportsOnlyLocalLaunch() throws {
-        for (name, mode, args) in [("OpenCode", AgentSteerMode.openCodeSession, ["run", "--session", "session-1", "--", "--safe\ttext"]), ("Codex", .codexResume, ["exec", "resume", "session-1", "--", "--safe\ttext"])] {
-            let live = process(), runner = SteeringRunner(timeout: true), launcher = SteeringLauncher()
-            let steerer = steerer(runner, live: live, verifySessionOwnership: sessionOwner(live.identity, mode: mode), launcher: launcher)
-            let outcome = steerer.steer(agent: agent(name), prompt: " \0\n--safe\ttext\r ", uid: 501)
-            #expect(outcome.succeeded && outcome.mode == mode)
-            #expect(outcome.detail == "Started local \(name) continuation process")
-            #expect(runner.requests.isEmpty)
-            let request = try #require(launcher.requests.first)
-            #expect(request.executable == "/tools/\(name == "OpenCode" ? "opencode" : "codex")")
-            #expect(request.arguments == args)
-            #expect(launcher.requests.count == 1)
-        }
-    }
-
-    @Test func nativeSessionOwnershipMustMatchProcessProviderAndSession() {
-        let proof = sessionOwner(process().identity, mode: .codexResume)
-        for target in [agent(process: process(start: 101)), agent("OpenCode"), agent(session: "other-session")] {
-            let runner = SteeringRunner(), launcher = SteeringLauncher()
-            let steerer = steerer(runner, live: target.process, verifySessionOwnership: proof, launcher: launcher)
-            #expect(!steerer.steer(agent: target, prompt: "continue", uid: 501).succeeded)
-            #expect(runner.requests.isEmpty && launcher.requests.isEmpty)
-        }
-    }
-
-    @Test func cliUsesValidProjectThenCWDFallback() throws {
+    @Test(arguments: ["Codex", "OpenCode"])
+    func explicitSessionContinuationFromGenericDirectoryUsesChosenProject(_ provider: String) throws {
         let fixture = try QuotaFixture(); defer { fixture.clean() }
-        let project = fixture.home.appendingPathComponent("project")
-        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
-        let file = fixture.home.appendingPathComponent("file")
-        try Data().write(to: file)
-        for (name, mode) in [("Codex", AgentSteerMode.codexResume), ("OpenCode", .openCodeSession)] {
-            for (root, cwd, expected) in [(project.path, fixture.home.path, project),
-                                           (file.path, fixture.home.path, fixture.home),
-                                           ("/missing-\(UUID().uuidString)", fixture.home.path, fixture.home)] {
-                let live = process(cwd: cwd), launcher = SteeringLauncher()
-                let context = ProjectContext(rootPath: root, name: "Fixture", framework: nil, gitBranch: nil, gitCommit: nil, isWorktree: false)
-                let target = AgentObservation(id: live.pid, agentName: name, process: live, project: context, terminalApp: nil, statusSource: .processOnly, childServerPorts: [], sessionID: "safe-session")
-                let steerer = steerer(SteeringRunner(), live: live, verifySessionOwnership: sessionOwner(live.identity, mode: mode, session: "safe-session"), launcher: launcher)
-                #expect(steerer.steer(agent: target, prompt: "continue", uid: 501).succeeded)
-                #expect(try #require(launcher.requests.first).workingDirectory?.path == expected.path)
-            }
+        let project = fixture.home.appendingPathComponent("selected-project").resolvingSymlinksInPath()
+        let other = fixture.home.appendingPathComponent("other-project").resolvingSymlinksInPath()
+        for directory in [project, other] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         }
-        let live = process(cwd: file.path), launcher = SteeringLauncher()
-        let steerer = steerer(SteeringRunner(), live: live, verifySessionOwnership: sessionOwner(live.identity, mode: .codexResume), launcher: launcher)
-        #expect(steerer.steer(agent: agent(process: live), prompt: "continue", uid: 501).succeeded)
-        #expect(try #require(launcher.requests.first).workingDirectory == nil)
+        let isCodex = provider == "Codex"
+        let sessionID = isCodex ? "4fa50a5b-6037-477d-899b-98257d4e707b" : "ses_important"
+        let otherID = isCodex ? "e7038a11-aac6-499c-87c1-9b2e44d826a1" : "ses_other"
+        var db: OpaquePointer?
+        defer { if let db { sqlite3_close(db) } }
+        var rollout: URL?
+        if isCodex {
+            for (id, directory) in [(sessionID, project), (otherID, other)] {
+                let path = ".codex/sessions/2026/11/07/rollout-2026-11-07T10-30-00-\(id).jsonl"
+                try fixture.write([["type": "session_meta", "payload": ["id": id, "cwd": directory.path]]], to: path)
+                if id == sessionID { rollout = fixture.home.appendingPathComponent(path) }
+            }
+        } else {
+            try fixture.write(Data(), to: ".local/share/opencode/opencode.db")
+            let path = fixture.home.appendingPathComponent(".local/share/opencode/opencode.db").path
+            try #require(sqlite3_open(path, &db) == SQLITE_OK)
+            try #require(sqlite3_exec(db, """
+                CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_updated INTEGER);
+                INSERT INTO session_v2 VALUES ('\(sessionID)', 'Selected work', '\(project.path)', 100);
+                INSERT INTO session_v2 VALUES ('\(otherID)', 'Different work', '\(other.path)', 200);
+                """, nil, nil, nil) == SQLITE_OK)
+        }
+        let uid = Int(getuid())
+        let executable = isCodex ? "codex" : "opencode"
+        let live = process(uid: uid, cwd: "/", executable: "/tools/\(executable)")
+        let row = agent(provider, process: live, session: otherID)
+        let inspector = AgentTaskInspector(homeDirectory: fixture.home)
+        let targets = inspector.nativeSessionTargets(for: row)
+        #expect(Set(targets.map(\.sessionID)) == [sessionID, otherID])
+        let choice = try #require(targets.first { $0.sessionID == sessionID })
+        let catalog = NativeSessionCatalog(homeDirectory: fixture.home)
+        let runner = SteeringRunner(stdout: catalog.openCodeDB.path + "\n"), launcher = SteeringLauncher()
+        let steerer = AgentSteerer(processLookup: { _, _ in live }, runner: runner,
+                                   executableResolver: { "/tools/\($0)" }, homeDirectory: fixture.home,
+                                   nativeJobLauncher: launcher)
+        #expect(!steerer.steer(agent: row, prompt: "continue", uid: uid).succeeded)
+        #expect(launcher.requests.isEmpty)
+        let outcome = steerer.steer(agent: row, target: choice, prompt: " \0\n--follow up\r ", uid: uid)
+        #expect(outcome.succeeded && outcome.mode == (isCodex ? .codexResume : .openCodeSession))
+        #expect(outcome.detail?.contains("Started continuation") == true)
+        let request = try #require(launcher.requests.first)
+        let expected = isCodex ? ["exec", "-c", "sqlite_home=\"\(catalog.codexHome.path)\"", "resume", sessionID, "--", "--follow up"]
+                               : ["--standalone", "run", "--session", sessionID, "--", "--follow up"]
+        #expect(request.arguments == expected)
+        #expect(request.workingDirectory?.path == project.path)
+        if isCodex {
+            #expect(runner.requests.isEmpty)
+        } else {
+            let preflight = try #require(runner.requests.first)
+            #expect(preflight.arguments == ["debug", "paths", "db"])
+            #expect(preflight.environment["OPENCODE_DB"] == catalog.openCodeDB.path)
+            let mismatched = AgentSteerer(processLookup: { _, _ in live }, runner: SteeringRunner(stdout: "/elsewhere/opencode.db\n"),
+                                          executableResolver: { "/tools/\($0)" }, homeDirectory: fixture.home,
+                                          nativeJobLauncher: launcher)
+            #expect(!mismatched.steer(agent: row, target: choice, prompt: "continue", uid: uid).succeeded)
+        }
+
+        let otherRow = agent(provider, process: process(pid: 401, uid: uid, cwd: "/", executable: "/tools/\(executable)"))
+        #expect(!steerer.steer(agent: otherRow, target: choice, prompt: "continue", uid: uid).succeeded)
+        let otherProvider = agent(isCodex ? "OpenCode" : "Codex", process: live)
+        #expect(!steerer.steer(agent: otherProvider, target: choice, prompt: "continue", uid: uid).succeeded)
+        let changed = process(start: 101, uid: uid, cwd: "/", executable: "/tools/\(executable)")
+        let stale = AgentSteerer(processLookup: { _, _ in changed }, runner: runner,
+                                 executableResolver: { "/tools/\($0)" }, homeDirectory: fixture.home,
+                                 nativeJobLauncher: launcher)
+        #expect(!stale.steer(agent: row, target: choice, prompt: "continue", uid: uid).succeeded)
+        let projectRow = agent(provider, process: process(uid: uid, cwd: project.path, executable: "/tools/\(executable)"))
+        #expect(inspector.nativeSessionTargets(for: projectRow).map(\.sessionID) == [sessionID])
+        if let rollout {
+            let original = try Data(contentsOf: rollout)
+            try original.write(to: rollout, options: .atomic)
+        } else {
+            try #require(sqlite3_exec(db, "DELETE FROM session_v2 WHERE id = '\(sessionID)'", nil, nil, nil) == SQLITE_OK)
+        }
+        let probesBeforeStaleSelection = runner.requests.count
+        #expect(!steerer.steer(agent: row, target: choice, prompt: "continue", uid: uid).succeeded)
+        #expect(runner.requests.count == probesBeforeStaleSelection)
+        #expect(launcher.requests.count == 1)
+    }
+
+    @Test func codexConflictingIndexOrArchiveCannotAuthorizeContinuation() throws {
+        let fixture = try QuotaFixture(); defer { fixture.clean() }
+        let uid = Int(getuid())
+        let live = process(uid: uid, cwd: "/")
+        let row = agent(process: live)
+        let choice = try codexTarget(in: fixture, for: row)
+        let catalog = NativeSessionCatalog(homeDirectory: fixture.home)
+        #expect(catalog.validate(choice, for: row, live: live))
+
+        let duplicate = ".codex/archived_sessions/rollout-2026-01-01T12-00-00-\(choice.sessionID).jsonl.zst"
+        try fixture.write(Data("fixture".utf8), to: duplicate)
+        #expect(!catalog.validate(choice, for: row, live: live))
+        try FileManager.default.removeItem(at: fixture.home.appendingPathComponent(duplicate))
+        let revised = ".codex/sessions/recovered/rollout-2026-11-09T10-00-00-\(choice.sessionID)_4abb52c8-09bc-42b2-82a8-1d043d39c49c.jsonl"
+        try fixture.write(Data("fixture".utf8), to: revised)
+        #expect(!catalog.validate(choice, for: row, live: live))
+        try FileManager.default.removeItem(at: fixture.home.appendingPathComponent(revised))
+
+        var db: OpaquePointer?
+        let indexPath = catalog.codexHome.appendingPathComponent("state_5.sqlite").path
+        try #require(sqlite3_open(indexPath, &db) == SQLITE_OK)
+        defer { if let db { sqlite3_close(db) } }
+        try #require(sqlite3_exec(db, """
+            CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT);
+            INSERT INTO threads VALUES ('\(choice.sessionID)', '/different/rollout.jsonl');
+            """, nil, nil, nil) == SQLITE_OK)
+        #expect(!catalog.validate(choice, for: row, live: live))
+        try #require(sqlite3_exec(db, "UPDATE threads SET rollout_path = '\(choice.source.path)'", nil, nil, nil) == SQLITE_OK)
+        #expect(catalog.validate(choice, for: row, live: live))
+
+        let symlink = catalog.codexRoot.appendingPathComponent("2025")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: catalog.codexRoot.appendingPathComponent("2026"))
+        #expect(!catalog.validate(choice, for: row, live: live))
+    }
+
+    @Test func replacingSelectedProjectDirectoryInvalidatesNativeTarget() throws {
+        let fixture = try QuotaFixture(); defer { fixture.clean() }
+        let live = process(uid: Int(getuid()), cwd: "/")
+        let row = agent(process: live)
+        let choice = try codexTarget(in: fixture, for: row)
+        let catalog = NativeSessionCatalog(homeDirectory: fixture.home)
+        #expect(catalog.validate(choice, for: row, live: live))
+        let project = URL(fileURLWithPath: choice.projectPath, isDirectory: true)
+        try FileManager.default.moveItem(at: project, to: fixture.home.appendingPathComponent("original"))
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: false)
+        #expect(!catalog.validate(choice, for: row, live: live))
+    }
+
+    @Test func openCodeDuplicateIDOutsideTheProjectCannotAuthorizeContinuation() throws {
+        let fixture = try QuotaFixture(); defer { fixture.clean() }
+        let catalog = NativeSessionCatalog(homeDirectory: fixture.home)
+        let project = fixture.home.appendingPathComponent("project")
+        let other = fixture.home.appendingPathComponent("other")
+        for directory in [project, other] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try fixture.write(Data(), to: ".local/share/opencode/opencode.db")
+        var db: OpaquePointer?
+        try #require(sqlite3_open(catalog.openCodeDB.path, &db) == SQLITE_OK)
+        defer { if let db { sqlite3_close(db) } }
+        try #require(sqlite3_exec(db, """
+            CREATE TABLE session_v2 (id TEXT, title TEXT, directory TEXT, time_updated INTEGER);
+            INSERT INTO session_v2 VALUES ('ses_same', 'First', '\(project.path)', 100);
+            INSERT INTO session_v2 VALUES ('ses_same', 'Second', '\(other.path)', 200);
+            """, nil, nil, nil) == SQLITE_OK)
+        let live = process(uid: Int(getuid()), cwd: project.path, executable: "/tools/opencode")
+        let row = agent("OpenCode", process: live)
+        let choice = try #require(catalog.choices(for: row).first)
+        #expect(!catalog.validate(choice, for: row, live: live))
     }
 
     @Test func commandRunnerAppliesDirectoryAndOptInPATH() throws {
@@ -321,22 +429,13 @@ struct AgentSteererTests {
             for cwd in ["/", fixture.home.path, "/workspace/Suyoi"] {
                 let target = ObservedProcess(pid: 400, parentPID: 1, uid: 501, cpuPercent: 0, residentBytes: 0, executable: "/bin/\(executable)", startTimeMicroseconds: 100, cwd: cwd)
                 let single = inspector.inspect(agentName: name, process: target, projectRoot: nil, allProcesses: [target])
-                #expect(single.sessionID == "safe-session")
+                #expect(single.sessionID == nil && single.sessionTitle == nil && single.currentTask == nil)
                 let observation = agent(name, process: target, session: single.sessionID)
                 let runner = SteeringRunner(), launcher = SteeringLauncher()
                 #expect(!AgentSteerer.canSteer(observation))
                 #expect(!steerer(runner, live: target, launcher: launcher).steer(agent: observation, prompt: "continue", uid: 501).succeeded)
                 #expect(runner.requests.isEmpty && launcher.requests.isEmpty)
-                // Generic-directory display metadata remains available even when it cannot identify a single session.
-                guard cwd != "/workspace/Suyoi" else { continue }
-                #expect(single.sessionTitle != nil && single.currentTask != nil)
-                for stopped in [false, true] {
-                    let peer = ObservedProcess(pid: 401, parentPID: 1, uid: 501, cpuPercent: 0, residentBytes: 0, executable: "/bin/\(executable)", startTimeMicroseconds: 101, cwd: "/another-project", isStopped: stopped)
-                    let context = inspector.inspect(agentName: name, process: target, projectRoot: nil, allProcesses: [target, peer])
-                    #expect(context.sessionID == (stopped ? single.sessionID : nil))
-                    #expect(context.sessionTitle == single.sessionTitle)
-                    #expect(context.currentTask == single.currentTask)
-                }
+
             }
         }
     }
@@ -355,17 +454,20 @@ struct AgentSteererTests {
     }
 
     @Test func discoversCLIInUserBinWithoutCustomResolver() throws {
-        let tempHome = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let executable = tempHome.appendingPathComponent(".bun/bin/codex")
+        let fixture = try QuotaFixture(); defer { fixture.clean() }
+        let executable = fixture.home.appendingPathComponent(".bun/bin/codex")
         try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempHome) }
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
 
-        let live = process(), runner = SteeringRunner(), launcher = SteeringLauncher()
-        let steerer = AgentSteerer(processLookup: { _, _ in live }, runner: runner, homeDirectory: tempHome,
-                                   verifySessionOwnership: sessionOwner(live.identity, mode: .codexResume), nativeJobLauncher: launcher)
-        let outcome = steerer.steer(agent: agent(process: live), prompt: "continue", uid: 501)
+        let uid = Int(getuid())
+        let live = process(uid: uid, cwd: "/", executable: "/bin/codex")
+        let row = agent(process: live)
+        let target = try codexTarget(in: fixture, for: row)
+        let launcher = SteeringLauncher()
+        let steerer = AgentSteerer(processLookup: { _, _ in live }, runner: SteeringRunner(), homeDirectory: fixture.home,
+                                   nativeJobLauncher: launcher)
+        let outcome = steerer.steer(agent: row, target: target, prompt: "continue", uid: uid)
 
         #expect(outcome.succeeded)
         let request = try #require(launcher.requests.first)
@@ -373,14 +475,20 @@ struct AgentSteererTests {
     }
 
     @Test func invalidPromptsAndNativeLaunchFailureArePrivate() throws {
-        let live = process(), runner = SteeringRunner(), launcher = SteeringLauncher(fails: true)
-        let proof = sessionOwner(live.identity, mode: .codexResume)
-        let steering = steerer(runner, live: live, verifySessionOwnership: proof, launcher: launcher)
+        let fixture = try QuotaFixture(); defer { fixture.clean() }
+        let uid = Int(getuid())
+        let live = process(uid: uid, cwd: "/", executable: "/bin/codex")
+        let row = agent(process: live)
+        let target = try codexTarget(in: fixture, for: row)
+        let runner = SteeringRunner(), launcher = SteeringLauncher(fails: true)
+        let steering = AgentSteerer(processLookup: { _, _ in live }, runner: runner,
+                                    executableResolver: { "/tools/\($0)" }, homeDirectory: fixture.home,
+                                    nativeJobLauncher: launcher)
         for prompt in [" \n\0", String(repeating: "x", count: 2001)] {
-            #expect(!steering.steer(agent: agent(), prompt: prompt, uid: 501).succeeded)
+            #expect(!steering.steer(agent: row, target: target, prompt: prompt, uid: uid).succeeded)
         }
         #expect(launcher.requests.isEmpty)
-        let outcome = steering.steer(agent: agent(), prompt: "PRIVATE PROMPT", uid: 501)
+        let outcome = steering.steer(agent: row, target: target, prompt: "PRIVATE PROMPT", uid: uid)
         #expect(!outcome.succeeded)
         #expect(launcher.requests.count == 1)
         #expect(runner.requests.isEmpty)

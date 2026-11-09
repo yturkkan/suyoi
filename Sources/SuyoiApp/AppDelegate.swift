@@ -29,6 +29,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var globalClickMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
 
+    static let popoverSize = NSSize(width: 700, height: 600)
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -42,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
-        popover.contentSize = NSSize(width: 450, height: 600)
+        popover.contentSize = Self.popoverSize
         popover.contentViewController = NSHostingController(rootView: DashboardView(model: model))
 
         model.$snapshot
@@ -171,8 +173,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             && NSApp.modalWindow == nil
             && popover.contentViewController?.view.window?.attachedSheet == nil
             && !model.isShowingSettings
-            && model.selectedAgent == nil
-            && model.selectedServer == nil
+            && model.steeringAgentID == nil
+            && !model.isSteering
+            && !model.isPerformingAction
+            && !model.isLoadingSteerSessions
+            && model.steerPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && model.selectedSteerSessionID == nil
             && !model.isShowingCleanupPreview
             && !model.isShowingNotesPopover
     }

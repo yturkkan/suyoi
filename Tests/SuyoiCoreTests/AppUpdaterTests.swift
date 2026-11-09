@@ -81,6 +81,111 @@ struct AppUpdaterTests {
         }
     }
 
+    @Test("Staging requires a short bundle version matching the normalized release version")
+    func shortBundleVersionVerification() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appendingPathComponent("suyoi-version-test-\(UUID().uuidString)")
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let downloadURL = URL(string: "https://github.com/yturkkan/suyoi/releases/download/v1.2.3/Suyoi.app.zip")!
+        let releaseURL = URL(string: "https://github.com/yturkkan/suyoi/releases/tag/v1.2.3")!
+        let currentApp = root.appendingPathComponent("Suyoi.app")
+        let versions: [Any?] = [nil, 123, "", "invalid", "1..2.3", "1.2.2", "1.2.3"]
+        for (index, version) in versions.enumerated() {
+            let fixture = root.appendingPathComponent(String(index))
+            let app = fixture.appendingPathComponent("Suyoi.app")
+            let contents = app.appendingPathComponent("Contents")
+            let executable = contents.appendingPathComponent("MacOS/Suyoi")
+            try fileManager.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(contentsOf: URL(fileURLWithPath: "/usr/bin/true")).write(to: executable)
+            try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+            var plist: [String: Any] = [
+                "CFBundleIdentifier": "local.suyoi.app",
+                "CFBundleExecutable": "Suyoi",
+                "CFBundlePackageType": "APPL",
+                "CFBundleVersion": "1.2.3"
+            ]
+            plist["CFBundleShortVersionString"] = version
+            try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+                .write(to: contents.appendingPathComponent("Info.plist"))
+            try #require(try runTool("/usr/bin/codesign", ["--force", "--sign", "-", app.path]) == 0)
+            let archive = fixture.appendingPathComponent("archive.zip")
+            try #require(try runTool("/usr/bin/ditto", ["-c", "-k", "--keepParent", app.path, archive.path]) == 0)
+
+            let release = AppReleaseInfo(
+                version: "v1.2.3", tagName: "v1.2.3", releaseURL: releaseURL,
+                downloadURL: downloadURL, assetSizeBytes: 2048,
+                expectedSHA256: try AppUpdater.computeSHA256Hex(of: archive)
+            )
+            let updater = AppUpdater(downloadArchive: { _ in
+                (archive, HTTPURLResponse(url: downloadURL, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            })
+            if version as? String == "1.2.3" {
+                let staged = try await updater.stageUpdate(release, currentBundleURL: currentApp)
+                defer { try? fileManager.removeItem(at: staged.stagingDirectoryURL) }
+                #expect(fileManager.fileExists(atPath: staged.verifiedAppBundleURL.path))
+            } else {
+                await #expect(throws: AppUpdaterError.bundleVerificationFailed("version mismatch"), "Fixture \(index)") {
+                    let staged = try await updater.stageUpdate(release, currentBundleURL: currentApp)
+                    try fileManager.removeItem(at: staged.stagingDirectoryURL)
+                }
+            }
+        }
+    }
+
+    @Test("Installer replaces the bundle only after the process exits within the wait", arguments: [60, 61])
+    func installerWaitsForExit(exitAfterSleeps: Int) throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appendingPathComponent("suyoi-installer-test-\(UUID().uuidString)")
+        let target = root.appendingPathComponent("Suyoi.app")
+        let staging = root.appendingPathComponent("staging")
+        let update = staging.appendingPathComponent("Suyoi.app")
+        try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: root) }
+        try fileManager.createDirectory(at: update, withIntermediateDirectories: true)
+        let calls = root.appendingPathComponent("calls")
+
+        let mocks = #"""
+        calls="$5"
+        exit_after_sleeps="$6"
+        sleeps=0
+        kill() { [ "$sleeps" -lt "$exit_after_sleeps" ]; }
+        fake_sleep() { sleeps=$((sleeps + 1)); printf 'wait\n' >> "$calls"; }
+        fake_mv() { printf 'move\n' >> "$calls"; }
+        fake_xattr() { printf 'xattr\n' >> "$calls"; }
+        fake_open() { printf 'open\n' >> "$calls"; }
+        fake_rm() { printf 'cleanup\n' >> "$calls"; }
+
+        """#
+        let script = mocks + AppUpdater.replacementScript
+            .replacingOccurrences(of: "/bin/sleep", with: "fake_sleep")
+            .replacingOccurrences(of: "/bin/mv", with: "fake_mv")
+            .replacingOccurrences(of: "/usr/bin/xattr", with: "fake_xattr")
+            .replacingOccurrences(of: "/usr/bin/open", with: "fake_open")
+            .replacingOccurrences(of: "/bin/rm", with: "fake_rm")
+        let result = try runTool("/bin/sh", [
+            "-c", script, "fixture", "1", target.path, update.path, staging.path, calls.path, String(exitAfterSleeps)
+        ])
+        let processExited = exitAfterSleeps == 60
+        #expect(result == (processExited ? 0 : 1))
+        let expectedWait = String(repeating: "wait\n", count: 60)
+        let expectedReplacement = processExited ? "move\nmove\nxattr\nopen\ncleanup\n" : ""
+        #expect(try String(contentsOf: calls, encoding: .utf8) == expectedWait + expectedReplacement)
+    }
+
+    private func runTool(_ executable: String, _ arguments: [String]) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
     @Test("Version normalization strips leading v and pre-release suffix")
     func versionNormalization() {
         #expect(AppUpdater.normalizeVersion("v0.1.8") == "0.1.8")

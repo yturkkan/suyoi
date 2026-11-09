@@ -46,10 +46,10 @@ public struct SessionTurnPreviewInspector: Sendable {
             return CharacterSet.controlCharacters.contains(scalar) ? nil : scalar
         }))
         let patterns = [
+            #"(?i:Bearer)\s+[A-Za-z0-9._~+/-]+=*"#,
             #"sk-[A-Za-z0-9_-]{12,}"#,
             #"gh[pousr]_[A-Za-z0-9]{12,}"#,
             #"AIza[A-Za-z0-9_-]{16,}"#,
-            #"(?i:Bearer)\s+[A-Za-z0-9._-]+"#,
             #"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?"#
         ]
         for pattern in patterns {
@@ -63,60 +63,61 @@ public struct SessionTurnPreviewInspector: Sendable {
 
     public func inspectPreview(for agent: AgentObservation, allProcesses: [ObservedProcess] = []) -> SessionTurnPreview? {
         let running = runningTool(for: agent, allProcesses: allProcesses)
+        let isCodex = agent.agentName == "Codex"
+        guard isCodex || agent.agentName == "Claude Code",
+              let cwd = agent.process.cwd, cwd.hasPrefix("/"), cwd != "/",
+              let evidence = SessionFileEvidence.live(for: agent.process,
+                beneath: homeDirectory.appendingPathComponent(isCodex ? ".codex/sessions" : ".claude/projects")),
+              let source = readSource(evidence.url, evidence: evidence, uid: agent.process.uid) else {
+            return toolOnly(running, agent: agent)
+        }
+        let association = association(in: source, codex: isCodex)
+        guard association.ids.count == 1, let id = association.ids.first,
+              let directory = association.cwd, directory.hasPrefix("/"),
+              URL(fileURLWithPath: directory).standardizedFileURL.path == URL(fileURLWithPath: cwd).standardizedFileURL.path else {
+            return toolOnly(running, agent: agent)
+        }
+        let stem = evidence.url.deletingPathExtension().lastPathComponent
+        guard isCodex ? stem.hasSuffix("-" + id) : stem == id else { return toolOnly(running, agent: agent) }
+        return nonemptyPreview(source, codex: isCodex, id: id, running: running)
+    }
+
+    /// Reads an explicitly identified historical session, separate from a live row preview.
+    public func inspectSelectedSession(_ sessionID: String, for agent: AgentObservation,
+                                allProcesses: [ObservedProcess] = []) -> SessionTurnPreview? {
+        let running = runningTool(for: agent, allProcesses: allProcesses)
         if agent.agentName == "OpenCode" || agent.agentName == "Gemini CLI" {
-            return inspectAdditionalPreview(for: agent, running: running) ?? toolOnly(running, agent: agent)
+            guard let requestedID = AgentContextValidation.sessionID(sessionID) else { return toolOnly(running, agent: agent) }
+            return inspectAdditionalPreview(for: agent, sessionID: requestedID, running: running) ?? toolOnly(running, agent: agent)
         }
         let isCodex = agent.agentName == "Codex"
         guard isCodex || agent.agentName == "Claude Code" else { return toolOnly(running, agent: agent) }
-        let requestedID = agent.sessionID.flatMap(AgentContextValidation.sessionID)
-        // An invalid explicit identifier must never broaden discovery to another session.
-        guard agent.sessionID == nil || requestedID != nil else { return nil }
-        let root = (agent.project?.rootPath ?? agent.process.cwd).flatMap { raw -> String? in
-            guard raw.hasPrefix("/") else { return nil }
-            let path = URL(fileURLWithPath: raw).standardizedFileURL.path
-            return path == "/" || path == homeDirectory.standardizedFileURL.path ? nil : path
-        }
-        guard requestedID != nil || root != nil else { return toolOnly(running, agent: agent) }
-
+        guard let requestedID = AgentContextValidation.sessionID(sessionID) else { return nil }
         for file in candidateFiles(codex: isCodex, sessionID: requestedID) {
             guard let source = readSource(file.url) else { continue }
-            let metadata = source.header + source.tail
-            let ids: [String]
-            let directory: String?
-            if isCodex {
-                let payloads = metadata.filter { $0["type"] as? String == "session_meta" }.compactMap { $0["payload"] as? [String: Any] }
-                ids = payloads.compactMap { ($0["id"] as? String).flatMap(AgentContextValidation.sessionID) }
-                directory = payloads.compactMap { $0["cwd"] as? String }.first
-            } else {
-                ids = metadata.compactMap { ($0["sessionId"] as? String).flatMap(AgentContextValidation.sessionID) }
-                directory = metadata.compactMap { $0["cwd"] as? String }.first
-            }
-            // Conflicting session metadata must never be associated by project alone.
-            guard Set(ids).count <= 1 else { continue }
-            let filenameID = isCodex ? nil : AgentContextValidation.sessionID(file.url.deletingPathExtension().lastPathComponent)
-            let id = ids.first ?? filenameID
-            if let requestedID {
-                if let id {
-                    guard id == requestedID else { continue }
-                } else {
-                    let stem = file.url.deletingPathExtension().lastPathComponent
-                    guard stem == requestedID || stem.hasSuffix("-" + requestedID) else { continue }
-                }
-            } else if let root {
-                if let directory {
-                    guard directory.hasPrefix("/"), URL(fileURLWithPath: directory).standardizedFileURL.path == root else { continue }
-                } else {
-                    guard !isCodex, file.url.deletingLastPathComponent().lastPathComponent == encodedClaudeDirectory(root) else { continue }
-                }
-            }
-            let preview = parse(source.tail, codex: isCodex, sessionID: id ?? requestedID, modifiedAt: source.modifiedAt, running: running)
-            if preview.lastUserPromptPreview != nil || preview.lastAssistantReplyPreview != nil || !preview.recentTools.isEmpty {
-                return preview
-            }
-            // The selected latest session may be empty; do not show an older session's conversation.
-            return nil
+            let association = association(in: source, codex: isCodex)
+            let stem = file.url.deletingPathExtension().lastPathComponent
+            guard association.ids == [requestedID] ||
+                (association.ids.isEmpty && (stem == requestedID || (isCodex && stem.hasSuffix("-" + requestedID)))) else { continue }
+            return nonemptyPreview(source, codex: isCodex, id: requestedID, running: running)
         }
         return toolOnly(running, agent: agent)
+    }
+
+    private func association(in source: Source, codex: Bool) -> (ids: Set<String>, cwd: String?) {
+        let records = source.header + source.tail
+        let metadata = codex
+            ? records.filter { $0["type"] as? String == "session_meta" }.compactMap { $0["payload"] as? [String: Any] }
+            : records
+        let ids = Set(metadata.compactMap { $0[codex ? "id" : "sessionId"] as? String })
+        if ids.contains(where: { AgentContextValidation.sessionID($0) == nil }) { return (["", "invalid"], nil) }
+        let directories = Set(metadata.compactMap { $0["cwd"] as? String })
+        return (ids, directories.count == 1 ? directories.first : nil)
+    }
+
+    private func nonemptyPreview(_ source: Source, codex: Bool, id: String, running: SessionToolCallSummary?) -> SessionTurnPreview? {
+        let preview = parse(source.tail, codex: codex, sessionID: id, modifiedAt: source.modifiedAt, running: running)
+        return preview.lastUserPromptPreview != nil || preview.lastAssistantReplyPreview != nil || !preview.recentTools.isEmpty ? preview : nil
     }
 
     private struct Candidate {
@@ -168,14 +169,12 @@ public struct SessionTurnPreviewInspector: Sendable {
         let modifiedAt: Date
     }
 
-    private func readSource(_ url: URL, document: Bool = false) -> Source? {
+    private func readSource(_ url: URL, document: Bool = false, evidence: SessionFileEvidence? = nil, uid: Int = Int(getuid())) -> Source? {
         guard QuotaParsing.safePath(url) else { return nil }
-        // Only the standard macOS filesystem aliases are canonicalized; user symlinks remain rejected.
-        var path = url.path
-        if ["/var/", "/tmp/", "/etc/"].contains(where: { path.hasPrefix($0) }) { path = "/private" + path }
-        let descriptor = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW_ANY)
+        let descriptor = SessionFileEvidence.openRegular(url)
         guard descriptor >= 0 else { return nil }
         defer { close(descriptor) }
+        if let evidence, SessionFileEvidence.readIdentity(descriptor, uid: uid) != evidence.identity { return nil }
         var info = stat()
         guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size >= 0 else { return nil }
         func read(_ count: Int, offset: off_t) -> Data? {
@@ -250,9 +249,7 @@ public struct SessionTurnPreviewInspector: Sendable {
         }
     }
 
-    private func inspectAdditionalPreview(for agent: AgentObservation, running: SessionToolCallSummary?) -> SessionTurnPreview? {
-        // These layouts lack a reliable process/project association. Require an explicit session.
-        guard let sessionID = agent.sessionID.flatMap(AgentContextValidation.sessionID) else { return nil }
+    private func inspectAdditionalPreview(for agent: AgentObservation, sessionID: String, running: SessionToolCallSummary?) -> SessionTurnPreview? {
         let openCode = agent.agentName == "OpenCode"
         let messageDirectory = homeDirectory
             .appendingPathComponent(".local/share/opencode/storage/message")
@@ -477,12 +474,6 @@ public struct SessionTurnPreviewInspector: Sendable {
             return block["text"] as? String
         }
         return Self.sanitizeAndRedact(texts.joined(separator: " "))
-    }
-
-    private func encodedClaudeDirectory(_ root: String) -> String {
-        String(root.map { character in
-            character.isASCII && (character.isLetter || character.isNumber) ? character : "-"
-        })
     }
 
     private func runningTool(for agent: AgentObservation, allProcesses: [ObservedProcess]) -> SessionToolCallSummary? {

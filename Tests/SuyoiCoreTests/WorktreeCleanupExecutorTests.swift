@@ -12,7 +12,8 @@ private final class WorktreeTrashCalls: @unchecked Sendable {
 private struct CleanupWorktreeRunner: CommandRunning {
     let handler: @Sendable (CommandRequest) throws -> CommandResult
     func run(_ request: CommandRequest) throws -> CommandResult {
-        #expect(request.executable == "/usr/bin/git" || request.executable == "/usr/sbin/lsof")
+        if let toolResult = worktreeToolStub(request) { return toolResult }
+        #expect(request.executable == "/usr/bin/sandbox-exec" || request.executable == "/usr/sbin/lsof")
         #expect(!request.arguments.contains("remove"))
         #expect(!request.arguments.contains("--force"))
         return try handler(request)
@@ -64,15 +65,17 @@ private struct CleanupWorktreeFixture: Sendable {
     }
 
     func runner(listing: String? = nil, dirty: Bool = false, merged: Bool = true,
-                statusFailure: Bool = false, mergeFailure: Bool = false) -> CleanupWorktreeRunner {
+                statusFailure: Bool = false, mergeFailure: Bool = false, trackedIndex: String = "") -> CleanupWorktreeRunner {
         let output = listing ?? self.listing()
         return CleanupWorktreeRunner { request in
             if request.executable == "/usr/sbin/lsof" { return cleanupWorktreeResult(exit: 1) }
             #expect(request.arguments.contains("core.fsmonitor=false"))
             #expect(request.environment["GIT_OPTIONAL_LOCKS"] == "0")
             if request.arguments.contains("list") { return cleanupWorktreeResult(output) }
+            if request.arguments.contains("config") { return cleanupWorktreeResult(exit: 1) }
+            if request.arguments.contains("ls-files") { return cleanupWorktreeResult(trackedIndex) }
             if request.arguments.contains("status") {
-                return cleanupWorktreeResult(dirty ? "?? local-file\n" : "", exit: statusFailure ? 128 : 0)
+                return cleanupWorktreeResult(worktreeStatusFixture(dirty: dirty), exit: statusFailure ? 128 : 0)
             }
             if request.arguments.contains("rev-parse") { return cleanupWorktreeResult("aaaa\n") }
             if request.arguments.contains("merge-base") { return cleanupWorktreeResult(exit: mergeFailure ? 128 : (merged ? 0 : 1)) }
@@ -97,8 +100,10 @@ private struct CleanupWorktreeFixture: Sendable {
                 return destination
             })
         let result = executor.moveToTrash(worktree: fixture.record(), parentRoot: fixture.root)
-        #expect(result == WorktreeTrashOutcome(path: fixture.linked.path, branch: "refs/heads/feature",
-                                              trashed: true, trashedURL: destination, error: nil))
+        #expect(result.path == fixture.linked.path)
+        #expect(result.branch == "refs/heads/feature")
+        #expect(result.trashed && result.trashedURL == destination && result.error == nil)
+        #expect(result.recovery?.fileIdentity == FileMetadataReader().identity(at: destination))
         #expect(calls.urls == [fixture.linked])
         #expect(!FileManager.default.fileExists(atPath: fixture.linked.path))
         #expect(FileManager.default.fileExists(atPath: destination.appendingPathComponent(".git").path))
@@ -195,7 +200,7 @@ private struct CleanupWorktreeFixture: Sendable {
         let secret = fixture.linked.appendingPathComponent(path)
         try FileManager.default.createDirectory(at: secret.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data().write(to: secret)
-        let executor = WorktreeCleanupExecutor(runner: fixture.runner(), processInspector: CleanupWorktreeProcesses(),
+        let executor = WorktreeCleanupExecutor(runner: fixture.runner(trackedIndex: "H 100644 aaaa 0\t\(path)\0"), processInspector: CleanupWorktreeProcesses(),
             openFileCheck: { _ in .clear }, trashHandler: { _ in Issue.record("Protected descendant reached Trash"); return nil })
         let result = executor.moveToTrash(worktree: fixture.record(), parentRoot: fixture.root)
         #expect(!result.trashed)

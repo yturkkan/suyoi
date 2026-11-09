@@ -5,6 +5,18 @@ public struct OpenFileInspector: Sendable {
     private let runner: any CommandRunning
     public init(runner: any CommandRunning = CommandRunner()) { self.runner = runner }
 
+    /// Checks a regular file without traversing sibling session paths.
+    func checkFileInUse(_ path: String, uid: Int = Int(getuid())) -> UsageState {
+        guard path.hasPrefix("/"), !path.contains("\0"), let result = try? runner.run(CommandRequest(
+            executable: "/usr/sbin/lsof", arguments: ["-nP", "-a", "-u", String(uid), "-Fp", "--", path], timeout: 4
+        )), !result.timedOut, !result.truncated, result.stderr.isEmpty else { return .unknown }
+        if result.exitCode == 1 && result.stdout.isEmpty { return .clear }
+        guard result.exitCode == 0, result.stdoutText.split(separator: "\n").contains(where: {
+            $0.first == "p" && Int($0.dropFirst()).map { $0 > 0 } == true
+        }) else { return .unknown }
+        return .inUse
+    }
+
     /// Explicit, potentially expensive recursive inspection. Callers can instead inject a
     /// cached/batch usage lookup into SafetyEvaluator and WorktreeInspector.
     public func checkPathInUse(_ path: String, uid: Int = Int(getuid())) -> UsageState {

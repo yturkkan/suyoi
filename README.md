@@ -14,11 +14,11 @@ Modern software development on macOS often involves running multiple coding agen
 
 **Suyoi** lives in the macOS menu bar (or as a **Notch Dynamic Island** / **Floating Companion**) and provides a single, low-overhead control plane to:
 
-- **Inspect, jump to & steer 18+ coding agents** — Detect native and runtime-wrapped (`node`, `bun`, `deno`, `python`) agent processes via `libproc` and bounded `KERN_PROCARGS2` inspection, view secret-redacted live turn & tool call previews, jump directly to the exact `tmux` window/pane, `Terminal.app`/`iTerm2` tab, or IDE workspace (`cursor://`, `vscode://`, `windsurf://`, `zed://`, `antigravity://`), respond to in-panel tool approval/question hooks (`Approve`, `Auto-Approve Session`, `Deny`), and send follow-up instructions via Terminal/iTerm2 TTY or native CLI sessions.
+- **Inspect, jump to & steer 18+ coding agents** — Detect native and runtime-wrapped agents, see bounded previews when the live transcript can be identified, and jump to an associated terminal tab, `tmux` pane, or IDE workspace. Send instructions to a verified Terminal or iTerm2 target, or choose an explicit Codex or OpenCode session to continue. The Claude Code hook bridge supports in-panel approval, denial, and eligible session auto-approval.
 - **Switch between 3 display surfaces, 4 themes & semantic audio packs** — Operate Suyoi as a standard **Menu Bar Popover**, a top-center **Notch Dynamic Island** pill that expands on attention, or a draggable **Floating Companion ("Buddy")**, paired with **Suyoi Glass**, **macOS Native**, **Pixel Arcade**, or **Game Boy Olive** themes and macOS system sounds or **OpenPeon (`openpeon.json`)** CESP audio packs.
 - **Group & manage localhost dev servers** — Map listening TCP ports to their owning process trees, git branches, and frameworks (`Next.js`, `Vite`, `SwiftPM`, `Cargo`, `Python`, `Go`) with RFC 1123 named `http://<project>.localhost:<port>` URLs, stale/idle (`Idle 2h+`) & uptime badges, one-click browser launch, URL copy, and safe process-group termination.
-- **Track 5-hour & 7-day AI quotas** — Combine offline local rolling token counters (`300m` and `10080m` windows) with optional in-memory OAuth quota window checks (`Codex`, `Claude`, `Gemini`, `OpenCode`, `Cursor`), including reset countdowns and customizable provider ordering.
-- **Reclaim build, cache & merged git worktree storage safely** — Scan workspace build directories (`node_modules`, `.build`, `.next`, `target`, `dist`, `.turbo`, `__pycache__`), 50+ developer/AI cache locations, and clean merged secondary git worktrees; verify live process/open-file/lockfile safety at execution time; move eligible items to **macOS Trash** (`FileManager.trashItem`) — never `rm -rf` — and restore recently trashed items with one-click **Put Back** recovery.
+- **Track 5-hour & 7-day AI quotas** — See local rolling token counts alongside account-wide usage and reset times when available. Live quota checks are enabled by default and can be disabled from the Quotas tab.
+- **Review storage before moving it to Trash** — Scan workspace build artifacts, developer caches, merged secondary Git worktrees, and aged session logs. Suyoi checks eligibility again for each move to **macOS Trash**. **Put Back** is available when Suyoi can verify the moved item and both directory locations.
 
 ---
 
@@ -35,7 +35,7 @@ A prebuilt ad-hoc signed macOS bundle is included in this repository and on the 
 open build/Suyoi.app
 ```
 
-To update an installed copy of Suyoi, open the `…` menu in the bottom-right corner of the popover (or **Settings → About Suyoi**) and click **Check for Updates…** → **Update & Relaunch**. Suyoi downloads the latest `Suyoi.app.zip` from GitHub Releases, verifies its bundle identifier and code signature, replaces the app bundle, and relaunches automatically.
+To update an installed copy, open **Settings → About Suyoi**, check for updates, and choose **Update & Relaunch**. Suyoi downloads the archive from GitHub Releases and verifies the bundle identifier, release version, code signature, and checksum when supplied. The helper waits for the current process to exit before replacing the bundle. The ad-hoc signature checks bundle integrity. Publisher trust comes from the GitHub release source.
 
 ### Build from Source
 
@@ -78,20 +78,22 @@ build/Suyoi.app/Contents/MacOS/Suyoi --agent-storage
 
 ## Safety & Privacy Architecture
 
-Suyoi is designed around strict fail-closed invariants:
+Suyoi verifies the target and available evidence before performing an action.
 
-1. **No Prompt or Environment Harvesting (`KERN_PROCARGS2`)**
-   Wrapper inspection reads only bounded `argv` script/module tokens to identify runtime-hosted agents (`node .../claude`, `bun .../opencode`, `python -m aider`). Environment variables (`envp`), API keys, and conversation bodies are never parsed, logged, or stored.
+1. **Bounded Process and Session Inspection**
+   Wrapper recognition reads only the `argv` script and module tokens needed to identify an agent. It skips prompt arguments and process environment variables. Session previews read bounded portions of an identified transcript in memory and redact common credential patterns before display. Suyoi keeps no raw transcript copy or preview history.
 2. **Process Identity Re-Verification (`ProcessIdentity`)**
    Before sending `SIGTERM` (or an explicit user-requested `SIGKILL`), `ActionExecutor` re-verifies `pid`, `uid`, `startTimeMicroseconds`, and `executable` against the live kernel process table to prevent signaling a reused PID.
 3. **Interactive Shell & Agent Boundaries (`ProcessTree`)**
    Server grouping respects interactive shells, coding agents, GUI processes, and project boundaries when walking the process tree or merging related listeners on a shared port.
 4. **Live Pre-Trash Safety Re-Evaluation**
-   Suyoi collects fresh evidence for each item, including during a bulk operation. A bounded metadata check blocks directories with protected descendants or an incomplete traversal. The final macOS Trash call is path-based, so a change can still occur between the last check and the move.
+   Suyoi collects fresh evidence for each item, including during a bulk operation. Worktree cleanup blocks ignored or untracked local files and unverifiable Git status. Session log retention requires a fresh, complete process sample and clear open-file evidence. The final macOS Trash call accepts a path, so a change can still occur between the last check and the move.
 5. **High-Impact Cache Protection (`Manual Trash`)**
    Large model stores and environments (`HuggingFace` model weights, `uv`, `CoreSimulator`, `.venv`, and uncataloged `~/.cache/*` directories) are separated from disposable build caches and excluded from bulk **Trash All Ready** operations.
 6. **Verified Steering Targets**
-   Suyoi checks the selected agent's live identity, controlling TTY, and foreground ownership before sending to Terminal or iTerm2. The foreground group must contain only the selected agent. Native Codex and OpenCode continuation is unavailable in the default app because displayed session metadata cannot establish live process ownership.
+   Suyoi checks the selected agent's live identity, controlling TTY, and sole foreground ownership before sending to Terminal or iTerm2. Foreground ownership can change before the Apple Event arrives. To continue through the Codex or OpenCode CLI, select the provider session and check its project in the composer. This starts a new local continuation process for the chosen session.
+7. **Claude Code Hook Approvals**
+   Configure the copied hook command for `SessionStart`, `SessionEnd`, and one approval event, either `PreToolUse` or `PermissionRequest`. Session auto-approval requires a verified Claude Code process, project, and session lifetime. The private bridge stores only fields needed to show and resolve the request.
 
 For deeper implementation details, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -106,7 +108,7 @@ Suyoi/
 │   ├── SuyoiCore/        # Process inspection, tree grouping, quotas, cleanup safety & steering
 │   └── SuyoiApp/         # AppKit status bar controller, SwiftUI popover views & CLI entrypoint
 ├── Tests/
-│   └── SuyoiCoreTests/   # Unit and fixture tests (361 tests across 32 suites)
+│   └── SuyoiCoreTests/   # Unit and fixture tests
 ├── Resources/            # AppIcon.icns & artwork
 ├── scripts/
 │   ├── build-app.sh      # Release bundle & archive builder

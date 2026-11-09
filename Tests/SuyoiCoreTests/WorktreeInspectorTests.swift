@@ -5,13 +5,26 @@ import Testing
 private struct WorktreeCommandStub: CommandRunning {
     let handler: @Sendable (CommandRequest) throws -> CommandResult
     func run(_ request: CommandRequest) throws -> CommandResult {
-        #expect(request.executable == "/usr/bin/git")
-        #expect(request.arguments.prefix(2).first == "-C")
+        if let toolResult = worktreeToolStub(request) { return toolResult }
+        #expect(request.executable == "/usr/bin/sandbox-exec")
+        #expect(request.arguments.contains("-C"))
         #expect(request.arguments.contains("core.fsmonitor=false"))
         #expect(request.environment["GIT_OPTIONAL_LOCKS"] == "0")
         #expect(request.timeout <= 4)
         return try handler(request)
     }
+}
+
+func worktreeToolStub(_ request: CommandRequest) -> CommandResult? {
+    switch request.executable {
+    case "/usr/bin/xcrun": return wtResult("/usr/bin/git\n")
+    case "/usr/bin/codesign": return wtResult()
+    default: return nil
+    }
+}
+
+func worktreeStatusFixture(branch: String = "feature", head: String = "bbbb", dirty: Bool = false) -> String {
+    "# branch.oid \(head)\0# branch.head \(branch)\0" + (dirty ? "? local-file\0" : "")
 }
 
 private func wtResult(_ output: String = "", exit: Int32 = 0, error: String = "", timeout: Bool = false, truncated: Bool = false) -> CommandResult {
@@ -71,9 +84,11 @@ struct WorktreeInspectorTests {
                 #expect(request.arguments.suffix(4) == ["worktree", "list", "--porcelain", "-z"])
                 return wtResult(listing)
             }
+            if request.arguments.contains("config") { return wtResult(exit: 1) }
+            if request.arguments.contains("ls-files") { return wtResult() }
             if request.arguments.contains("status") {
-                #expect(request.arguments.suffix(3) == ["status", "--porcelain=v1", "--untracked-files=all"])
-                return wtResult()
+                #expect(request.arguments.contains("--ignored=traditional"))
+                return wtResult(worktreeStatusFixture())
             }
             if request.arguments.contains("rev-parse") { return wtResult("aaaa\n") }
             if request.arguments.contains("merge-base") { return wtResult() }
@@ -96,7 +111,9 @@ struct WorktreeInspectorTests {
         let listing = String(fixture.porcelain.dropLast()) + "locked review\0\0"
         let runner = WorktreeCommandStub { request in
             if request.arguments.contains("list") { return wtResult(listing) }
-            if request.arguments.contains("status") { return wtResult("?? local-file\n") }
+            if request.arguments.contains("config") { return wtResult(exit: 1) }
+            if request.arguments.contains("ls-files") { return wtResult() }
+            if request.arguments.contains("status") { return wtResult(worktreeStatusFixture(dirty: true)) }
             if request.arguments.contains("rev-parse") { return wtResult("aaaa\n") }
             return wtResult(exit: 1)
         }
@@ -118,6 +135,8 @@ struct WorktreeInspectorTests {
         let listing = fixture.porcelain
         let runner = WorktreeCommandStub { request in
             if request.arguments.contains("list") { return wtResult(listing) }
+            if request.arguments.contains("config") { return wtResult(exit: 1) }
+            if request.arguments.contains("ls-files") { return wtResult() }
             if request.arguments.contains("status") { return wtResult(exit: 128, error: "unavailable") }
             return wtResult(exit: 1)
         }
@@ -135,7 +154,9 @@ struct WorktreeInspectorTests {
         let listing = fixture.porcelain
         let runner = WorktreeCommandStub { request in
             if request.arguments.contains("list") { return wtResult(listing) }
-            if request.arguments.contains("status") { return wtResult() }
+            if request.arguments.contains("config") { return wtResult(exit: 1) }
+            if request.arguments.contains("ls-files") { return wtResult() }
+            if request.arguments.contains("status") { return wtResult(worktreeStatusFixture()) }
             if request.arguments.contains("rev-parse") {
                 return request.arguments.last == target ? wtResult("aaaa\n") : wtResult(exit: 1)
             }
@@ -162,6 +183,8 @@ struct WorktreeInspectorTests {
         let listing = fixture.porcelain
         let runner = WorktreeCommandStub { request in
             if request.arguments.contains("list") { return wtResult(listing) }
+            if request.arguments.contains("config") { return wtResult(exit: 1) }
+            if request.arguments.contains("ls-files") { return wtResult() }
             if request.arguments.contains("rev-parse") { return wtResult("aaaa\n") }
             return wtResult()
         }
@@ -183,8 +206,12 @@ struct WorktreeInspectorTests {
         let expected = fixture.main.path
         let listing = fixture.porcelain
         let runner = WorktreeCommandStub { request in
-            #expect(request.arguments[1] == expected || !request.arguments.contains("list"))
+            if request.arguments.contains("list"), let directory = request.arguments.firstIndex(of: "-C") {
+                #expect(request.arguments[directory + 1] == expected)
+            }
             if request.arguments.contains("list") { return wtResult(listing) }
+            if request.arguments.contains("config") { return wtResult(exit: 1) }
+            if request.arguments.contains("ls-files") { return wtResult() }
             if request.arguments.contains("rev-parse") { return wtResult("aaaa\n") }
             return wtResult()
         }

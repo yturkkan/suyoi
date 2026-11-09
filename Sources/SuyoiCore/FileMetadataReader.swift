@@ -28,7 +28,8 @@ public struct FileMetadataReader: Sendable {
     }
 
     /// Returns nil only after a complete metadata check of the directory about to be trashed.
-    func trashDescendantBlocker(at directory: URL, expectedIdentity: FileIdentity, homeDirectory: URL) -> String? {
+    func trashDescendantBlocker(at directory: URL, expectedIdentity: FileIdentity, homeDirectory: URL,
+                               permitsWorktreeEntry: ((String, mode_t) -> Bool)? = nil) -> String? {
         let entryLimit = 250_000
         let depthLimit = 64
         let deadline = ProcessInfo.processInfo.systemUptime + 2
@@ -84,6 +85,10 @@ public struct FileMetadataReader: Sendable {
                 var child = stat()
                 guard fstatat(descriptor, name, &child, AT_SYMLINK_NOFOLLOW) == 0,
                       child.st_dev == before.st_dev, child.st_ino == entry.pointee.d_ino else { return incomplete }
+                if let permitsWorktreeEntry,
+                   !permitsWorktreeEntry(String(childPath.path.dropFirst(directory.path.count + 1)), child.st_mode) {
+                    return "Worktree contains local files or directories that are not tracked by Git"
+                }
                 if (child.st_mode & S_IFMT) != S_IFDIR { continue }
                 guard depth < depthLimit else { return incomplete }
                 let childDescriptor = openat(descriptor, name, directoryFlags)

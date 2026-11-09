@@ -43,6 +43,13 @@ public enum ApprovalDecision: Codable, Equatable, Sendable {
     case answerQuestion(selectedOption: String)
 }
 
+struct ApprovalScope: Codable, Equatable, Sendable {
+    let process: ProcessIdentity
+    let sessionID: String
+    let projectPath: String
+    let generation: UUID
+}
+
 /// In-memory hook decisions. State transitions are atomic; responders run after unlocking
 /// and may reenter the controller. Concurrent responders must provide their own synchronization.
 public final class AgentApprovalController: @unchecked Sendable {
@@ -52,9 +59,16 @@ public final class AgentApprovalController: @unchecked Sendable {
         let request: PendingApprovalRequest
         let isQuestion: Bool
         let responder: Responder?
+        let scope: ApprovalScope?
+        let isScopeCurrent: @Sendable () -> Bool
+
+        var currentScope: ApprovalScope? {
+            guard let scope, isScopeCurrent() else { return nil }
+            return scope
+        }
     }
 
-    private struct Reply: Encodable {
+    struct Reply: Codable {
         let decision: String
         var reason: String? = nil
         var answer: String? = nil
@@ -107,7 +121,7 @@ public final class AgentApprovalController: @unchecked Sendable {
 
     private let lock = NSLock()
     private var entries: [Entry] = []
-    private var autoApprovedSessions: Set<String> = []
+    private var grants: [Entry] = []
 
     public init() {}
 
@@ -120,28 +134,55 @@ public final class AgentApprovalController: @unchecked Sendable {
     public func pruneExpiredRequests(olderThan maxAge: TimeInterval = 180, now: Date = Date()) -> Int {
         guard maxAge.isFinite, maxAge > 0 else { return 0 }
         let expired: [Entry] = lock.withLock {
-            removeEntries { now.timeIntervalSince($0.request.requestedAt) > maxAge }
+            grants.removeAll { $0.currentScope == nil }
+            return removeEntries {
+                now.timeIntervalSince($0.request.requestedAt) > maxAge || ($0.scope != nil && $0.currentScope == nil)
+            }
         }
         respond(to: expired, with: Reply(decision: "block", reason: "Approval request expired"))
         return expired.count
     }
 
-    public func isSessionAutoApproved(_ sessionID: String) -> Bool {
-        lock.withLock { autoApprovedSessions.contains(sessionID) }
+    public func canAutoApprove(request: PendingApprovalRequest) -> Bool {
+        lock.withLock {
+            entries.contains { $0.request == request && !$0.isQuestion && $0.currentScope != nil }
+        }
     }
 
-    /// Enabling also resolves existing tool requests; questions always require an answer.
-    public func setSessionAutoApprove(_ enabled: Bool, sessionID: String) {
-        guard Self.validSessionID(sessionID) else { return }
-        let approved: [Entry] = lock.withLock {
-            if enabled {
-                autoApprovedSessions.insert(sessionID)
-                return removeEntries { $0.request.sessionID == sessionID && !$0.isQuestion }
-            }
-            autoApprovedSessions.remove(sessionID)
-            return []
+    public func activeAutoApproveRequests() -> [PendingApprovalRequest] {
+        lock.withLock {
+            grants.removeAll { $0.currentScope == nil }
+            return grants.map(\.request)
         }
-        respond(to: approved, with: Reply(decision: "approve"))
+    }
+
+    public func isSessionAutoApproved(for request: PendingApprovalRequest) -> Bool {
+        lock.withLock {
+            guard let entry = (entries + grants).first(where: { $0.request == request }),
+                  let scope = entry.currentScope else { return false }
+            return grants.contains { $0.currentScope == scope }
+        }
+    }
+
+    public func matchesAgent(_ request: PendingApprovalRequest, agent: AgentObservation,
+                             verifiedSessionID: String? = nil) -> Bool {
+        guard request.agentName == agent.agentName, request.pid == agent.process.pid,
+              let cwd = agent.process.cwd, cwd.hasPrefix("/"),
+              request.projectPath == URL(fileURLWithPath: cwd).resolvingSymlinksInPath().standardizedFileURL.path,
+              verifiedSessionID == nil || verifiedSessionID == request.sessionID else { return false }
+        return lock.withLock {
+            (entries + grants).contains {
+                $0.request == request && $0.currentScope?.process == agent.process.identity
+            }
+        }
+    }
+
+    public func setSessionAutoApprove(_ enabled: Bool, for request: PendingApprovalRequest) {
+        if enabled {
+            _ = submitDecision(.allowForSession, forRequestID: request.id)
+        } else {
+            lock.withLock { grants.removeAll { $0.request == request } }
+        }
     }
 
     @discardableResult
@@ -149,24 +190,29 @@ public final class AgentApprovalController: @unchecked Sendable {
         let result: ([Entry], Reply)? = lock.withLock {
             guard let index = entries.firstIndex(where: { $0.request.id == id }) else { return nil }
             let entry = entries[index]
+            let scope = entry.currentScope
             let reply: Reply
             switch decision {
             case .allowOnce, .allowForSession:
-                guard !entry.isQuestion else { return nil }
+                guard !entry.isQuestion, entry.scope == nil || scope != nil,
+                      decision != .allowForSession || scope != nil else { return nil }
                 reply = Reply(decision: "approve")
             case .deny(let reason):
                 reply = Reply(decision: "block", reason: Self.clean(reason, limit: 1_024))
             case .answerQuestion(let option):
-                guard entry.isQuestion, entry.request.questionOptions.contains(option) else { return nil }
+                guard entry.isQuestion, entry.scope == nil || scope != nil,
+                      entry.request.questionOptions.contains(option) else { return nil }
                 reply = Reply(decision: "approve", answer: option)
             }
             entries.remove(at: index)
             var resolved = [entry]
-            if decision == .allowForSession {
-                autoApprovedSessions.insert(entry.request.sessionID)
-                resolved += removeEntries {
-                    $0.request.sessionID == entry.request.sessionID && !$0.isQuestion
-                }
+            if decision == .allowForSession, let scope {
+                grants.removeAll { $0.currentScope == nil || $0.scope == scope }
+                if grants.count == 50 { grants.removeFirst() }
+                // Retain the scope and revalidation, not the original response callback.
+                grants.append(Entry(request: entry.request, isQuestion: false, responder: nil,
+                                    scope: scope, isScopeCurrent: entry.isScopeCurrent))
+                resolved += removeEntries { !$0.isQuestion && $0.currentScope == scope }
             }
             return (resolved, reply)
         }
@@ -175,31 +221,39 @@ public final class AgentApprovalController: @unchecked Sendable {
         return true
     }
 
-    /// Accepts at most 64 KiB and keeps at most 50 pending requests. Invalid or overflow
-    /// requests receive a blocking response. Stop/end also unblock waiters with a denial.
-    /// PreToolUse is gated unless requires_approval is explicitly false.
+    /// Accepts at most 64 KiB and keeps at most 50 pending requests.
     @discardableResult
     public func ingestHookEvent(_ data: Data, now: Date = Date(),
                                 responder: (@Sendable (Data) -> Void)? = nil) -> PendingApprovalRequest? {
+        ingestHookEvent(data, scope: nil, now: now, responder: responder)
+    }
+
+    @discardableResult
+    func ingestHookEvent(_ data: Data, scope: ApprovalScope?, now: Date = Date(),
+                         isScopeCurrent: @escaping @Sendable () -> Bool = { false },
+                         responder: (@Sendable (Data) -> Void)? = nil) -> PendingApprovalRequest? {
         guard data.count <= 65_536,
               let hook = try? JSONDecoder().decode(Hook.self, from: data),
               Self.validSessionID(hook.session_id) else {
             responder?(Reply(decision: "block", reason: "Invalid hook event").data)
             return nil
         }
-
-        switch hook.hook_event_name {
-        case .stop, .sessionEnd:
+        if hook.hook_event_name == .stop {
+            guard let scope, scope.sessionID == hook.session_id, isScopeCurrent() else { return nil }
             let cancelled = lock.withLock {
-                if hook.hook_event_name == .sessionEnd { autoApprovedSessions.remove(hook.session_id) }
-                return removeEntries { $0.request.sessionID == hook.session_id }
+                removeEntries { $0.scope == scope && $0.request.requestedAt <= now }
             }
-            respond(to: cancelled, with: Reply(decision: "block", reason: "Session stopped"))
+            respond(to: cancelled, with: Reply(decision: "block", reason: "Agent turn stopped"))
             return nil
-        case .permissionRequest, .preToolUse:
-            if hook.hook_event_name == .preToolUse && hook.requires_approval == false { return nil }
-        default:
-            return nil
+        }
+        guard hook.hook_event_name == .permissionRequest || hook.hook_event_name == .preToolUse else { return nil }
+        if hook.hook_event_name == .preToolUse && hook.requires_approval == false { return nil }
+        if let scope {
+            guard scope.sessionID == hook.session_id, scope.process.pid == hook.pid,
+                  scope.projectPath == hook.cwd, hook.agent_name == "Claude Code", isScopeCurrent() else {
+                responder?(Reply(decision: "block", reason: "Hook session ended").data)
+                return nil
+            }
         }
 
         guard let toolName = Self.clean(hook.tool_name, limit: 128) else {
@@ -234,13 +288,17 @@ public final class AgentApprovalController: @unchecked Sendable {
             summary: summary, questionOptions: labels, requestedAt: now
         )
         let immediate: Reply? = lock.withLock {
-            if !isQuestion && autoApprovedSessions.contains(hook.session_id) {
-                return Reply(decision: "approve")
+            if let scope {
+                guard isScopeCurrent() else { return Reply(decision: "block", reason: "Hook session ended") }
+                if !isQuestion && grants.contains(where: { $0.currentScope == scope }) {
+                    return Reply(decision: "approve")
+                }
             }
             guard entries.count < 50 else {
                 return Reply(decision: "block", reason: "Approval queue is full")
             }
-            entries.append(Entry(request: request, isQuestion: isQuestion, responder: responder))
+            entries.append(Entry(request: request, isQuestion: isQuestion, responder: responder,
+                                 scope: scope, isScopeCurrent: isScopeCurrent))
             return nil
         }
         if let immediate {
@@ -274,7 +332,7 @@ public final class AgentApprovalController: @unchecked Sendable {
         for entry in entries { entry.responder?(data) }
     }
 
-    private static func validSessionID(_ value: String) -> Bool {
+    static func validSessionID(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 256
             && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
             && !value.unicodeScalars.contains(where: unsafeScalar)

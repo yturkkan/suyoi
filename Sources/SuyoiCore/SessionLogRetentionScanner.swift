@@ -25,9 +25,12 @@ public struct StaleSessionLogSummary: Codable, Equatable, Sendable, Identifiable
 /// Inspects names and filesystem metadata without reading session contents.
 public struct SessionLogRetentionScanner: Sendable {
     private let homeDirectory: URL
+    private let openFileCheck: @Sendable (String) -> UsageState
 
-    public init(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) {
+    public init(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+                openFileCheck: (@Sendable (String) -> UsageState)? = nil) {
         self.homeDirectory = homeDirectory.standardizedFileURL
+        self.openFileCheck = openFileCheck ?? { OpenFileInspector().checkFileInUse($0) }
     }
 
     public func scanStaleSessionLogs(
@@ -67,7 +70,7 @@ public struct SessionLogRetentionScanner: Sendable {
         _ logs: [StaleSessionLogSummary],
         olderThanDays: Int = 14,
         activeAgents: [AgentObservation] = [],
-        liveAgents: (() -> [AgentObservation])? = nil,
+        liveProcesses: () -> Observation<[ObservedProcess]>,
         now: Date = Date(),
         trashItem: (URL) throws -> URL? = { url in
             var resulting: NSURL?
@@ -93,17 +96,47 @@ public struct SessionLogRetentionScanner: Sendable {
                 outcomes.append(failed("Session log was already moved to Trash"))
                 continue
             }
-            let currentActiveAgents = liveAgents?() ?? activeAgents
-            guard !isAssociated(target, activeAgents: currentActiveAgents) else {
-                outcomes.append(failed("Session log is associated with an active agent"))
-                continue
-            }
-            guard let live = metadata(at: components), live.identity == log.identity else {
+            guard let before = metadata(at: components), before.identity == log.identity else {
                 outcomes.append(failed("Session log is unavailable, contains a symlink, or its identity changed"))
                 continue
             }
-            guard live.modifiedAt < cutoff else {
+            guard before.modifiedAt < cutoff else {
                 outcomes.append(failed("Session log is no longer older than the retention period"))
+                continue
+            }
+            let observed = liveProcesses()
+            guard observed.status == .complete, observed.warnings.isEmpty, Self.isFresh(observed.capturedAt) else {
+                outcomes.append(failed("Live session ownership could not be verified"))
+                continue
+            }
+            let knownOwners = activeAgents.filter { isAssociated(target, activeAgents: [$0]) }
+            guard !knownOwners.contains(where: { owner in
+                observed.value.contains { process in
+                    let captured = owner.process.identity
+                    let current = process.identity
+                    return current.pid == captured.pid
+                        && (!current.isActionEligible || !captured.isActionEligible || current == captured)
+                }
+            }) else {
+                outcomes.append(failed("Session log is associated with an active agent"))
+                continue
+            }
+            let provider = components[0] == ".codex" ? "Codex" : "Claude Code"
+            // Displayed session IDs come from bounded heuristics. While a
+            // provider process exists, a different ID does not exclude ownership.
+            guard !observed.value.contains(where: { AgentRecognizer.agentName(for: $0) == provider }) else {
+                outcomes.append(failed("A running agent may still own this session log"))
+                continue
+            }
+            let openUsage = openFileCheck(target.path)
+            guard openUsage == .clear else {
+                outcomes.append(failed(openUsage == .inUse ? "Session log is open"
+                    : "Open-file usage could not be verified"))
+                continue
+            }
+            guard let live = metadata(at: components), live == before, Self.isFresh(observed.capturedAt),
+                  let recovery = TrashRecoveryEvidence.prepare(original: target, expectedIdentity: live.identity) else {
+                outcomes.append(failed("Session log or its usage evidence changed during verification"))
                 continue
             }
             do {
@@ -113,7 +146,8 @@ public struct SessionLogRetentionScanner: Sendable {
                 movedIdentities.append(live.identity)
                 bytes = bytes > Int64.max - live.bytes ? Int64.max : bytes + live.bytes
                 outcomes.append(TrashItemOutcome(candidateID: log.id, path: log.path,
-                    trashedURL: destination?.path, bytes: live.bytes, succeeded: true))
+                    trashedURL: destination?.path, bytes: live.bytes, succeeded: true,
+                    recovery: recovery.completed(at: destination)))
             } catch {
                 outcomes.append(failed("Could not move session log to Trash"))
             }
@@ -122,7 +156,11 @@ public struct SessionLogRetentionScanner: Sendable {
             warnings: ["Reported bytes are logical sizes moved to Trash; disk space is not necessarily freed."])
     }
 
-    private struct Metadata {
+    private static func isFresh(_ capturedAt: Date) -> Bool {
+        (0...10).contains(Date().timeIntervalSince(capturedAt))
+    }
+
+    private struct Metadata: Equatable {
         let identity: FileIdentity
         let bytes: Int64
         let modifiedAt: Date

@@ -2,38 +2,42 @@ import AppKit
 import SwiftUI
 import SuyoiCore
 
-private let quotaGreen = Color.accentColor
-
 struct QuotasSectionView: View {
     @ObservedObject var model: DashboardModel
 
+    private var accent: Color {
+        ThemeStyling.accentColor(for: model.experienceTheme)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            liveOptInHeaderCard
+            liveHeaderCard
 
             if let snapshot = model.quotaSnapshot {
                 let items = model.displayQuotaItems(from: snapshot)
                 if items.isEmpty {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("All subscriptions are currently hidden")
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(.system(size: 13, weight: .semibold))
                         Text("Open Settings to choose which AI subscriptions to display and change their order.")
-                            .font(.system(size: 11))
+                            .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                         Button("Open Settings…") {
                             model.isShowingSettings = true
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
+                        .tint(accent)
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(nsColor: .controlBackgroundColor).opacity(0.78), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .themedSurfaceCard(theme: model.experienceTheme, isHovered: false)
                 } else {
                     ForEach(items, id: \.provider) { item in
                         let rowID = "quota-\(item.provider.rawValue)"
                         QuotaProviderCard(
                             item: item,
+                            theme: model.experienceTheme,
                             isHovered: model.hoveredRowID == rowID,
                             isPollingLive: model.isPollingLiveQuotas && model.isLiveQuotaEnabled,
                             onHover: { hovering in
@@ -50,7 +54,7 @@ struct QuotasSectionView: View {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text("Inspecting local AI usage & quota telemetry…")
-                        .font(.system(size: 11.5))
+                        .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -59,39 +63,39 @@ struct QuotasSectionView: View {
         }
     }
 
-    private var liveOptInHeaderCard: some View {
+    private var liveHeaderCard: some View {
         HStack(alignment: .center, spacing: 10) {
             Image(systemName: model.isLiveQuotaEnabled ? "antenna.radiowaves.left.and.right" : "internaldrive")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(model.isLiveQuotaEnabled ? Color.blue : quotaGreen)
-                .frame(width: 26, height: 26)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(model.isLiveQuotaEnabled ? Color.blue : accent)
+                .frame(width: 28, height: 28)
                 .background(
-                    (model.isLiveQuotaEnabled ? Color.blue : quotaGreen).opacity(0.12),
+                    (model.isLiveQuotaEnabled ? Color.blue : accent).opacity(0.12),
                     in: RoundedRectangle(cornerRadius: 7, style: .continuous)
                 )
 
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 5) {
-                    Text(model.isLiveQuotaEnabled ? "Hybrid Mode (Local + Opt-in Live OAuth)" : "Local Telemetry Mode (100% Offline)")
-                        .font(.system(size: 11, weight: .semibold))
+                HStack(spacing: 6) {
+                    Text("Account quotas")
+                        .font(.system(size: 12.5, weight: .semibold))
                     Text("Account-wide")
-                        .font(.system(size: 8.5, weight: .semibold))
+                        .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.secondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
                         .background(Color.primary.opacity(0.06), in: Capsule())
                 }
                 Text(
                     model.isLiveQuotaEnabled
-                        ? "Queries Codex & Claude usage endpoints in-memory using existing CLI OAuth tokens."
+                        ? "Polls Codex, Claude & Gemini usage windows in-memory using existing CLI OAuth tokens alongside local rolling token counters."
                         : "Reads only numeric token & rate-limit counters from local session files. No network calls."
                 )
-                .font(.system(size: 9.5))
+                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
             }
 
-            Spacer(minLength: 4)
+            Spacer(minLength: 6)
 
             if model.isLiveQuotaEnabled {
                 Button {
@@ -100,12 +104,12 @@ struct QuotasSectionView: View {
                     if model.isPollingLiveQuotas {
                         ProgressView().controlSize(.mini)
                     } else {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                            .font(.system(size: 10.5, weight: .semibold))
+                        Label("Refresh", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 11, weight: .semibold))
                     }
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .disabled(model.isPollingLiveQuotas)
                 .help("Poll live provider quota endpoints now")
             }
@@ -114,40 +118,32 @@ struct QuotasSectionView: View {
                 model.setLiveQuotaEnabled(!model.isLiveQuotaEnabled)
             } label: {
                 Text(model.isLiveQuotaEnabled ? "Live: ON" : "Enable Live")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(model.isLiveQuotaEnabled ? Color.white : Color.primary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4.5)
                     .background(
                         model.isLiveQuotaEnabled ? Color.blue : Color.primary.opacity(0.08),
                         in: Capsule()
                     )
             }
             .buttonStyle(.plain)
-            .help("Toggle opt-in live OAuth quota polling (Codex & Claude)")
+            .help("Toggle live OAuth quota polling (Codex, Claude & Gemini)")
+
             Button {
                 model.isShowingSettings = true
             } label: {
                 Image(systemName: "slider.horizontal.3")
-                    .font(.system(size: 10.5, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
             }
             .buttonStyle(.bordered)
-            .controlSize(.mini)
+            .controlSize(.small)
             .help("Reorder or show/hide subscriptions")
+            .accessibilityLabel("Subscription settings")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(
-            .regularMaterial,
-            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(
-                    Color(nsColor: .separatorColor).opacity(0.55),
-                    lineWidth: 0.5
-                )
-        )
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .themedSurfaceCard(theme: model.experienceTheme, isHovered: false)
     }
 }
 
@@ -245,11 +241,16 @@ struct CombinedProviderQuotaItem: Equatable, Sendable {
 
 private struct QuotaProviderCard: View {
     let item: CombinedProviderQuotaItem
+    let theme: SuyoiExperienceTheme
     let isHovered: Bool
     let isPollingLive: Bool
     let onHover: (Bool) -> Void
     let onRefreshLive: () -> Void
     let isLiveEnabled: Bool
+
+    private var accent: Color {
+        ThemeStyling.accentColor(for: theme)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -259,7 +260,7 @@ private struct QuotaProviderCard: View {
             if !windows.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(windows.enumerated()), id: \.offset) { _, window in
-                        QuotaWindowProgressRow(window: window)
+                        QuotaWindowProgressRow(window: window, accent: accent)
                     }
                 }
             }
@@ -270,7 +271,7 @@ private struct QuotaProviderCard: View {
             if !validTokens.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("LOCAL ROLLING TOKEN CONSUMPTION")
-                        .font(.system(size: 8.5, weight: .semibold))
+                        .font(.system(size: 9.5, weight: .bold))
                         .tracking(0.4)
                         .foregroundStyle(.secondary)
                     ForEach(validTokens, id: \.windowMinutes) { summary in
@@ -293,78 +294,69 @@ private struct QuotaProviderCard: View {
                     item.combinedWarnings.first
                         ?? "No local usage records found for \(item.displayName) yet."
                 )
-                .font(.system(size: 10))
+                .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
             }
 
             footerMetadataRow
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 9)
-        .background(
-            .regularMaterial,
-            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(
-                    Color(nsColor: .separatorColor).opacity(isHovered ? 0.95 : 0.45),
-                    lineWidth: 0.5
-                )
-        )
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .themedSurfaceCard(theme: theme, isHovered: isHovered)
         .onHover(perform: onHover)
     }
 
     private var headerRow: some View {
         HStack(spacing: 6) {
             Image(systemName: item.symbolName)
-                .font(.system(size: 11.5, weight: .semibold))
-                .foregroundStyle(quotaGreen)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(accent)
 
             Text(item.displayName)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 13.5, weight: .bold))
 
             if let plan = item.effectivePlanType, !plan.isEmpty {
                 Text(plan.uppercased())
-                    .font(.system(size: 8.5, weight: .bold))
-                    .foregroundStyle(quotaGreen)
-                    .padding(.horizontal, 5.5)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(accent)
+                    .padding(.horizontal, 6)
                     .padding(.vertical, 1.5)
-                    .background(quotaGreen.opacity(0.12), in: Capsule())
+                    .background(accent.opacity(0.12), in: Capsule())
             }
 
             Spacer()
 
             if let source = item.effectiveSourceForWindows {
-                HStack(spacing: 3) {
+                HStack(spacing: 4) {
                     Circle()
-                        .fill(source == .liveAPI ? Color.blue : quotaGreen)
-                        .frame(width: 4.5, height: 4.5)
+                        .fill(source == .liveAPI ? Color.blue : accent)
+                        .frame(width: 5, height: 5)
                     Text(source == .liveAPI ? "Live OAuth" : "Local Telemetry")
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.system(size: 10, weight: .semibold))
                 }
-                .foregroundStyle(source == .liveAPI ? Color.blue : quotaGreen)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 1.5)
-                .background((source == .liveAPI ? Color.blue : quotaGreen).opacity(0.10), in: Capsule())
+                .foregroundStyle(source == .liveAPI ? Color.blue : accent)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background((source == .liveAPI ? Color.blue : accent).opacity(0.10), in: Capsule())
             } else {
                 Text("Unavailable")
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1.5)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
                     .background(Color.primary.opacity(0.05), in: Capsule())
             }
 
             if isLiveEnabled && (item.provider == .codex || item.provider == .claude || item.provider == .gemini) {
                 Button(action: onRefreshLive) {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
                 .disabled(isPollingLive)
                 .help("Refresh live OAuth quota for \(item.displayName)")
+                .accessibilityLabel("Refresh live OAuth quota for \(item.displayName)")
             }
         }
     }
@@ -372,15 +364,15 @@ private struct QuotaProviderCard: View {
     private func creditsRow(_ credits: QuotaCredits) -> some View {
         HStack(spacing: 6) {
             Image(systemName: "creditcard")
-                .font(.system(size: 9.5))
+                .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
             if credits.unlimited == true {
                 Text("Credits: Unlimited")
-                    .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(quotaGreen)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(accent)
             } else if let balance = credits.balance {
                 Text(String(format: "Credits balance: %.2f", balance))
-                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
         }
@@ -389,16 +381,16 @@ private struct QuotaProviderCard: View {
     private func extraUsageRow(_ extra: QuotaExtraUsage) -> some View {
         HStack(spacing: 6) {
             Image(systemName: "plus.circle")
-                .font(.system(size: 9.5))
+                .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
             let currencyPrefix = extra.currency.map { "\($0) " } ?? ""
             if let used = extra.used, let limit = extra.limit {
                 Text(String(format: "Extra usage: %@%.2f / %.2f", currencyPrefix, used, limit))
-                    .font(.system(size: 9.5, design: .monospaced))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
             } else {
                 Text("Extra metered usage enabled")
-                    .font(.system(size: 9.5))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
         }
@@ -407,15 +399,15 @@ private struct QuotaProviderCard: View {
     private var footerMetadataRow: some View {
         HStack(spacing: 6) {
             Text("Account-wide quota")
-                .font(.system(size: 9))
+                .font(.system(size: 10.5))
                 .foregroundStyle(.tertiary)
             if let lastAct = item.effectiveLastActivityAt {
                 Text("· Last active \(formatRelativeTime(lastAct))")
-                    .font(.system(size: 9))
+                    .font(.system(size: 10.5))
                     .foregroundStyle(.tertiary)
             } else if let obsAt = item.effectiveObservedAt {
                 Text("· Checked \(obsAt.formatted(date: .omitted, time: .shortened))")
-                    .font(.system(size: 9))
+                    .font(.system(size: 10.5))
                     .foregroundStyle(.tertiary)
             }
             Spacer()
@@ -425,6 +417,7 @@ private struct QuotaProviderCard: View {
 
 private struct QuotaWindowProgressRow: View {
     let window: QuotaWindow
+    let accent: Color
 
     private var label: String {
         switch window.kind {
@@ -443,34 +436,36 @@ private struct QuotaWindowProgressRow: View {
         guard let pct = window.usedPercent else { return .secondary }
         if pct >= 90 { return .red }
         if pct >= 65 { return .orange }
-        return quotaGreen
+        return accent
     }
 
     var body: some View {
         let clamped = min(max(window.usedPercent ?? 0, 0), 100)
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Text(label)
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(.primary)
 
                 Spacer()
 
                 if let resetsAt = window.resetsAt {
                     Text(formatResetCountdown(resetsAt))
-                        .font(.system(size: 9.5, design: .monospaced))
+                        .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
 
                 if let pct = window.usedPercent {
                     let remaining = max(0, min(100, 100.0 - pct))
                     Text(String(format: "%.0f%% left (%.0f%% used)", remaining, pct))
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .font(.system(size: 11.5, weight: .bold, design: .rounded))
                         .monospacedDigit()
                         .foregroundStyle(barColor)
+                        .fixedSize(horizontal: true, vertical: false)
                 } else {
                     Text("—")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -484,7 +479,7 @@ private struct QuotaWindowProgressRow: View {
                         .frame(width: max(4, geo.size.width * CGFloat(clamped / 100.0)))
                 }
             }
-            .frame(height: 5.5)
+            .frame(height: 6)
         }
     }
 }
@@ -505,29 +500,29 @@ private struct TokenUsageRow: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(windowLabel)
-                .font(.system(size: 9.5, weight: .medium))
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
-                .frame(width: 86, alignment: .leading)
+                .frame(width: 96, alignment: .leading)
 
             HStack(spacing: 6) {
                 if let total = summary.totalTokens {
                     Text("\(formatTokenCount(total)) total")
-                        .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .foregroundStyle(.primary)
                 }
                 if let input = summary.inputTokens {
                     Text("· \(formatTokenCount(input)) in")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: 10.5, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
                 if let cached = summary.cacheReadTokens, cached > 0 {
                     Text("· \(formatTokenCount(cached)) cache")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: 10.5, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
                 if let output = summary.outputTokens {
                     Text("· \(formatTokenCount(output)) out")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: 10.5, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -541,82 +536,77 @@ private struct TokenUsageRow: View {
 /// Compact inline account-wide quota summary bar shown inside matching Agent rows on the Agents tab.
 struct CompactAgentQuotaBar: View {
     let item: CombinedProviderQuotaItem
+    var theme: SuyoiExperienceTheme = .nativeGlass
+
+    private var accent: Color {
+        ThemeStyling.accentColor(for: theme)
+    }
 
     var body: some View {
-        let fiveHour = item.effectiveWindows.first(where: { $0.kind == .fiveHour })
-        let sevenDay = item.effectiveWindows.first(where: { $0.kind == .sevenDay })
+        let primaryWindow = item.effectiveWindows.first(where: { $0.kind == .fiveHour })
+            ?? item.effectiveWindows.first(where: { $0.kind == .sevenDay })
         let token5h = item.localTokenSummaries.first(where: { $0.windowMinutes == 300 && ($0.totalTokens ?? 0) > 0 })
         let token7d = item.localTokenSummaries.first(where: { $0.windowMinutes == 10080 && ($0.totalTokens ?? 0) > 0 })
 
-        if fiveHour != nil || sevenDay != nil || token5h != nil || token7d != nil {
-            HStack(spacing: 8) {
-                Text("Account")
-                    .font(.system(size: 8.5, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 4.5)
-                    .padding(.vertical, 1)
-                    .background(Color.primary.opacity(0.05), in: Capsule())
-
-                if let plan = item.effectivePlanType {
+        if primaryWindow != nil || token5h != nil || token7d != nil {
+            HStack(spacing: 6) {
+                if let plan = item.effectivePlanType, !plan.isEmpty {
                     Text(plan.uppercased())
-                        .font(.system(size: 8.5, weight: .bold))
-                        .foregroundStyle(quotaGreen)
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundStyle(accent)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(accent.opacity(0.12), in: Capsule())
+                        .fixedSize(horizontal: true, vertical: false)
                 }
 
-                if let w5 = fiveHour, let pct = w5.usedPercent {
-                    miniWindowPill(title: "5h", percent: pct, resetsAt: w5.resetsAt)
-                }
-
-                if let w7 = sevenDay, let pct = w7.usedPercent {
-                    miniWindowPill(title: "7d", percent: pct, resetsAt: w7.resetsAt)
-                }
-
-                if fiveHour == nil && sevenDay == nil {
-                    if let t5 = token5h, let tot = t5.totalTokens {
-                        Text("5h: \(formatTokenCount(tot)) tok")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    if let t7 = token7d, let tot = t7.totalTokens {
-                        Text("7d: \(formatTokenCount(tot)) tok")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
+                if let win = primaryWindow, let pct = win.usedPercent {
+                    let windowLabel = win.kind == .fiveHour ? "5h" : "7d"
+                    miniWindowPill(title: windowLabel, percent: pct, resetsAt: win.resetsAt)
                 } else if let t5 = token5h, let tot = t5.totalTokens {
-                    Text("· \(formatTokenCount(tot)) tok (5h)")
-                        .font(.system(size: 8.5, design: .monospaced))
-                        .foregroundStyle(.tertiary)
+                    Text("\(formatTokenCount(tot)) tok (5h)")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else if let t7 = token7d, let tot = t7.totalTokens {
+                    Text("\(formatTokenCount(tot)) tok (7d)")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
 
                 Spacer(minLength: 0)
             }
-            .padding(.top, 3)
+            .lineLimit(1)
         }
     }
 
     private func miniWindowPill(title: String, percent: Double, resetsAt: Date?) -> some View {
-        let color: Color = percent >= 90 ? .red : (percent >= 65 ? .orange : quotaGreen)
+        let color: Color = percent >= 90 ? .red : (percent >= 65 ? .orange : accent)
         let clamped = min(max(percent, 0), 100)
         let remaining = max(0, min(100, 100.0 - clamped))
         return HStack(spacing: 4) {
             Text(title)
-                .font(.system(size: 8.5, weight: .semibold))
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: true, vertical: false)
             ZStack(alignment: .leading) {
                 Capsule()
-                    .fill(Color.primary.opacity(0.09))
-                    .frame(width: 28, height: 4)
+                    .fill(Color.primary.opacity(0.10))
+                    .frame(width: 24, height: 4.5)
                 Capsule()
                     .fill(color)
-                    .frame(width: max(2, 28 * CGFloat(clamped / 100.0)), height: 4)
+                    .frame(width: max(2, 24 * CGFloat(clamped / 100.0)), height: 4.5)
             }
             Text(String(format: "%.0f%% left", remaining))
-                .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                 .foregroundStyle(color)
+                .fixedSize(horizontal: true, vertical: false)
             if let resetsAt {
                 Text("(\(formatShortCountdown(resetsAt)))")
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
         }
     }

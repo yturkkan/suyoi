@@ -2,25 +2,37 @@ import Foundation
 import Testing
 @testable import SuyoiCore
 
-private struct TrashRecoveryFixture {
+private final class TrashRecoveryFixture: @unchecked Sendable {
     let root: URL
     let original: URL
     let trashed: URL
+    var evidence: TrashRecoveryEvidence?
 
     init() throws {
         root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
             .appendingPathComponent("suyoi-recovery-" + UUID().uuidString, isDirectory: true)
-        original = root.appendingPathComponent("original")
-        trashed = root.appendingPathComponent("trashed")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        original = root.appendingPathComponent("project/original")
+        trashed = root.appendingPathComponent("trash/trashed")
+        for file in [original, trashed] {
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        }
     }
 
     func createTrashedFile() throws {
-        try Data("recoverable contents".utf8).write(to: trashed)
+        try Data("recoverable contents".utf8).write(to: original)
+        try trashOriginal()
+    }
+
+    func trashOriginal() throws {
+        let identity = try #require(FileMetadataReader().identity(at: original))
+        let pending = try #require(TrashRecoveryEvidence.prepare(original: original, expectedIdentity: identity))
+        try FileManager.default.moveItem(at: original, to: trashed)
+        let receipt = try #require(pending.completed(at: trashed))
+        evidence = receipt
     }
 
     func record(in store: TrashRecoveryStore) throws -> TrashedItemRecord {
-        store.record(originalPath: original.path, trashedURL: trashed, category: "cache", bytes: 20)
+        store.record(originalPath: original.path, trashedURL: trashed, category: "cache", bytes: 20, recovery: evidence)
         return try #require(store.records().first)
     }
 
@@ -42,7 +54,7 @@ struct TrashRecoveryStoreTests {
         let store = TrashRecoveryStore()
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         store.record(originalPath: fixture.original.path, trashedURL: fixture.trashed,
-                     category: "build", bytes: 1234, now: now)
+                     category: "build", bytes: 1234, now: now, recovery: fixture.evidence)
         let item = try #require(store.records().first)
         #expect(store.records().count == 1)
         #expect(UUID(uuidString: item.id) != nil)
@@ -80,9 +92,10 @@ struct TrashRecoveryStoreTests {
     func restoreDirectory() throws {
         let fixture = try TrashRecoveryFixture()
         defer { fixture.remove() }
-        let child = fixture.trashed.appendingPathComponent("nested/file")
+        let child = fixture.original.appendingPathComponent("nested/file")
         try FileManager.default.createDirectory(at: child.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("nested contents".utf8).write(to: child)
+        try fixture.trashOriginal()
         let store = TrashRecoveryStore()
         let item = try fixture.record(in: store)
         #expect(store.restore(item).restored)
@@ -196,7 +209,7 @@ struct TrashRecoveryStoreTests {
         #expect(store.records() == [item])
     }
 
-    @Test("A valid source can be restored when its recorded identity is unavailable")
+    @Test("An unbound source cannot be restored after appearing at the recorded path")
     func optionalIdentity() throws {
         let fixture = try TrashRecoveryFixture()
         defer { fixture.remove() }
@@ -206,9 +219,10 @@ struct TrashRecoveryStoreTests {
         let encoded = try JSONEncoder().encode(item)
         #expect(try JSONDecoder().decode(TrashedItemRecord.self, from: encoded) == item)
         try fixture.createTrashedFile()
-        #expect(store.restore(item).restored)
-        #expect(try Data(contentsOf: fixture.original) == Data("recoverable contents".utf8))
-        #expect(store.records().isEmpty)
+        #expect(!store.restore(item).restored)
+        #expect(!FileManager.default.fileExists(atPath: fixture.original.path))
+        #expect(try Data(contentsOf: fixture.trashed) == Data("recoverable contents".utf8))
+        #expect(store.records() == [item])
     }
 
     @Test("A failed move retains the source and recovery record")
@@ -225,6 +239,44 @@ struct TrashRecoveryStoreTests {
         #expect(outcome.error != nil)
         #expect(FileManager.default.fileExists(atPath: fixture.trashed.path))
         #expect(!FileManager.default.fileExists(atPath: original.path))
+        #expect(store.records() == [item])
+    }
+
+    @Test("A replaced original directory blocks recovery and keeps the source", arguments: [false, true])
+    func replacedDestinationParent(symlink: Bool) throws {
+        let fixture = try TrashRecoveryFixture()
+        defer { fixture.remove() }
+        try fixture.createTrashedFile()
+        let store = TrashRecoveryStore()
+        let item = try fixture.record(in: store)
+        let originalParent = fixture.original.deletingLastPathComponent()
+        let previous = fixture.root.appendingPathComponent("previous")
+        try FileManager.default.moveItem(at: originalParent, to: previous)
+        if symlink {
+            try FileManager.default.createSymbolicLink(at: originalParent, withDestinationURL: previous)
+        } else {
+            try FileManager.default.createDirectory(at: originalParent, withIntermediateDirectories: false)
+        }
+        #expect(!store.restore(item).restored)
+        #expect(!FileManager.default.fileExists(atPath: fixture.original.path))
+        #expect(FileManager.default.fileExists(atPath: fixture.trashed.path))
+        #expect(store.records() == [item])
+    }
+
+    @Test("A symlink to the same Trash parent cannot redirect recovery")
+    func symlinkToOriginalTrashParent() throws {
+        let fixture = try TrashRecoveryFixture()
+        defer { fixture.remove() }
+        try fixture.createTrashedFile()
+        let store = TrashRecoveryStore()
+        let item = try fixture.record(in: store)
+        let trashParent = fixture.trashed.deletingLastPathComponent()
+        let previous = fixture.root.appendingPathComponent("previous")
+        try FileManager.default.moveItem(at: trashParent, to: previous)
+        try FileManager.default.createSymbolicLink(at: trashParent, withDestinationURL: previous)
+        #expect(!store.restore(item).restored)
+        #expect(!FileManager.default.fileExists(atPath: fixture.original.path))
+        #expect(FileManager.default.fileExists(atPath: previous.appendingPathComponent(fixture.trashed.lastPathComponent).path))
         #expect(store.records() == [item])
     }
 

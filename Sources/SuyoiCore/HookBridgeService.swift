@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Dispatch
 import Foundation
@@ -5,13 +6,24 @@ import Foundation
 public struct HookBridgeClient: Sendable {
     public let inboxDirectory: URL
     public let outboxDirectory: URL
+    private let hookOwner: @Sendable () -> ObservedProcess?
+    private let processLookup: @Sendable (Int32, Int) -> ObservedProcess?
 
     public init(
         inboxDirectory: URL = HookBridgeClient.defaultInboxDirectory(),
         outboxDirectory: URL = HookBridgeClient.defaultOutboxDirectory()
     ) {
+        self.init(inboxDirectory: inboxDirectory, outboxDirectory: outboxDirectory,
+                  hookOwner: { Self.claudeAncestor() }, processLookup: { DarwinProcessReader().process(pid: $0, uid: $1) })
+    }
+
+    init(inboxDirectory: URL, outboxDirectory: URL,
+         hookOwner: @escaping @Sendable () -> ObservedProcess?,
+         processLookup: @escaping @Sendable (Int32, Int) -> ObservedProcess?) {
         self.inboxDirectory = inboxDirectory
         self.outboxDirectory = outboxDirectory
+        self.hookOwner = hookOwner
+        self.processLookup = processLookup
     }
 
     public static func defaultInboxDirectory(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
@@ -22,7 +34,13 @@ public struct HookBridgeClient: Sendable {
         homeDirectory.appendingPathComponent("Library/Application Support/Suyoi/approvals/outbox", isDirectory: true)
     }
 
-    /// Synchronous transport for hook subprocesses; call off the main thread.
+    private struct Envelope: Codable {
+        let version: Int
+        let fields: Data
+        let scope: ApprovalScope?
+    }
+
+    /// Synchronous Claude Code hook transport. Only a reduced event reaches the inbox.
     public func forwardEventAndWait(
         _ inputData: Data,
         timeout: TimeInterval = 120.0,
@@ -30,36 +48,95 @@ public struct HookBridgeClient: Sendable {
     ) -> Data {
         guard !inputData.isEmpty, inputData.count <= 65_536,
               let object = try? JSONSerialization.jsonObject(with: inputData) as? [String: Any],
-              let event = object["hook_event_name"] as? String,
-              let session = object["session_id"] as? String,
-              !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+              let name = object["hook_event_name"] as? String, let event = HookEventKind(rawValue: name) else {
             return Self.invalidPayload
         }
-        let lifecycle = ["Stop", "SessionEnd", "SessionStart", "PostToolUse", "Notification"].contains(event)
-        guard lifecycle || event == "PermissionRequest" || event == "PreToolUse" else {
-            return Self.invalidPayload
+        func deny(_ reason: String) -> Data { Self.claudeReply(.init(decision: "block", reason: reason), event: event) }
+        let decisionEvent = event == .preToolUse || event == .permissionRequest
+        guard decisionEvent || event == .sessionStart || event == .sessionEnd || event == .stop else { return Data() }
+        guard let sessionID = object["session_id"] as? String, AgentApprovalController.validSessionID(sessionID) else {
+            return deny("Invalid hook payload")
         }
 
+        let owner = hookOwner().flatMap { process -> ObservedProcess? in
+            UUID(uuidString: sessionID) != nil && Self.isClaude(process) ? process : nil
+        }
+        let cwd = Self.validProject(object["cwd"] as? String)
+        let verified = owner.flatMap { process -> ObservedProcess? in
+            guard let cwd, Self.validProject(process.cwd) == cwd else { return nil }
+            return process
+        }
+
+        if !decisionEvent && owner == nil { return Data() }
         let inbox = HookBridgeFiles.openDirectory(inboxDirectory)
-        guard inbox >= 0 else { return Self.unavailable }
+        guard inbox >= 0 else { return deny("Hook bridge unavailable") }
         defer { close(inbox) }
-        let requestName = UUID().uuidString + ".json"
-        if lifecycle {
-            guard HookBridgeFiles.writeAtomically(inputData, name: requestName, directory: inbox) else {
-                return Self.unavailable
+        let now = Date()
+        HookBridgeFiles.pruneStaleFiles(in: inbox, suffix: ".json", olderThan: 180, now: now)
+        HookBridgeFiles.pruneStaleFiles(in: inbox, suffix: ".lifetime", olderThan: Self.lifetimeMaxAge, now: now)
+
+        var scope: ApprovalScope?
+        if let owner {
+            let key = Self.scopeFilename(process: owner.identity, sessionID: sessionID)
+            switch event {
+            case .sessionStart:
+                // A new lifetime retires any previous grant even when its project cannot be verified.
+                if verified != nil {
+                    if !HookBridgeFiles.writeAtomically(Data(UUID().uuidString.utf8), name: key, directory: inbox) {
+                        _ = unlinkat(inbox, key, 0)
+                    }
+                } else {
+                    _ = unlinkat(inbox, key, 0)
+                }
+                return Data()
+            case .sessionEnd:
+                _ = unlinkat(inbox, key, 0)
+                return Data()
+            default:
+                if let verified, let cwd, let generation = Self.readGeneration(key, directory: inbox, now: now) {
+                    scope = ApprovalScope(process: verified.identity, sessionID: sessionID, projectPath: cwd,
+                                          generation: generation)
+                }
             }
-            return Data(#"{"decision":"approve"}"#.utf8)
+        }
+        if event == .stop {
+            if let scope,
+               let fields = try? JSONSerialization.data(withJSONObject: ["hook_event_name": name, "session_id": sessionID]),
+               let envelope = try? JSONEncoder().encode(Envelope(version: 1, fields: fields, scope: scope)) {
+                _ = HookBridgeFiles.writeAtomically(envelope, name: UUID().uuidString + ".json", directory: inbox)
+            }
+            return Data()
+        }
+        guard decisionEvent else { return Data() }
+        if event == .preToolUse, object["requires_approval"] as? Bool == false { return Data() }
+        guard timeout.isFinite, timeout > 0 else { return deny("Approval timed out") }
+        guard let tool = (object["tool_name"] as? String).flatMap({ Self.display($0, limit: 128) }) else {
+            return deny("Missing tool name")
         }
 
-        guard timeout.isFinite, timeout > 0 else { return Self.timedOut }
-        let outbox = HookBridgeFiles.openDirectory(outboxDirectory)
-        guard outbox >= 0 else { return Self.unavailable }
-        defer { close(outbox) }
-        guard HookBridgeFiles.writeAtomically(inputData, name: requestName, directory: inbox) else {
-            return Self.unavailable
+        let originalInput = object["tool_input"] as? [String: Any] ?? [:]
+        let prepared = Self.reducedInput(originalInput, isQuestionTool: tool == "AskUserQuestion")
+        guard let prepared else { return deny("Unsupported question format") }
+        var fields: [String: Any] = ["hook_event_name": name, "session_id": sessionID, "tool_name": tool,
+                                     "agent_name": verified == nil ? "Claude Code Hook" : "Claude Code",
+                                     "tool_input": prepared.fields]
+        if let cwd { fields["cwd"] = cwd }
+        if let verified { fields["pid"] = verified.pid }
+        guard let data = try? JSONSerialization.data(withJSONObject: fields),
+              let envelope = try? JSONEncoder().encode(Envelope(version: 1, fields: data, scope: scope)) else {
+            return deny("Invalid hook payload")
         }
-        let responseName = String(requestName.dropLast(5)) + ".response.json"
-        // Only transport-owned spool entries are unlinked; these are not user storage cleanup.
+
+        let outbox = HookBridgeFiles.openDirectory(outboxDirectory)
+        guard outbox >= 0 else { return deny("Hook bridge unavailable") }
+        defer { close(outbox) }
+        HookBridgeFiles.pruneStaleFiles(in: outbox, suffix: ".response.json", olderThan: 180, now: now)
+        let id = UUID().uuidString
+        let requestName = id + ".json"
+        guard HookBridgeFiles.writeAtomically(envelope, name: requestName, directory: inbox) else {
+            return deny("Hook bridge unavailable")
+        }
+        let responseName = id + ".response.json"
         defer {
             _ = unlinkat(inbox, requestName, 0)
             _ = unlinkat(outbox, responseName, 0)
@@ -68,20 +145,34 @@ public struct HookBridgeClient: Sendable {
         let interval = pollInterval.isFinite && pollInterval > 0 ? max(0.001, pollInterval) : 0.05
         while true {
             let remaining = timeout - (ProcessInfo.processInfo.systemUptime - started)
-            guard remaining > 0 else { return Self.timedOut }
+            guard remaining > 0 else { return deny("Approval timed out") }
             switch HookBridgeFiles.readBoundedFile(name: responseName, directory: outbox, maxBytes: 16_384) {
             case .missing:
                 Thread.sleep(forTimeInterval: min(interval, remaining))
             case .invalid:
-                return Data(#"{"decision":"block","reason":"Invalid approval response"}"#.utf8)
+                return deny("Invalid approval response")
             case .data(let data):
-                return data
+                guard let reply = try? JSONDecoder().decode(AgentApprovalController.Reply.self, from: data),
+                      ["approve", "block"].contains(reply.decision) else { return deny("Invalid approval response") }
+                if reply.decision == "approve", let scope, !scopeIsCurrent(scope, directory: inbox) {
+                    return deny("Hook session ended")
+                }
+                var updatedInput: [String: Any]?
+                if reply.decision == "approve", let question = prepared.originalQuestion {
+                    guard let label = reply.answer, let index = prepared.labels.firstIndex(of: label) else {
+                        return deny("Question requires an answer")
+                    }
+                    var input = originalInput
+                    input["answers"] = [question: prepared.originalLabels[index]]
+                    updatedInput = input
+                }
+                return Self.claudeReply(reply, event: event, updatedInput: updatedInput)
             }
         }
     }
 
-    /// Safely drains queued hook JSON files from the inbox directory using descriptor-pinned `O_NOFOLLOW`
-    /// reads, routes responses atomically to the outbox directory, and prunes expired requests/responses.
+    /// The scope marker is changed by the lifecycle hook before it returns. An older
+    /// pending request cannot regain the previous lifetime by arriving late.
     @discardableResult
     public func drainInbox(
         into controller: AgentApprovalController,
@@ -97,31 +188,131 @@ public struct HookBridgeClient: Sendable {
         defer { close(outbox) }
 
         HookBridgeFiles.pruneStaleFiles(in: inbox, suffix: ".json", olderThan: maxPendingAge, now: now)
+        HookBridgeFiles.pruneStaleFiles(in: inbox, suffix: ".lifetime", olderThan: Self.lifetimeMaxAge, now: now)
         HookBridgeFiles.pruneStaleFiles(in: outbox, suffix: ".response.json", olderThan: maxPendingAge, now: now)
-
-        let names = HookBridgeFiles.directoryEntryNames(inbox)
-            .filter { !$0.hasPrefix(".") && $0.hasSuffix(".json") }
-            .sorted()
-        let outboxURL = outboxDirectory
+        let names = HookBridgeFiles.directoryEntryNames(inbox).compactMap { name -> (String, Date)? in
+            guard name.hasSuffix(".json"), UUID(uuidString: String(name.dropLast(5))) != nil,
+                  let date = HookBridgeFiles.modificationDate(name: name, directory: inbox) else { return nil }
+            return (name, date)
+        }.sorted { $0.1 == $1.1 ? $0.0 < $1.0 : $0.1 < $1.1 }
         var addedCount = 0
-        for name in names {
-            let fileTimestamp = HookBridgeFiles.modificationDate(name: name, directory: inbox) ?? now
+        for (name, timestamp) in names.prefix(100) {
             let readResult = HookBridgeFiles.readBoundedFile(name: name, directory: inbox, maxBytes: 65_536)
-            _ = unlinkat(inbox, name, 0)
-            guard now.timeIntervalSince(fileTimestamp) <= maxPendingAge,
-                  case .data(let data) = readResult else { continue }
+            guard unlinkat(inbox, name, 0) == 0,
+                  abs(now.timeIntervalSince(timestamp)) <= maxPendingAge, case .data(let data) = readResult,
+                  let envelope = try? JSONDecoder().decode(Envelope.self, from: data), envelope.version == 1 else { continue }
             let responseName = String(name.dropLast(5)) + ".response.json"
-            let created = controller.ingestHookEvent(data, now: fileTimestamp) { replyData in
-                let fd = HookBridgeFiles.openDirectory(outboxURL)
+            let created = controller.ingestHookEvent(envelope.fields, scope: envelope.scope, now: timestamp, isScopeCurrent: {
+                guard let scope = envelope.scope else { return false }
+                let fd = HookBridgeFiles.openDirectory(inboxDirectory)
+                guard fd >= 0 else { return false }
+                defer { close(fd) }
+                return scopeIsCurrent(scope, directory: fd)
+            }) { replyData in
+                let fd = HookBridgeFiles.openDirectory(outboxDirectory)
                 guard fd >= 0 else { return }
                 defer { close(fd) }
                 _ = HookBridgeFiles.writeAtomically(replyData, name: responseName, directory: fd)
             }
-            if created != nil {
-                addedCount += 1
-            }
+            if created != nil { addedCount += 1 }
         }
         return addedCount
+    }
+
+    private static let lifetimeMaxAge: TimeInterval = 86_400
+
+    private static func validProject(_ raw: String?) -> String? {
+        guard let raw, raw.hasPrefix("/"), raw.utf8.count <= 4_096,
+              !raw.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) || $0.properties.generalCategory == .format }) else { return nil }
+        return URL(fileURLWithPath: raw).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private static func isClaude(_ process: ObservedProcess) -> Bool {
+        process.identity.isActionEligible && process.uid == Int(getuid()) && !process.isStopped
+            && AgentRecognizer.agentName(for: process) == "Claude Code"
+    }
+
+    private static func claudeAncestor() -> ObservedProcess? {
+        let uid = Int(getuid())
+        let reader = DarwinProcessReader()
+        var pid = getppid()
+        for _ in 0..<12 {
+            guard pid > 1, let process = reader.process(pid: pid, uid: uid),
+                  let parent = Int32(exactly: process.parentPID), parent != pid else { return nil }
+            if AgentRecognizer.isAgent(process) { return isClaude(process) ? process : nil }
+            pid = parent
+        }
+        return nil
+    }
+
+    private static func scopeFilename(process: ProcessIdentity, sessionID: String) -> String {
+        let material = "\(process.uid)\0\(process.pid)\0\(process.startTimeMicroseconds ?? 0)\0\(process.executablePath)\0\(sessionID)"
+        return SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined() + ".lifetime"
+    }
+
+    private static func readGeneration(_ key: String, directory: Int32, now: Date) -> UUID? {
+        guard let date = HookBridgeFiles.modificationDate(name: key, directory: directory),
+              abs(now.timeIntervalSince(date)) <= lifetimeMaxAge,
+              case .data(let data) = HookBridgeFiles.readBoundedFile(name: key, directory: directory, maxBytes: 36),
+              let value = String(data: data, encoding: .utf8) else { return nil }
+        return UUID(uuidString: value)
+    }
+
+    private func scopeIsCurrent(_ scope: ApprovalScope, directory: Int32) -> Bool {
+        guard let pid = Int32(exactly: scope.process.pid), let process = processLookup(pid, scope.process.uid),
+              process.identity == scope.process, Self.isClaude(process),
+              Self.validProject(process.cwd) == scope.projectPath else { return false }
+        let key = Self.scopeFilename(process: scope.process, sessionID: scope.sessionID)
+        return Self.readGeneration(key, directory: directory, now: Date()) == scope.generation
+    }
+
+    private static func display(_ raw: String, limit: Int) -> String? {
+        SessionTurnPreviewInspector.sanitizeAndRedact(raw, maxLength: limit)
+    }
+
+    private struct ReducedInput {
+        let fields: [String: Any]
+        let originalQuestion: String?
+        let labels: [String]
+        let originalLabels: [String]
+    }
+
+    private static func reducedInput(_ input: [String: Any], isQuestionTool: Bool) -> ReducedInput? {
+        if isQuestionTool {
+            guard let questions = input["questions"] as? [[String: Any]], questions.count == 1,
+                  let question = questions.first, question["multiSelect"] as? Bool != true,
+                  let text = question["question"] as? String, let summary = display(text, limit: 1_024),
+                  let options = question["options"] as? [[String: Any]], (1...32).contains(options.count) else { return nil }
+            let original = options.compactMap { $0["label"] as? String }
+            let labels = original.compactMap { display($0, limit: 512) }
+            guard labels.count == options.count, Set(labels).count == labels.count else { return nil }
+            return ReducedInput(fields: ["question": summary, "options": labels],
+                                originalQuestion: text, labels: labels, originalLabels: original)
+        }
+        let candidate = (input["command"] as? String) ?? (input["file_path"] as? String)
+        let summary = candidate.flatMap { display($0, limit: 1_024) }
+        return ReducedInput(fields: summary.map { ["command": $0] } ?? [:],
+                            originalQuestion: nil, labels: [], originalLabels: [])
+    }
+
+    private static func claudeReply(_ reply: AgentApprovalController.Reply, event: HookEventKind,
+                                    updatedInput: [String: Any]? = nil) -> Data {
+        let allowed = reply.decision == "approve"
+        let behavior = allowed ? "allow" : "deny"
+        var output: [String: Any] = ["hookEventName": event.rawValue]
+        switch event {
+        case .preToolUse:
+            output["permissionDecision"] = behavior
+            if let reason = reply.reason { output["permissionDecisionReason"] = reason }
+            if let updatedInput { output["updatedInput"] = updatedInput }
+        case .permissionRequest:
+            var decision: [String: Any] = ["behavior": behavior]
+            if let reason = reply.reason { decision["message"] = reason }
+            if let updatedInput { decision["updatedInput"] = updatedInput }
+            output["decision"] = decision
+        default: return Data()
+        }
+        return (try? JSONSerialization.data(withJSONObject: ["hookSpecificOutput": output], options: [.sortedKeys])) ?? invalidPayload
     }
 
     public static func simulatedApprovalPayload(
@@ -143,8 +334,6 @@ public struct HookBridgeClient: Sendable {
     }
 
     private static let invalidPayload = Data(#"{"decision":"block","reason":"Invalid hook payload"}"#.utf8)
-    private static let timedOut = Data(#"{"decision":"block","reason":"Approval timed out"}"#.utf8)
-    private static let unavailable = Data(#"{"decision":"block","reason":"Hook bridge unavailable"}"#.utf8)
 }
 
 /// Directory notifications are coalesced by Dispatch. The callback should rescan the inbox.
@@ -210,7 +399,16 @@ private enum HookBridgeFiles {
                                                     attributes: [.posixPermissions: 0o700])
         } catch { return -1 }
         // Pin the directory so subsequent reads, writes and cleanup cannot follow a replaced path.
-        return open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        var path = url.path
+        if ["/var/", "/tmp/", "/etc/"].contains(where: { path.hasPrefix($0) }) { path = "/private" + path }
+        let descriptor = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC)
+        guard descriptor >= 0 else { return -1 }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_uid == getuid(), info.st_mode & 0o077 == 0 else {
+            close(descriptor)
+            return -1
+        }
+        return descriptor
     }
 
     static func writeAtomically(_ data: Data, name: String, directory: Int32) -> Bool {
@@ -241,6 +439,7 @@ private enum HookBridgeFiles {
         defer { close(descriptor) }
         var metadata = stat()
         guard fstat(descriptor, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
+              metadata.st_uid == getuid(), metadata.st_mode & 0o077 == 0, metadata.st_nlink == 1,
               metadata.st_size >= 0, metadata.st_size <= off_t(maxBytes) else { return .invalid }
         // Read one extra byte to detect growth after fstat, without unbounded allocation.
         var bytes = [UInt8](repeating: 0, count: maxBytes + 1)

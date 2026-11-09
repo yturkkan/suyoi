@@ -10,11 +10,18 @@ public struct WorktreeInspector: Sendable {
     public func inspect(root: URL, processes: Observation<[ObservedProcess]> = Observation(value: [], status: .unavailable, warnings: [], capturedAt: Date())) -> Observation<[WorktreeRecord]> {
         var warnings: [String] = []
         let repos = discoverRepositories(root: root, warnings: &warnings)
+        guard !repos.isEmpty else {
+            return Observation(value: [], status: warnings.isEmpty ? .complete : .partial,
+                warnings: warnings, capturedAt: Date())
+        }
+        guard let git = ReadOnlyWorktreeGit(runner: runner) else {
+            return Observation(value: [], status: .unavailable,
+                warnings: warnings + ["Could not start read-only Git inspection"], capturedAt: Date())
+        }
         var records: [WorktreeRecord] = []
         var seen = Set<String>()
         for repo in repos {
-            guard let result = command(repo.path, ["worktree", "list", "--porcelain", "-z"]),
-                  successful(result), let entries = Self.parseEntries(result.stdoutText) else {
+            guard let entries = entries(in: repo.path, git: git) else {
                 warnings.append("Could not inspect worktrees in \(repo.path)"); continue
             }
             for (index, entry) in entries.enumerated() {
@@ -32,13 +39,21 @@ public struct WorktreeInspector: Sendable {
                 let pathVerified = entry.path.hasPrefix("/") && FileMetadataReader().identity(at: treeURL) != nil && treeURL.standardizedFileURL.resolvingSymlinksInPath().path == treeURL.standardizedFileURL.path
                 if !pathVerified { reasons.append("Worktree path is unavailable or contains a symlink") }
                 if !isMain && !entry.bare {
-                    if pathVerified, let status = command(entry.path, ["status", "--porcelain=v1", "--untracked-files=all"]), successful(status) {
-                        dirty = !status.stdout.isEmpty
+                    if pathVerified {
+                        let blocker: String?
+                        if let tracked = git.trackedPaths(entry.path) {
+                            blocker = git.filterBlocker(entry.path, tracked: tracked)
+                                ?? git.statusBlocker(entry.path, head: entry.head, branch: entry.branch)
+                        } else {
+                            blocker = "Could not verify the worktree Git index"
+                        }
+                        dirty = blocker != nil
+                        if let blocker { reasons.append(blocker) }
+                        merged = mergeStatus(path: entry.path, head: entry.head, git: git)
                     } else {
-                        dirty = true; reasons.append("Could not verify worktree status")
+                        dirty = true
+                        reasons.append("Could not verify worktree status")
                     }
-                    if dirty { reasons.append("Worktree has uncommitted changes") }
-                    if pathVerified { merged = mergeStatus(path: entry.path) }
                     if merged != true { reasons.append("Worktree is not verified merged to the default branch") }
                 }
                 let cwd = NodeModulesSafety.workingDirectoryUsage(root: treeURL, processes: processes)
@@ -107,21 +122,45 @@ public struct WorktreeInspector: Sendable {
         return entries.isEmpty ? nil : entries
     }
 
-    private func command(_ path: String, _ arguments: [String]) -> CommandResult? {
-        try? runner.run(CommandRequest(executable: "/usr/bin/git", arguments: ["-C", path, "-c", "core.fsmonitor=false"] + arguments, timeout: 4))
+    /// Re-read registration and status after potentially slow usage checks.
+    func freshTrashBlocker(_ worktree: WorktreeRecord,
+                           inspectContents: (ReadOnlyWorktreeGit.TrackedPaths) -> String?) -> String? {
+        guard let git = ReadOnlyWorktreeGit(runner: runner),
+              let entries = entries(in: worktree.path, git: git) else {
+            return "Could not verify live worktree registration"
+        }
+        let matching = entries.enumerated().filter { $0.element.path == worktree.path }
+        guard matching.count == 1, let (index, entry) = matching.first, index != 0,
+              !entry.bare, !entry.locked, !entry.prunable, entry.branch == worktree.branch,
+              entry.head == worktree.headCommit else {
+            return "Worktree registration, branch, or commit changed during verification"
+        }
+        guard mergeStatus(path: worktree.path, head: entry.head, git: git) == true else {
+            return "Worktree is not verified merged to the default branch"
+        }
+        guard let trackedPaths = git.trackedPaths(worktree.path) else {
+            return "Could not verify the worktree Git index"
+        }
+        if let blocker = git.filterBlocker(worktree.path, tracked: trackedPaths) { return blocker }
+        if let blocker = git.statusBlocker(worktree.path, head: entry.head, branch: entry.branch) { return blocker }
+        return inspectContents(trackedPaths)
     }
 
-    private func successful(_ result: CommandResult) -> Bool {
-        result.exitCode == 0 && !result.timedOut && !result.truncated && result.stderr.isEmpty
+    private func entries(in path: String, git: ReadOnlyWorktreeGit) -> [Entry]? {
+        guard let result = git.command(path, ["worktree", "list", "--porcelain", "-z"]),
+              ReadOnlyWorktreeGit.successful(result), let text = String(data: result.stdout, encoding: .utf8) else { return nil }
+        return Self.parseEntries(text)
     }
 
-    private func mergeStatus(path: String) -> Bool? {
+    private func mergeStatus(path: String, head: String?, git: ReadOnlyWorktreeGit) -> Bool? {
+        guard let head, !head.isEmpty, head.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
         for ref in ["refs/heads/main", "refs/heads/master", "refs/remotes/origin/HEAD"] {
-            guard let exists = command(path, ["rev-parse", "--verify", "--quiet", ref]), !exists.timedOut, !exists.truncated, exists.stderr.isEmpty else { return nil }
+            guard let exists = git.command(path, ["rev-parse", "--verify", "--quiet", ref]),
+                  ReadOnlyWorktreeGit.complete(exists) else { return nil }
             if exists.exitCode == 1 { continue }
             guard exists.exitCode == 0, !exists.stdout.isEmpty,
-                  let ancestor = command(path, ["merge-base", "--is-ancestor", "HEAD", ref]),
-                  !ancestor.timedOut, !ancestor.truncated, ancestor.stderr.isEmpty else { return nil }
+                  let ancestor = git.command(path, ["merge-base", "--is-ancestor", head, ref]),
+                  ReadOnlyWorktreeGit.complete(ancestor) else { return nil }
             if ancestor.exitCode == 0 { return true }
             if ancestor.exitCode == 1 { return false }
             return nil

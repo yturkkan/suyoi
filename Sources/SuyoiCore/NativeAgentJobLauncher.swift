@@ -14,8 +14,11 @@ public final class NativeAgentJobLauncher: NativeAgentJobLaunching, @unchecked S
 
     private let lock = NSLock()
     private var runningJobs: [UUID: Process] = [:]
+    private let catalog: NativeSessionCatalog
 
-    public init() {}
+    public init(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        catalog = NativeSessionCatalog(homeDirectory: homeDirectory)
+    }
 
     public func launch(executable: String, arguments: [String], workingDirectory: URL?) throws {
         guard executable.hasPrefix("/") else { throw Error.relativeExecutable }
@@ -30,11 +33,7 @@ public final class NativeAgentJobLauncher: NativeAgentJobLaunching, @unchecked S
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.currentDirectoryURL = workingDirectory
-        process.environment = [
-            "PATH": "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-            "LC_ALL": "C",
-            "GIT_OPTIONAL_LOCKS": "0"
-        ]
+        process.environment = Self.environment(for: executable, catalog: catalog)
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -50,6 +49,25 @@ public final class NativeAgentJobLauncher: NativeAgentJobLaunching, @unchecked S
             release(id)
             throw Error.launchFailed
         }
+    }
+
+    static func environment(for executable: String, catalog: NativeSessionCatalog) -> [String: String] {
+        var environment = [
+            "PATH": "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "LC_ALL": "C",
+            "GIT_OPTIONAL_LOCKS": "0"
+        ]
+        // Continue the same provider store that supplied the selected session.
+        switch URL(fileURLWithPath: executable).lastPathComponent {
+        case "codex":
+            environment["CODEX_HOME"] = catalog.codexHome.path
+            environment["CODEX_SQLITE_HOME"] = catalog.codexHome.path
+        case "opencode":
+            environment["OPENCODE_DB"] = catalog.openCodeDB.path
+        default:
+            break
+        }
+        return environment
     }
 
     private func release(_ id: UUID) {

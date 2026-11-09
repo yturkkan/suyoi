@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct AgentClientVisualProfile: Equatable, Sendable {
@@ -46,9 +47,19 @@ public struct SessionJumpOutcome: Equatable, Sendable {
 /// Navigation only: selects existing sessions or opens a workspace, without sending terminal input.
 public struct SessionJumpRouter: Sendable {
     private let runner: any CommandRunning
+    private let verifyProcess: @Sendable (AgentObservation) -> Bool
+    private let verifyHost: @Sendable (AgentObservation, Int) -> Bool
 
     public init(runner: any CommandRunning = CommandRunner()) {
+        self.init(runner: runner, verifyProcess: { Self.liveProcessMatches($0) }, verifyHost: { Self.liveHostMatches($0, $1) })
+    }
+
+    init(runner: any CommandRunning,
+         verifyProcess: @escaping @Sendable (AgentObservation) -> Bool,
+         verifyHost: @escaping @Sendable (AgentObservation, Int) -> Bool) {
         self.runner = runner
+        self.verifyProcess = verifyProcess
+        self.verifyHost = verifyHost
     }
 
     public static let allSupportedAgentNames: [String] = [
@@ -121,6 +132,9 @@ public struct SessionJumpRouter: Sendable {
         activatePID: (Int) -> Bool = { _ in false },
         openURL: (URL) -> Bool = { _ in false }
     ) -> SessionJumpOutcome {
+        let stale = SessionJumpOutcome(succeeded: false, target: nil, summary: "Session jump unavailable",
+                                       error: "Selected process or terminal association changed")
+        guard verifyProcess(agent) else { return stale }
         guard let target = resolveTarget(for: agent) else {
             return SessionJumpOutcome(succeeded: false, target: nil, summary: "No session target available",
                                       error: "No terminal, workspace or host could be resolved")
@@ -131,6 +145,10 @@ public struct SessionJumpRouter: Sendable {
         func failure(_ error: String) -> SessionJumpOutcome {
             SessionJumpOutcome(succeeded: false, target: target, summary: "Session jump unavailable", error: error)
         }
+        func activateHost(_ pid: Int) -> Bool {
+            verifyProcess(agent) && verifyHost(agent, pid) && activatePID(pid)
+        }
+        guard verifyProcess(agent) else { return stale }
         switch target {
         case let .tmuxPane(pane, _):
             guard let separator = pane.lastIndex(of: ".") else { return failure("Invalid tmux target") }
@@ -138,29 +156,59 @@ public struct SessionJumpRouter: Sendable {
             guard runSucceeded(Self.tmuxRequest(["select-window", "-t", window])) else {
                 return failure("Could not select the tmux window")
             }
+            guard verifyProcess(agent) else { return stale }
             guard runSucceeded(Self.tmuxRequest(["select-pane", "-t", pane])) else {
                 return failure("Could not select the tmux pane")
             }
-            if let pid = Self.validPID(agent.terminalPID) { _ = activatePID(pid) }
+            if let pid = Self.validPID(agent.terminalPID) { _ = activateHost(pid) }
             return success("Selected tmux window and pane")
         case let .terminalTab(app, tty, hostPID):
             let script = app == "Terminal" ? Self.terminalScript : Self.iTermScript
             let request = CommandRequest(executable: "/usr/bin/osascript", arguments: ["-e", script, "/dev/" + tty],
                                          timeout: 5, maximumOutputBytes: 4096)
             if runSucceeded(request) { return success("Selected terminal session") }
-            if let hostPID, activatePID(hostPID) { return success("Activated terminal host; session selection unavailable") }
+            if let hostPID, activateHost(hostPID) { return success("Activated terminal host; session selection unavailable") }
             return failure("Could not select the terminal session or activate its host")
         case let .ideWorkspace(_, url, _, hostPID):
-            if let hostPID, activatePID(hostPID) { return success("Activated workspace host") }
+            if let hostPID, activateHost(hostPID) { return success("Activated workspace host") }
             if let url, openURL(url) { return success("Opened workspace link") }
             return failure("Could not activate the IDE or open its workspace link")
         case let .hostProcess(_, pid):
-            return activatePID(pid) ? success("Activated session host") : failure("Could not activate the session host")
+            return activateHost(pid) ? success("Activated session host") : failure("Could not activate the session host")
         case let .finderReveal(path):
             let request = CommandRequest(executable: "/usr/bin/open", arguments: ["-R", path],
                                          timeout: 5, maximumOutputBytes: 4096)
             return runSucceeded(request) ? success("Revealed workspace in Finder") : failure("Could not reveal the workspace")
         }
+    }
+
+    private static func liveProcessMatches(_ agent: AgentObservation) -> Bool {
+        let uid = Int(getuid())
+        let identity = agent.process.identity
+        guard identity.isActionEligible, identity.uid == uid, let pid = Int32(exactly: identity.pid),
+              let live = DarwinProcessReader().process(pid: pid, uid: uid), live.identity == identity,
+              !live.isStopped else { return false }
+        return live.tty.map { normalizedTTY($0) ?? $0 } == agent.process.tty.map { normalizedTTY($0) ?? $0 }
+    }
+
+    private static func liveHostMatches(_ agent: AgentObservation, _ hostPID: Int) -> Bool {
+        let reader = DarwinProcessReader()
+        let uid = Int(getuid())
+        var processes: [Int: ObservedProcess] = [:]
+        var pid = agent.process.pid
+        for _ in 0..<64 {
+            guard processes[pid] == nil, let value = Int32(exactly: pid),
+                  let process = reader.process(pid: value, uid: uid) else { break }
+            processes[pid] = process
+            if pid == hostPID { break }
+            pid = process.parentPID
+        }
+        guard let live = processes[agent.process.pid], live.identity == agent.process.identity,
+              let host = AgentRecognizer.terminalHost(for: live, processesByPID: processes),
+              host.pid == hostPID, host.name == agent.terminalApp,
+              let capturedHost = processes[hostPID], capturedHost.identity.isActionEligible,
+              let hostPID = Int32(exactly: hostPID) else { return false }
+        return reader.process(pid: hostPID, uid: uid)?.identity == capturedHost.identity
     }
 
     private static let ideSchemes = [

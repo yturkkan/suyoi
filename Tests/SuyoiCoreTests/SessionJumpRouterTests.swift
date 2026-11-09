@@ -37,6 +37,21 @@ struct SessionJumpRouterTests {
                                 terminalApp: app, statusSource: .processOnly, childServerPorts: [], terminalPID: pid)
     }
 
+    private func router(runner: any CommandRunning) -> SessionJumpRouter {
+        SessionJumpRouter(runner: runner, verifyProcess: { _ in true }, verifyHost: { _, _ in true })
+    }
+
+    @Test func staleProcessCannotRunJumpCommandsOrActivateHost() {
+        let runner = JumpCommandRecorder()
+        let row = agent(app: "Terminal", tty: "ttys001", pid: 9)
+        let result = SessionJumpRouter(runner: runner).executeJump(for: row, activatePID: { _ in
+            Issue.record("A stale row must not activate a host")
+            return true
+        })
+        #expect(!result.succeeded)
+        #expect(runner.requests.isEmpty)
+    }
+
     @Test func supportsEveryRequestedProductWithDistinctVisuals() {
         let names = ["Claude Code", "Codex", "OpenCode", "Gemini CLI", "Antigravity CLI", "Hermes Agent",
                      "Qwen Code", "Kimi CLI", "OpenClaw", "Pi Agent", "Oh My Pi", "Aider", "Cursor",
@@ -73,7 +88,7 @@ struct SessionJumpRouterTests {
     @Test(arguments: ["ttys001", "/dev/ttys001"])
     func resolvesTmuxBeforeHostTerminal(tty: String) {
         let runner = JumpCommandRecorder { _ in jumpResult("/dev/ttys002\tother:0.0\n/dev/ttys001\tproject:2.3\n") }
-        let target = SessionJumpRouter(runner: runner).resolveTarget(for: agent(app: "Terminal", tty: tty, pid: 9))
+        let target = router(runner: runner).resolveTarget(for: agent(app: "Terminal", tty: tty, pid: 9))
         #expect(target == .tmuxPane(sessionWindowPane: "project:2.3", tty: "ttys001"))
         #expect(runner.requests.count == 1)
         #expect(runner.requests.first?.executable == "/usr/bin/env")
@@ -83,7 +98,7 @@ struct SessionJumpRouterTests {
 
     @Test func resolvesBareTmuxTTYAndExplicitHost() {
         let runner = JumpCommandRecorder { _ in jumpResult("ttys007\twork:12.4\n") }
-        #expect(SessionJumpRouter(runner: runner).resolveTarget(for: agent(app: "tmux", tty: "ttys007"))
+        #expect(router(runner: runner).resolveTarget(for: agent(app: "tmux", tty: "ttys007"))
                 == .tmuxPane(sessionWindowPane: "work:12.4", tty: "ttys007"))
     }
 
@@ -92,7 +107,7 @@ struct SessionJumpRouterTests {
             request.arguments.contains("list-panes") ? jumpResult("/dev/ttys001\tmy project:12.4\n") : jumpResult()
         }
         var activated: [Int] = []
-        let outcome = SessionJumpRouter(runner: runner).executeJump(
+        let outcome = router(runner: runner).executeJump(
             for: agent(app: "iTerm2", tty: "ttys001", pid: 9), activatePID: { activated.append($0); return true })
         #expect(outcome.succeeded)
         #expect(outcome.error == nil)
@@ -111,7 +126,7 @@ struct SessionJumpRouterTests {
             if request.arguments.contains("list-panes") { return jumpResult("/dev/ttys001\twork:0.1\n") }
             return jumpResult("PRIVATE OUTPUT", exit: request.arguments.contains(command) ? 1 : 0)
         }
-        let outcome = SessionJumpRouter(runner: runner).executeJump(for: agent(app: "tmux", tty: "ttys001"))
+        let outcome = router(runner: runner).executeJump(for: agent(app: "tmux", tty: "ttys001"))
         #expect(!outcome.succeeded)
         #expect(outcome.target == .tmuxPane(sessionWindowPane: "work:0.1", tty: "ttys001"))
         #expect(outcome.error != nil)
@@ -130,7 +145,7 @@ struct SessionJumpRouterTests {
     ])
     func rejectsAmbiguousMalformedOrNonmatchingTmuxOutput(output: String) {
         let runner = JumpCommandRecorder { _ in jumpResult(output) }
-        #expect(SessionJumpRouter(runner: runner).resolveTarget(for: agent(app: "Terminal", tty: "ttys001"))
+        #expect(router(runner: runner).resolveTarget(for: agent(app: "Terminal", tty: "ttys001"))
                 == .terminalTab(app: "Terminal", tty: "ttys001", hostPID: nil))
     }
 
@@ -139,7 +154,7 @@ struct SessionJumpRouterTests {
                       jumpResult("/dev/ttys001\twork:0.0\n", truncated: true)])
     func ignoresFailedOrIncompleteTmuxDiscovery(result: CommandResult) {
         let runner = JumpCommandRecorder { _ in result }
-        #expect(SessionJumpRouter(runner: runner).resolveTarget(for: agent(app: "iTerm2", tty: "ttys001"))
+        #expect(router(runner: runner).resolveTarget(for: agent(app: "iTerm2", tty: "ttys001"))
                 == .terminalTab(app: "iTerm2", tty: "ttys001", hostPID: nil))
     }
 
@@ -147,7 +162,7 @@ struct SessionJumpRouterTests {
     func selectsTerminalTabUsingDeviceArgument(app: String) {
         let runner = JumpCommandRecorder()
         var activated = false
-        let outcome = SessionJumpRouter(runner: runner).executeJump(
+        let outcome = router(runner: runner).executeJump(
             for: agent(app: app, tty: "/dev/ttys001", pid: 9), activatePID: { _ in activated = true; return true })
         #expect(outcome.succeeded)
         #expect(outcome.target == .terminalTab(app: app, tty: "ttys001", hostPID: 9))
@@ -162,7 +177,7 @@ struct SessionJumpRouterTests {
     @Test(arguments: ["", "-tty", "ttys001;bad", "../ttys001", "/dev/../ttys001", "ttys001\n", "pts/1"])
     func invalidTTYDoesNotLaunchCommands(tty: String) {
         let runner = JumpCommandRecorder()
-        #expect(SessionJumpRouter(runner: runner).resolveTarget(for: agent(app: "Terminal", tty: tty, pid: 9))
+        #expect(router(runner: runner).resolveTarget(for: agent(app: "Terminal", tty: tty, pid: 9))
                 == .hostProcess(app: "Terminal", pid: 9))
         #expect(runner.requests.isEmpty)
     }
@@ -170,7 +185,7 @@ struct SessionJumpRouterTests {
     @Test func terminalFailureFallsBackToHostActivation() {
         let runner = JumpCommandRecorder { _ in jumpResult("PRIVATE OUTPUT", exit: 1) }
         var activated: [Int] = []
-        let outcome = SessionJumpRouter(runner: runner).executeJump(
+        let outcome = router(runner: runner).executeJump(
             for: agent(app: "Terminal", tty: "ttys001", pid: 9), activatePID: { activated.append($0); return true })
         #expect(outcome.succeeded)
         #expect(outcome.error == nil)
@@ -181,7 +196,7 @@ struct SessionJumpRouterTests {
     @Test(arguments: [jumpResult(exit: 1), jumpResult(timedOut: true), jumpResult(truncated: true)])
     func terminalFailureWithoutWorkingFallbackFails(result: CommandResult) {
         let runner = JumpCommandRecorder { _ in result }
-        let outcome = SessionJumpRouter(runner: runner).executeJump(for: agent(app: "iTerm2", tty: "ttys001", pid: 9))
+        let outcome = router(runner: runner).executeJump(for: agent(app: "iTerm2", tty: "ttys001", pid: 9))
         #expect(!outcome.succeeded)
         #expect(outcome.error != nil)
         #expect(!String(describing: outcome).contains("PRIVATE"))
@@ -192,7 +207,7 @@ struct SessionJumpRouterTests {
     func generatesEncodedIDEWorkspaceLinks(app: String, scheme: String) {
         let runner = JumpCommandRecorder()
         let root = "/work/My Project/#draft?rate=100%/日本語"
-        let target = SessionJumpRouter(runner: runner).resolveTarget(for: agent(app: app, pid: 9, root: root, cwd: "/other"))
+        let target = router(runner: runner).resolveTarget(for: agent(app: app, pid: 9, root: root, cwd: "/other"))
         guard case let .ideWorkspace(actualApp, link, path, pid) = target else { Issue.record("Expected IDE workspace"); return }
         #expect(actualApp == app)
         #expect(path == root)
@@ -207,7 +222,7 @@ struct SessionJumpRouterTests {
     }
 
     @Test func workspaceUsesCWDWhenProjectIsMissingOrInvalid() {
-        let router = SessionJumpRouter(runner: JumpCommandRecorder())
+        let router = router(runner: JumpCommandRecorder())
         #expect(router.resolveTarget(for: agent(app: "Cursor", cwd: "/work/repo"))
                 == .ideWorkspace(app: "Cursor", deepLinkURL: URL(string: "cursor://file/work/repo"), rootPath: "/work/repo", hostPID: nil))
         #expect(router.resolveTarget(for: agent(app: "Cursor", root: "", cwd: "/work/repo"))
@@ -217,7 +232,7 @@ struct SessionJumpRouterTests {
     }
 
     @Test func idePrefersHostActivationAndFallsBackToURL() {
-        let router = SessionJumpRouter(runner: JumpCommandRecorder())
+        let router = router(runner: JumpCommandRecorder())
         let observation = agent(app: "Cursor", pid: 9, root: "/work/repo")
         var activated: [Int] = []
         var opened: [URL] = []
@@ -234,7 +249,7 @@ struct SessionJumpRouterTests {
     }
 
     @Test func hostAndFinderFallbackPriority() {
-        let router = SessionJumpRouter(runner: JumpCommandRecorder())
+        let router = router(runner: JumpCommandRecorder())
         #expect(router.resolveTarget(for: agent(pid: 9, root: "/work/repo")) == .hostProcess(app: "Terminal", pid: 9))
         #expect(router.resolveTarget(for: agent(app: "Other", pid: 9)) == .hostProcess(app: "Other", pid: 9))
         #expect(router.resolveTarget(for: agent(root: "/work/repo", cwd: "/other")) == .finderReveal(path: "/work/repo"))
@@ -247,7 +262,7 @@ struct SessionJumpRouterTests {
 
     @Test(arguments: [0, -1, Int.max])
     func invalidHostPIDsCannotBeActivated(pid: Int) {
-        let router = SessionJumpRouter(runner: JumpCommandRecorder())
+        let router = router(runner: JumpCommandRecorder())
         var activated = false
         #expect(router.resolveTarget(for: agent(pid: pid)) == nil)
         #expect(!router.executeJump(for: agent(pid: pid), activatePID: { _ in activated = true; return true }).succeeded)
@@ -257,7 +272,7 @@ struct SessionJumpRouterTests {
     @Test func finderRevealPassesLiteralPathAsOneArgument() {
         let path = "/work/space name;$(touch ignored)"
         let runner = JumpCommandRecorder()
-        let outcome = SessionJumpRouter(runner: runner).executeJump(for: agent(cwd: path))
+        let outcome = router(runner: runner).executeJump(for: agent(cwd: path))
         #expect(outcome.succeeded)
         #expect(outcome.target == .finderReveal(path: path))
         #expect(runner.requests.count == 1)
@@ -267,7 +282,7 @@ struct SessionJumpRouterTests {
 
     @Test func finderAndUnavailableTargetReportFailure() {
         let runner = JumpCommandRecorder { _ in jumpResult("PRIVATE OUTPUT", exit: 1) }
-        let router = SessionJumpRouter(runner: runner)
+        let router = router(runner: runner)
         let failed = router.executeJump(for: agent(cwd: "/work/repo"))
         #expect(!failed.succeeded)
         #expect(failed.error != nil)
@@ -281,7 +296,7 @@ struct SessionJumpRouterTests {
     @Test(arguments: ["", "relative/path", "-option", "/work/\u{0}repo", "/work/repo\n"])
     func invalidPathsCannotBecomeJumpTargets(path: String) {
         let runner = JumpCommandRecorder()
-        let router = SessionJumpRouter(runner: runner)
+        let router = router(runner: runner)
         #expect(router.resolveTarget(for: agent(cwd: path)) == nil)
         #expect(!router.executeJump(for: agent(cwd: path)).succeeded)
         #expect(runner.requests.isEmpty)
@@ -289,7 +304,7 @@ struct SessionJumpRouterTests {
 
     @Test func thrownCommandsUseSafeErrorsAndFallbacks() {
         let runner = JumpCommandRecorder { _ in throw NSError(domain: "PRIVATE THROW", code: 1) }
-        let router = SessionJumpRouter(runner: runner)
+        let router = router(runner: runner)
         let observation = agent(app: "Terminal", tty: "ttys001", pid: 9)
         #expect(router.resolveTarget(for: observation) == .terminalTab(app: "Terminal", tty: "ttys001", hostPID: 9))
         #expect(router.executeJump(for: observation, activatePID: { _ in true }).succeeded)

@@ -23,6 +23,7 @@ public final class IncrementalDirectoryCache: @unchecked Sendable {
     private struct Entry {
         let key: EntryKey
         let bytes: Int64
+        let allocatedBytes: Int64?
         let recordedAt: Date
         let sequence: UInt64
     }
@@ -39,6 +40,10 @@ public final class IncrementalDirectoryCache: @unchecked Sendable {
     }
 
     public func cachedBytes(for url: URL, now: Date = Date()) -> Int64? {
+        cachedMeasurement(for: url, now: now)?.bytes
+    }
+
+    func cachedMeasurement(for url: URL, now: Date = Date()) -> (bytes: Int64, allocatedBytes: Int64?)? {
         lock.lock()
         defer { lock.unlock() }
         let path = url.standardizedFileURL.path
@@ -48,10 +53,10 @@ public final class IncrementalDirectoryCache: @unchecked Sendable {
             entries.removeValue(forKey: path)
             return nil
         }
-        return entry.bytes
+        return (entry.bytes, entry.allocatedBytes)
     }
 
-    public func record(bytes: Int64, for url: URL, now: Date = Date()) {
+    public func record(bytes: Int64, allocatedBytes: Int64? = nil, for url: URL, now: Date = Date()) {
         lock.lock()
         defer { lock.unlock() }
         guard bytes >= 0, ttlSeconds > 0, maxEntries > 0,
@@ -65,7 +70,8 @@ public final class IncrementalDirectoryCache: @unchecked Sendable {
             entries.removeValue(forKey: oldest)
         }
         sequence &+= 1
-        entries[key.path] = Entry(key: key, bytes: bytes, recordedAt: now, sequence: sequence)
+        entries[key.path] = Entry(key: key, bytes: bytes, allocatedBytes: allocatedBytes,
+            recordedAt: now, sequence: sequence)
     }
 
     public func invalidate(path: String) {

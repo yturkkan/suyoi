@@ -1,129 +1,123 @@
-import CryptoKit
 import Foundation
+import Darwin
 import SQLite3
 import Testing
 @testable import SuyoiCore
 
 @Suite("Bounded agent task metadata")
 struct AgentTaskInspectorTests {
-    private func process(_ name: String = "codex", pid: Int = 400, parent: Int = 1, cpu: Double = 0, stopped: Bool = false, cwd: String? = "/project") -> ObservedProcess {
-        ObservedProcess(pid: pid, parentPID: parent, uid: 501, cpuPercent: cpu, residentBytes: 0, executable: "/bin/\(name)", startTimeMicroseconds: 100, cwd: cwd, isStopped: stopped)
-    }
-    private func inspect(_ fixture: QuotaFixture, name: String = "Codex", rows: [ObservedProcess] = [], now: Date = Date()) -> AgentTaskContext {
-        AgentTaskInspector(homeDirectory: fixture.home).inspect(agentName: name, process: process(name == "OpenCode" ? "opencode" : "codex"), projectRoot: "/project", allProcesses: rows, now: now)
+    private let rollout = ".codex/sessions/2026/11/07/rollout-safe-id.jsonl"
+
+    private func process(_ name: String = "codex", pid: Int = 400, parent: Int = 1,
+                         uid: Int = Int(getuid()), cpu: Double = 0, stopped: Bool = false,
+                         cwd: String? = "/project") -> ObservedProcess {
+        ObservedProcess(pid: pid, parentPID: parent, uid: uid, cpuPercent: cpu, residentBytes: 0,
+            executable: "/bin/\(name)", startTimeMicroseconds: 100, cwd: cwd, isStopped: stopped)
     }
 
-    @Test func openCodeSessionAndPrioritizedTodo() throws {
+    private func meta(cwd: String = "/project") -> [String: Any] {
+        ["type": "session_meta", "payload": ["id": "safe-id", "cwd": cwd, "prompt": "PRIVATE"]]
+    }
+
+    private func state(_ value: String) -> [String: Any] {
+        ["type": "event_msg", "payload": ["type": value, "message": "PRIVATE"]]
+    }
+
+    private func evidence(at file: URL) throws -> SessionFileEvidence {
+        let fd = SessionFileEvidence.openRegular(file)
+        try #require(fd >= 0)
+        defer { close(fd) }
+        let identity = try #require(SessionFileEvidence.readIdentity(fd, uid: Int(getuid())))
+        return SessionFileEvidence(url: file, identity: identity)
+    }
+
+    @Test func structuredCodexTaskStatesRequireExactLiveFile() throws {
+        let f = try QuotaFixture(); defer { f.clean() }
+        let row = process()
+        let child = process("swift", pid: 401, parent: 400)
+        let unrelated = process("codex", pid: 405, parent: row.parentPID)
+        let records = [meta(cwd: "/project/."), state("task_started")]
+        try f.write(records, to: rollout)
+        try f.write([meta(cwd: "/other"), state("task_complete")], to: ".codex/sessions/2026/11/08/other.jsonl")
+        let file = try evidence(at: f.home.appendingPathComponent(rollout))
+        let inspector = AgentTaskInspector(homeDirectory: f.home, liveFile: { process, _ in
+            process.identity == row.identity ? file : nil
+        })
+
+        let started = inspector.inspect(agentName: "Codex", process: row, projectRoot: "/project", allProcesses: [row, child, unrelated])
+        #expect(started.sessionID == "safe-id")
+        #expect(started.currentTask == "Active turn · Running: swift")
+        #expect(inspector.inspect(agentName: "Codex", process: unrelated, projectRoot: "/project",
+                                  allProcesses: [row, unrelated]).sessionID == nil)
+
+        for (value, expected) in [("task_complete", "Turn complete · waiting for prompt"), ("turn_aborted", "Turn aborted · waiting for prompt")] {
+            try f.write(records + [state(value)], to: rollout)
+            #expect(inspector.inspect(agentName: "Codex", process: row, projectRoot: "/project", allProcesses: [row]).currentTask == expected)
+        }
+        try f.write([meta(cwd: "/other"), state("task_started")], to: rollout)
+        #expect(inspector.inspect(agentName: "Codex", process: row, projectRoot: "/project", allProcesses: [row]).sessionID == nil)
+    }
+
+    @Test func historicalRecordsCannotAttachToSiblingOrGenericDirectoryRows() throws {
+        let f = try QuotaFixture(); defer { f.clean() }
+        try f.write([meta(), state("task_started")], to: rollout)
+        for cwd: String? in ["/project", nil, "/", f.home.path] {
+            let first = process(pid: 510, parent: 9, cwd: cwd)
+            let second = process(pid: 511, parent: 9, cwd: cwd)
+            let rows = AgentRecognizer.observations(processes: [first, second], serverGroups: [], projectsByPath: [:], homeDirectory: f.home)
+            #expect(rows.count == 2)
+            #expect(rows.allSatisfy { $0.sessionID == nil && $0.sessionTitle == nil && $0.currentTask == nil })
+        }
+    }
+
+    @Test func openCodeAndGeminiStorageDoNotSupplyLiveRowMetadata() throws {
         let f = try QuotaFixture(); defer { f.clean() }
         try f.write(Data(), to: ".local/share/opencode/opencode.db")
         var db: OpaquePointer?
-        #expect(sqlite3_open(f.home.appendingPathComponent(".local/share/opencode/opencode.db").path, &db) == SQLITE_OK)
-        defer { sqlite3_close(db) }
-        let sql = """
-        CREATE TABLE session_v2 (id TEXT, title TEXT, directory TEXT, time_updated INTEGER);
-        CREATE TABLE todo (session_id TEXT, status TEXT, content TEXT, position INTEGER, time_updated INTEGER);
-        INSERT INTO session_v2 VALUES ('ses_safe', 'Build core', '/project', 100), ('other', 'Wrong project', '/elsewhere', 200);
-        INSERT INTO todo VALUES ('ses_safe', 'pending', 'Later work', 0, 200), ('ses_safe', 'in_progress', 'Implement inspector', 1, 100);
-        """
-        #expect(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK)
-        let context = inspect(f, name: "OpenCode")
-        #expect(context.sessionID == "ses_safe")
-        #expect(context.sessionTitle == "Build core")
-        #expect(context.currentTask == "Todo: Implement inspector")
-        #expect(inspect(f, name: "OpenCode", rows: [process("opencode"), process("swift", pid: 401, parent: 400)]).currentTask == "Running: swift · Todo: Implement inspector")
-        #expect(sqlite3_exec(db, "UPDATE todo SET status = 'completed' WHERE status = 'in_progress'", nil, nil, nil) == SQLITE_OK)
-        #expect(inspect(f, name: "OpenCode").currentTask == "Next: Later work")
-        #expect(sqlite3_exec(db, "UPDATE todo SET status = 'completed'", nil, nil, nil) == SQLITE_OK)
-        #expect(inspect(f, name: "OpenCode").currentTask == nil)
-    }
-
-    @Test func codexStructuredTaskStatesAndRecognizerWiring() throws {
-        let f = try QuotaFixture(); defer { f.clean() }
-        let path = ".codex/sessions/2026/11/07/session.jsonl"
-        let meta: [String: Any] = ["type": "session_meta", "payload": ["id": "safe-UUID_1", "cwd": "/project/.", "prompt": "PRIVATE"]]
-        let started: [String: Any] = ["type": "event_msg", "payload": ["type": "task_started", "message": "PRIVATE"]]
-        try f.write([meta, ["type": "response_item", "payload": ["message": "PRIVATE"]], started], to: path)
-        let context = inspect(f)
-        #expect(context.sessionID == "safe-UUID_1")
-        #expect(context.sessionTitle == nil)
-        #expect(context.currentTask == "Active turn in progress")
-        let rows = [process(), process("swift", pid: 401, parent: 400)]
-        #expect(inspect(f, rows: rows).currentTask == "Active turn · Running: swift")
-        let observation = AgentRecognizer.observations(processes: rows, serverGroups: [], projectsByPath: [:], homeDirectory: f.home).first
-        #expect(observation?.sessionID == context.sessionID)
-        #expect(observation?.currentTask == "Active turn · Running: swift")
-        for (state, expected) in [("task_complete", "Turn complete · waiting for prompt"), ("turn_aborted", "Turn aborted · waiting for prompt")] {
-            try f.write([meta, started, ["type": "event_msg", "payload": ["type": state, "message": "PRIVATE"]]], to: path)
-            #expect(inspect(f).currentTask == expected)
-        }
-        try f.write([["type": "session_meta", "payload": ["id": "safe-id", "cwd": "/other"]], started], to: path)
-        #expect(inspect(f).sessionID == nil)
-    }
-
-    @Test func openCodeGenericDirectoryUsesLatestSession() throws {
-        let f = try QuotaFixture(); defer { f.clean() }
-        try f.write(Data(), to: ".local/share/opencode/opencode.db")
-        var db: OpaquePointer?
-        #expect(sqlite3_open(f.home.appendingPathComponent(".local/share/opencode/opencode.db").path, &db) == SQLITE_OK)
-        defer { sqlite3_close(db) }
-        #expect(sqlite3_exec(db, """
-        CREATE TABLE session_v2 (id TEXT, title TEXT, directory TEXT, idle_outcome TEXT, time_updated INTEGER);
-        CREATE TABLE todo (session_id TEXT, status TEXT, content TEXT, position INTEGER, time_updated INTEGER);
-        INSERT INTO session_v2 VALUES ('older', 'Older work', '/project', 'completed', 100), ('latest', 'Build core', '/workspace/Suyoi', 'completed', 200);
-        """, nil, nil, nil) == SQLITE_OK)
+        try #require(sqlite3_open(f.home.appendingPathComponent(".local/share/opencode/opencode.db").path, &db) == SQLITE_OK)
+        defer { if let db { sqlite3_close(db) } }
+        try #require(sqlite3_exec(db, """
+            CREATE TABLE session_v2 (id TEXT, title TEXT, directory TEXT, time_updated INTEGER);
+            CREATE TABLE todo (session_id TEXT, status TEXT, content TEXT, position INTEGER, time_updated INTEGER);
+            INSERT INTO session_v2 VALUES ('ses_other', 'Other work', '/project', 100);
+            INSERT INTO todo VALUES ('ses_other', 'in_progress', 'Other task', 1, 100);
+            """, nil, nil, nil) == SQLITE_OK)
+        try f.write([["sessionId": "gem-other", "cwd": "/project"]], to: ".gemini/sessions/gem-other.jsonl")
         let inspector = AgentTaskInspector(homeDirectory: f.home)
-        for cwd: String? in [nil, "/", f.home.path, f.home.path + "/."] {
-            let agent = process("opencode", cwd: cwd)
-            let context = inspector.inspect(agentName: "OpenCode", process: agent, projectRoot: nil, allProcesses: [agent])
-            #expect(context.sessionID == "latest")
-            #expect(context.sessionTitle == "Suyoi · Build core")
-            #expect(context.currentTask == "Last turn: completed")
-            let running = inspector.inspect(agentName: "OpenCode", process: agent, projectRoot: nil, allProcesses: [agent, process("swift", pid: 401, parent: 400)])
-            #expect(running.currentTask == "Running: swift")
+        for (name, executable) in [("OpenCode", "opencode"), ("Gemini CLI", "gemini")] {
+            let row = process(executable)
+            let running = process("swift", pid: 401, parent: row.pid)
+            let context = inspector.inspect(agentName: name, process: row, projectRoot: "/project", allProcesses: [row, running])
+            #expect(context.sessionID == nil && context.sessionTitle == nil)
+            #expect(context.currentTask == "Running: swift")
         }
-        #expect(sqlite3_exec(db, "INSERT INTO todo VALUES ('latest', 'in_progress', 'Implement inspector', 0, 200)", nil, nil, nil) == SQLITE_OK)
-        let context = inspector.inspect(agentName: "OpenCode", process: process("opencode", cwd: f.home.path), projectRoot: nil, allProcesses: [])
-        #expect(context.currentTask == "Todo: Implement inspector")
-        #expect(inspector.inspect(agentName: "OpenCode", process: process("opencode", cwd: f.home.path), projectRoot: "/project", allProcesses: []).sessionID == "older")
     }
 
-    @Test func codexGenericDirectoryUsesLatestFileAndTaskState() throws {
+    @Test func largeCodexFileReadsVerifiedMetadataAndRecentStateWithinBudget() throws {
         let f = try QuotaFixture(); defer { f.clean() }
-        let older = ".codex/sessions/2026/11/07/older.jsonl"
-        let latest = ".codex/sessions/2026/11/07/latest.jsonl"
-        try f.write([["type": "session_meta", "payload": ["id": "older", "cwd": "/project"]]], to: older)
-        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 100)], ofItemAtPath: f.home.appendingPathComponent(older).path)
-        let meta: [String: Any] = ["type": "session_meta", "payload": ["id": "latest", "cwd": "/workspace/Suyoi", "prompt": "PRIVATE"]]
-        let inspector = AgentTaskInspector(homeDirectory: f.home)
-        for (state, expected, active) in [("task_started", "Active turn in progress", "Active turn"), ("task_complete", "Turn complete · waiting for prompt", "Turn complete"), ("turn_aborted", "Turn aborted · waiting for prompt", "Turn aborted")] {
-            try f.write([meta, ["type": "event_msg", "payload": ["type": "task_started"]], ["type": "event_msg", "payload": ["type": state]], ["type": "response_item", "payload": ["text": "PRIVATE"]]], to: latest)
-            for cwd: String? in [nil, "/", f.home.path, f.home.path + "/."] {
-                let agent = process(cwd: cwd)
-                let context = inspector.inspect(agentName: "Codex", process: agent, projectRoot: nil, allProcesses: [agent])
-                #expect(context.sessionID == "latest")
-                #expect(context.sessionTitle == "Suyoi session")
-                #expect(context.currentTask == expected)
-                #expect(inspector.inspect(agentName: "Codex", process: agent, projectRoot: nil, allProcesses: [agent, process("swift", pid: 401, parent: 400)]).currentTask == "\(active) · Running: swift")
-            }
-        }
-        #expect(inspector.inspect(agentName: "Codex", process: process(cwd: f.home.path), projectRoot: "/project", allProcesses: []).sessionID == "older")
-    }
-
-    @Test func largeCodexFileReadsMetadataAndRecentStateWithinBudget() throws {
-        let f = try QuotaFixture(); defer { f.clean() }
-        let meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"safe\",\"cwd\":\"/project\"}}\n"
+        let header = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"safe-id\",\"cwd\":\"/project\"}}\n"
         let ignored = "{\"type\":\"response_item\",\"payload\":{\"text\":\"PRIVATE\"}}\n"
         let tail = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
-        try f.write(Data((meta + String(repeating: ignored, count: 10000) + tail).utf8), to: ".codex/sessions/2026/11/07/large.jsonl")
-        #expect(inspect(f).sessionID == "safe")
-        #expect(inspect(f).currentTask == "Active turn in progress")
+        try f.write(Data((header + String(repeating: ignored, count: 10000) + tail).utf8), to: rollout)
+        let file = try evidence(at: f.home.appendingPathComponent(rollout))
+        let inspector = AgentTaskInspector(homeDirectory: f.home, liveFile: { _, _ in file })
+        let context = inspector.inspect(agentName: "Codex", process: process(), projectRoot: "/project", allProcesses: [])
+        #expect(context.sessionID == "safe-id")
+        #expect(context.currentTask == "Active turn in progress")
     }
 
     @Test func activeChildrenAndSanitization() throws {
         let f = try QuotaFixture(); defer { f.clean() }
-        #expect(inspect(f, rows: [process(), process("swift", pid: 401, parent: 400)]).currentTask == "Running: swift")
-        #expect(inspect(f, rows: [process(), process("swift", pid: 401, parent: 400, stopped: true)]).currentTask == nil)
-        #expect(inspect(f, rows: [process(), process("worker", pid: 401, parent: 400, cpu: 0.7)]).currentTask == "Running: worker")
+        let inspector = AgentTaskInspector(homeDirectory: f.home)
+        let row = process()
+        for (child, task) in [
+            (process("swift", pid: 401, parent: 400), "Running: swift"),
+            (process("swift", pid: 401, parent: 400, uid: Int(getuid()) + 1), nil),
+            (process("swift", pid: 401, parent: 400, stopped: true), nil),
+            (process("worker", pid: 401, parent: 400, cpu: 0.7), "Running: worker")
+        ] {
+            #expect(inspector.inspect(agentName: "Codex", process: row, projectRoot: "/project", allProcesses: [row, child]).currentTask == task)
+        }
         let context = AgentTaskContext(sessionID: "--unsafe", sessionTitle: "\n " + String(repeating: "x", count: 130), currentTask: "\0\n" + String(repeating: "t", count: 150))
         #expect(context.sessionID == nil)
         #expect(context.sessionTitle?.count == 100)
@@ -132,49 +126,40 @@ struct AgentTaskInspectorTests {
         #expect(AgentTaskContext(sessionID: "é").sessionID == nil)
     }
 
-    @Test func symlinkAndAmbiguousProjectFailClosed() throws {
+    @Test func exactWritableDescriptorRequiresOneOpenSessionFile() throws {
         let f = try QuotaFixture(); defer { f.clean() }
-        try f.write([["type": "session_meta", "payload": ["id": "safe", "cwd": "/project"]]], to: "elsewhere.jsonl")
-        let path = f.home.appendingPathComponent(".codex/sessions/2026/11/07")
-        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
-        try FileManager.default.createSymbolicLink(at: path.appendingPathComponent("unsafe.jsonl"), withDestinationURL: f.home.appendingPathComponent("elsewhere.jsonl"))
-        #expect(inspect(f).sessionID == nil)
-        try f.write([["type": "session_meta", "payload": ["id": "safe", "cwd": "/project"]]], to: ".codex/sessions/2026/11/07/safe.jsonl")
-        #expect(inspect(f, rows: [process(), process(pid: 402)]).sessionID == nil)
+        try f.write([meta(), state("task_started")], to: rollout)
+        let other = ".codex/sessions/2026/11/07/rollout-other.jsonl"
+        try f.write([meta(), state("task_started")], to: other)
+        let file = f.home.appendingPathComponent(rollout)
+        let base = f.home.appendingPathComponent(".codex/sessions")
+        let selfProcess = try #require(DarwinProcessReader().process(pid: getpid(), uid: Int(getuid())))
+        let reader = try FileHandle(forReadingFrom: file)
+        defer { try? reader.close() }
+        #expect(SessionFileEvidence.live(for: selfProcess, beneath: base) == nil)
+        let writer = try FileHandle(forWritingTo: file)
+        defer { try? writer.close() }
+        let expected = try evidence(at: file)
+        let actual = try #require(SessionFileEvidence.live(for: selfProcess, beneath: base))
+        #expect(actual.identity == expected.identity)
+        #expect(SessionFileEvidence.filesystemPath(actual.url) == SessionFileEvidence.filesystemPath(file))
+        let second = try FileHandle(forWritingTo: f.home.appendingPathComponent(other))
+        defer { try? second.close() }
+        #expect(SessionFileEvidence.live(for: selfProcess, beneath: base) == nil)
     }
 
-    @Test func geminiSessionIDDiscoveryAndPeerDisambiguation() throws {
+    @Test func replacedAndSymlinkRolloutsFailClosed() throws {
         let f = try QuotaFixture(); defer { f.clean() }
-        let projectPath = "/workspace/a/project"
-        let bucketHash = SHA256.hash(data: Data(projectPath.utf8)).map { String(format: "%02x", $0) }.joined()
-        let doc = try JSONSerialization.data(withJSONObject: [
-            "sessionId": "gem-session-42",
-            "messages": [["role": "model", "text": "Ready"]]
-        ])
-        try f.write(doc, to: ".gemini/tmp/\(bucketHash)/chats/session-gem-session-42.json")
-        let geminiProc = process("gemini", pid: 500, cwd: projectPath)
-        let inspector = AgentTaskInspector(homeDirectory: f.home)
-        let singleContext = inspector.inspect(
-            agentName: "Gemini CLI",
-            process: geminiProc,
-            projectRoot: projectPath,
-            allProcesses: [geminiProc]
-        )
-        #expect(singleContext.sessionID == "gem-session-42")
-        let sameBasenamePeer = process("gemini", pid: 501, cwd: "/workspace/b/project")
-        let matchedPeerContext = inspector.inspect(
-            agentName: "Gemini CLI",
-            process: geminiProc,
-            projectRoot: projectPath,
-            allProcesses: [geminiProc, sameBasenamePeer]
-        )
-        #expect(matchedPeerContext.sessionID == "gem-session-42")
-        let unmatchedPeerContext = inspector.inspect(
-            agentName: "Gemini CLI",
-            process: sameBasenamePeer,
-            projectRoot: "/workspace/b/project",
-            allProcesses: [geminiProc, sameBasenamePeer]
-        )
-        #expect(unmatchedPeerContext.sessionID == nil)
+        try f.write([meta(), state("task_started")], to: rollout)
+        let url = f.home.appendingPathComponent(rollout)
+        let file = try evidence(at: url)
+        let inspector = AgentTaskInspector(homeDirectory: f.home, liveFile: { _, _ in file })
+        let source = try Data(contentsOf: url)
+        try source.write(to: url, options: .atomic)
+        #expect(inspector.inspect(agentName: "Codex", process: process(), projectRoot: "/project", allProcesses: []).sessionID == nil)
+        let moved = url.deletingLastPathComponent().appendingPathComponent("other.jsonl")
+        try FileManager.default.moveItem(at: url, to: moved)
+        try FileManager.default.createSymbolicLink(at: url, withDestinationURL: moved)
+        #expect(inspector.inspect(agentName: "Codex", process: process(), projectRoot: "/project", allProcesses: []).sessionID == nil)
     }
 }

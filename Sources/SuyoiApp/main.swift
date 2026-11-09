@@ -2,6 +2,13 @@ import AppKit
 import Foundation
 import SuyoiCore
 
+#if DEBUG
+let fixtureArguments = Array(CommandLine.arguments.dropFirst())
+if Bundle.main.bundleIdentifier == DashboardFixture.bundleIdentifier || fixtureArguments.first == "--dashboard-fixture" {
+    MainActor.assumeIsolated { DashboardFixture.run(arguments: fixtureArguments) }
+}
+#endif
+
 // Parse before creating NSApplication; CLI inspection never probes sockets.
 let options: CLIOptions
 do {

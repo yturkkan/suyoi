@@ -8,11 +8,18 @@ enum ThemeStyling {
             return Color.accentColor
         }
         let tokens = ExperienceThemeCatalog.tokens(for: theme)
-        return Color(
+        return adaptiveAccent(
             red: tokens.accentRed,
             green: tokens.accentGreen,
             blue: tokens.accentBlue
         )
+    }
+
+    static func adaptiveAccent(red: Double, green: Double, blue: Double) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let strength = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? 1.0 : 0.5
+            return NSColor(srgbRed: red * strength, green: green * strength, blue: blue * strength, alpha: 1)
+        })
     }
 
     static func cardCornerRadius(for theme: SuyoiExperienceTheme) -> CGFloat {
@@ -44,11 +51,11 @@ struct PixelMascotBadgeView: View {
         case .waitingForApproval:
             return "Needs Input"
         case .idle:
-            return "Idle"
+            return "Quiet"
         case .completed:
             return "Done"
         case .sleeping:
-            return "Sleeping"
+            return "Stopped"
         }
     }
 
@@ -56,13 +63,13 @@ struct PixelMascotBadgeView: View {
         if theme == .pixelOlive {
             switch state {
             case .working, .completed:
-                return Color(red: 0.61, green: 0.73, blue: 0.06)
+                return ThemeStyling.accentColor(for: theme)
             case .waitingForApproval:
-                return Color(red: 0.78, green: 0.82, blue: 0.12)
+                return ThemeStyling.adaptiveAccent(red: 0.78, green: 0.82, blue: 0.12)
             case .idle:
-                return Color(red: 0.48, green: 0.60, blue: 0.10)
+                return ThemeStyling.adaptiveAccent(red: 0.48, green: 0.60, blue: 0.10)
             case .sleeping:
-                return Color(red: 0.40, green: 0.50, blue: 0.14)
+                return ThemeStyling.adaptiveAccent(red: 0.40, green: 0.50, blue: 0.14)
             }
         }
         switch state {

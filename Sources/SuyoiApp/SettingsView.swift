@@ -353,7 +353,7 @@ struct SettingsView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Live OAuth Quota Polling")
                                 .font(.system(size: 11.5, weight: .medium))
-                            Text("Queries remaining 5h & 7d limit windows in-memory from local CLI sessions.")
+                            Text("Enabled by default. Queries remaining 5h & 7d limit windows in-memory for Codex, Claude, and Gemini using existing CLI OAuth tokens.")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -613,7 +613,7 @@ struct SettingsView: View {
                 aboutFeatureRow(
                     symbol: "chart.bar.fill",
                     title: "Hybrid 5-Hour & 7-Day Quota Tracking",
-                    detail: "Combines offline local rolling token counters with opt-in in-memory OAuth quota windows and reset countdowns across your AI subscriptions."
+                    detail: "Combines in-memory OAuth quota windows (enabled by default for Codex, Claude, and Gemini) with offline local rolling token counters and reset countdowns."
                 )
                 Divider()
                 aboutFeatureRow(

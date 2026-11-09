@@ -83,12 +83,14 @@ public struct CleanupScanner: CleanupScanning {
             let valid = reader.canonicalPath(item.0, relativeTo: canonicalRoot) != nil
             let preIdentity = identityReader(item.0)
             let measurement: FileMetadataReader.Measurement
-            if valid, entryLimit >= 100_000, let cached = measurementCache?.cachedBytes(for: item.0) {
-                measurement = FileMetadataReader.Measurement(bytes: cached, allocatedBytes: cached, allocatedAvailable: true, entries: 1, partial: false)
+            if valid, entryLimit >= 100_000, let cached = measurementCache?.cachedMeasurement(for: item.0) {
+                measurement = FileMetadataReader.Measurement(bytes: cached.bytes,
+                    allocatedBytes: cached.allocatedBytes ?? 0, allocatedAvailable: cached.allocatedBytes != nil, entries: 1)
             } else if valid {
                 let measured = reader.measure(item.0, entryLimit: highBudget ? remaining : remaining / count, deadline: highBudget ? projectDeadline : sliceDeadline)
                 if !measured.partial {
-                    measurementCache?.record(bytes: measured.bytes, for: item.0)
+                    measurementCache?.record(bytes: measured.bytes,
+                        allocatedBytes: measured.allocatedAvailable ? measured.allocatedBytes : nil, for: item.0)
                 }
                 measurement = measured
             } else {

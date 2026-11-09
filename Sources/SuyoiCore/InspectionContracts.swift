@@ -43,6 +43,13 @@ public extension ActionExecuting {
 /// at execution time; pass prompt as data via argv, never interpolated script code.
 public protocol AgentSteering: Sendable {
     func steer(agent: AgentObservation, prompt: String, uid: Int) -> AgentSteerOutcome
+    func steer(agent: AgentObservation, target: NativeSessionTarget, prompt: String, uid: Int) -> AgentSteerOutcome
+}
+
+public extension AgentSteering {
+    func steer(agent: AgentObservation, target: NativeSessionTarget, prompt: String, uid: Int) -> AgentSteerOutcome {
+        AgentSteerOutcome(agentID: agent.id, mode: target.mode, succeeded: false, error: "Native continuation is unavailable")
+    }
 }
 
 /// Offline only. Bound file/line sizes, traversal and elapsed work; skip text fields.

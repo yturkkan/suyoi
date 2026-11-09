@@ -66,6 +66,9 @@ final class DashboardModel: ObservableObject {
     @Published var selectedServer: ServerGroup?
     @Published var steeringAgentID: Int?
     @Published var steerPromptText: String = ""
+    @Published private(set) var steerSessionTargets: [NativeSessionTarget] = []
+    @Published var selectedSteerSessionID: String?
+    @Published private(set) var isLoadingSteerSessions = false
     @Published var isSteering = false
     @Published var isShowingCleanupPreview = false
     @Published var isShowingSettings = false
@@ -91,6 +94,7 @@ final class DashboardModel: ObservableObject {
     @Published var availableSoundPacks: [OpenPeonSoundPack] = []
     @Published var selectedSoundPackID: String?
     @Published var pendingApprovals: [PendingApprovalRequest] = []
+    @Published private(set) var autoApprovedSessions: [PendingApprovalRequest] = []
     @Published var agentTurnPreviews: [Int: SessionTurnPreview] = [:]
     @Published var searchQuery: String = ""
     @Published var statusBarStyle: StatusBarDisplayStyle
@@ -110,12 +114,14 @@ final class DashboardModel: ObservableObject {
     private static let selectedSoundPackIDKey = "suyoi.selectedSoundPackID"
     private static let statusBarStyleKey = "suyoi.statusBarStyle"
 
-    let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
-    private let inspector = SystemInspector()
+    let homeDirectory: URL
+    private let inspector: SystemInspector?
     private let actionExecutor: any ActionExecuting
     private let quotaInspector: any QuotaInspecting
     private let liveQuotaPoller: any LiveQuotaPolling
     private let agentSteerer: any AgentSteering
+    private var steerSessionGeneration = UUID()
+    private var steerContext: ProcessIdentity?
     private let appUpdater: any AppUpdating
     private let trashRecoveryStore = TrashRecoveryStore()
     private let worktreeCleanupExecutor = WorktreeCleanupExecutor()
@@ -136,19 +142,17 @@ final class DashboardModel: ObservableObject {
         actionExecutor: any ActionExecuting = ActionExecutor(),
         quotaInspector: any QuotaInspecting = LocalQuotaInspector(),
         liveQuotaPoller: any LiveQuotaPolling = LiveQuotaPoller(),
-        agentSteerer: any AgentSteering = AgentSteerer(
-            verifySessionOwnership: { identity, _, sessionID in
-                identity.isActionEligible && AgentSteerer.isValidSessionID(sessionID)
-            }
-        ),
+        agentSteerer: any AgentSteering = AgentSteerer(),
         appUpdater: any AppUpdating = AppUpdater()
     ) {
+        self.inspector = SystemInspector()
         self.actionExecutor = actionExecutor
         self.quotaInspector = quotaInspector
         self.liveQuotaPoller = liveQuotaPoller
         self.agentSteerer = agentSteerer
         self.appUpdater = appUpdater
         let home = FileManager.default.homeDirectoryForCurrentUser
+        self.homeDirectory = home
         let resolvedRoot: URL
         if let savedRoot = UserDefaults.standard.string(forKey: Self.cleanupRootPathKey),
            savedRoot.hasPrefix("/"),
@@ -233,6 +237,45 @@ final class DashboardModel: ObservableObject {
         self.approvalInboxWatcher = watcher
         watcher.start()
     }
+
+#if DEBUG
+    init(fixture: DashboardFixture.Sample, tab: DashboardTab, theme: SuyoiExperienceTheme) {
+        let services = DashboardFixtureServices()
+        homeDirectory = fixture.root
+        inspector = nil
+        actionExecutor = services
+        quotaInspector = services
+        liveQuotaPoller = services
+        agentSteerer = services
+        appUpdater = services
+        cleanupRoot = fixture.root
+        isLiveQuotaEnabled = true
+        scanAllWorkspaces = false
+        providerOrder = QuotaProvider.allCases
+        hiddenProviders = []
+        areNotificationsEnabled = false
+        isLaunchAtLoginEnabled = false
+        surfaceMode = .menuBarPopover
+        experienceTheme = theme
+        soundMode = .muted
+        statusBarStyle = .agentsAndServers
+
+        self.tab = tab
+        snapshot = fixture.inventory
+        quotaSnapshot = fixture.quotas
+        liveQuotas = fixture.liveQuotas
+        cleanup = fixture.cleanup
+        cleanupScannedAt = fixture.inventory.capturedAt
+        scannedWorkspaceRoots = [fixture.root]
+        staleSessionLogs = fixture.staleSessionLogs
+        selectedAgent = fixture.inventory.agentObservations.first
+        steerContext = selectedAgent?.process.identity
+        steerSessionTargets = fixture.sessionTargets
+        steerPromptText = fixture.instruction
+        pendingApprovals = fixture.approvals
+        agentTurnPreviews = fixture.turnPreviews
+    }
+#endif
 
     var agentRows: [AgentObservation] {
         guard let snapshot else { return [] }
@@ -527,9 +570,8 @@ final class DashboardModel: ObservableObject {
     }
 
     func refresh() {
-        guard !isRefreshing else { return }
+        guard !isRefreshing, let currentInspector = inspector else { return }
         isRefreshing = true
-        let currentInspector = inspector
         let currentQuotaInspector = quotaInspector
         let previewInspector = turnPreviewInspector
         Task {
@@ -958,9 +1000,7 @@ final class DashboardModel: ObservableObject {
     }
 
     func mascotState(for obs: AgentObservation) -> MascotAnimationState {
-        let hasPending = pendingApprovals.contains { req in
-            req.pid == obs.process.pid || (obs.sessionID != nil && req.sessionID == obs.sessionID)
-        }
+        let hasPending = pendingApprovals.contains { approvalController.matchesAgent($0, agent: obs) }
         return ExperienceThemeCatalog.mascotState(for: obs, hasPendingApproval: hasPending)
     }
 
@@ -968,15 +1008,30 @@ final class DashboardModel: ObservableObject {
         agentTurnPreviews[obs.id]
     }
 
-    func isSessionAutoApproved(_ sessionID: String?) -> Bool {
-        guard let sessionID else { return false }
-        return approvalController.isSessionAutoApproved(sessionID)
+    func isSessionAutoApproved(for obs: AgentObservation) -> Bool {
+        let matches = autoApprovedSessions.filter { request in
+            approvalController.matchesAgent(request, agent: obs, verifiedSessionID: turnPreview(for: obs)?.sessionID)
+        }
+        return matches.count == 1
+    }
+
+    func canAutoApprove(_ request: PendingApprovalRequest) -> Bool {
+        approvalController.canAutoApprove(request: request)
+    }
+
+    func revokeAutoApproval(_ request: PendingApprovalRequest) {
+        approvalController.setSessionAutoApprove(false, for: request)
+        autoApprovedSessions = approvalController.activeAutoApproveRequests()
     }
 
     func submitApprovalDecision(_ decision: ApprovalDecision, for request: PendingApprovalRequest) {
         let resolved = approvalController.submitDecision(decision, forRequestID: request.id)
         pendingApprovals = approvalController.pendingRequests()
-        guard resolved else { return }
+        autoApprovedSessions = approvalController.activeAutoApproveRequests()
+        guard resolved else {
+            showBanner("Approval request is no longer available", isError: true)
+            return
+        }
         switch decision {
         case .allowOnce:
             showBanner("Approved \(request.toolName) for \(request.agentName)")
@@ -990,12 +1045,10 @@ final class DashboardModel: ObservableObject {
     }
 
     func copyHookSnippet(for agentName: String = "Claude Code") {
-        let spoolInbox = homeDirectory
-            .appendingPathComponent("Library/Application Support/Suyoi/approvals/inbox")
-            .path
-        let bridgePath = Bundle.main.executableURL?.path ?? "/Applications/Suyoi.app/Contents/MacOS/SuyoiApp"
+        let bridgePath = Bundle.main.executableURL?.path ?? "/Applications/Suyoi.app/Contents/MacOS/Suyoi"
         let snippet = AgentApprovalController.hookSnippet(for: agentName, bridgeExecutablePath: bridgePath) + " --hook-bridge"
-            + "\n# Or drop hook JSON payloads into: \(spoolInbox)"
+            + "\n# Use as a synchronous Claude Code command hook for SessionStart, SessionEnd, and one approval event."
+            + "\n# Choose PreToolUse to review tool calls or PermissionRequest to review native permission prompts."
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(snippet, forType: .string)
         showBanner("Copied \(agentName) hook integration snippet")
@@ -1008,6 +1061,7 @@ final class DashboardModel: ObservableObject {
         )
         let addedCount = client.drainInbox(into: approvalController)
         pendingApprovals = approvalController.pendingRequests()
+        autoApprovedSessions = approvalController.activeAutoApproveRequests()
         if addedCount > 0 {
             soundPlayer.play(.attentionRequired, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
         }
@@ -1053,23 +1107,7 @@ final class DashboardModel: ObservableObject {
             showBanner(outcome.summary)
             return
         }
-        if let hostName = obs.terminalApp?.lowercased() {
-            let running = NSWorkspace.shared.runningApplications
-            if let match = running.first(where: { app in
-                let name = (app.localizedName ?? "").lowercased()
-                let bundle = (app.bundleIdentifier ?? "").lowercased()
-                return name == hostName || name.contains(hostName) || bundle.contains(hostName)
-            }), match.activate(options: [.activateAllWindows]) {
-                showBanner("Focused \(match.localizedName ?? obs.terminalApp ?? "window")")
-                return
-            }
-        }
-        if let path = obs.project?.rootPath ?? obs.process.cwd {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-            showBanner("Revealed \(URL(fileURLWithPath: path).lastPathComponent) in Finder")
-        } else {
-            showBanner(outcome.error ?? "Could not locate a host window to focus", isError: true)
-        }
+        showBanner(outcome.error ?? "Could not locate a verified session target", isError: true)
     }
 
     func serverHealthBadge(for group: ServerGroup) -> ServerHealthBadge? {
@@ -1115,7 +1153,7 @@ final class DashboardModel: ObservableObject {
     }
 
     func steerMode(for obs: AgentObservation) -> AgentSteerMode? {
-        AgentSteerer.preferredMode(for: obs, allowNativeSessions: true)
+        AgentSteerer.preferredMode(for: obs) ?? AgentSteerer.nativeMode(for: obs)
     }
 
     func steerModeLabel(for obs: AgentObservation) -> String? {
@@ -1124,36 +1162,92 @@ final class DashboardModel: ObservableObject {
         case .terminalTTY:
             return "Terminal (\(obs.process.tty ?? "TTY"))"
         case .openCodeSession:
-            return "OpenCode Session"
+            return "Continue an OpenCode session"
         case .codexResume:
-            return "Codex Session"
+            return "Continue a Codex session"
         }
     }
 
     func toggleSteerComposer(for obs: AgentObservation) {
-        if steeringAgentID == obs.id {
-            steeringAgentID = nil
-            steerPromptText = ""
+        if steeringAgentID == obs.id && steerContext == obs.process.identity {
+            resetSteerComposer()
         } else {
+            resetSteerComposer()
             steeringAgentID = obs.id
-            steerPromptText = ""
+            prepareSteerSessions(for: obs)
         }
     }
 
+    func prepareSteerSessions(for obs: AgentObservation) {
+        guard steerContext != obs.process.identity else { return }
+        steerContext = obs.process.identity
+        steerSessionTargets = []
+        selectedSteerSessionID = nil
+        steerPromptText = ""
+        reloadSteerSessions(for: obs)
+    }
+
+    func reloadSteerSessions(for obs: AgentObservation) {
+        steerContext = obs.process.identity
+        selectedSteerSessionID = nil
+        let generation = UUID()
+        steerSessionGeneration = generation
+        guard let mode = steerMode(for: obs), mode != .terminalTTY else {
+            steerSessionTargets = []
+            isLoadingSteerSessions = false
+            return
+        }
+        let homeDirectory = homeDirectory
+        isLoadingSteerSessions = true
+        Task {
+            let targets = await Task.detached(priority: .userInitiated) {
+                AgentTaskInspector(homeDirectory: homeDirectory).nativeSessionTargets(for: obs)
+            }.value
+            guard steerSessionGeneration == generation else { return }
+            steerSessionTargets = targets
+            isLoadingSteerSessions = false
+        }
+    }
+
+    func resetSteerComposer() {
+        steerSessionGeneration = UUID()
+        steerContext = nil
+        steeringAgentID = nil
+        steerPromptText = ""
+        steerSessionTargets = []
+        selectedSteerSessionID = nil
+        isLoadingSteerSessions = false
+    }
+
+    func canSendSteerPrompt(to obs: AgentObservation) -> Bool {
+        guard !isSteering, let mode = steerMode(for: obs),
+              !steerPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return mode == .terminalTTY || (steerContext == obs.process.identity &&
+            steerSessionTargets.contains { $0.sessionID == selectedSteerSessionID })
+    }
+
     func sendSteerPrompt(to obs: AgentObservation) {
+        guard canSendSteerPrompt(to: obs), let mode = steerMode(for: obs) else { return }
         let trimmed = steerPromptText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isSteering else { return }
+        let target = steerSessionTargets.first { $0.sessionID == selectedSteerSessionID }
         isSteering = true
         let steerer = agentSteerer
         let uid = Int(getuid())
+        let generation = steerSessionGeneration
         Task {
             let outcome = await Task.detached(priority: .userInitiated) {
-                steerer.steer(agent: obs, prompt: trimmed, uid: uid)
+                if mode != .terminalTTY, let target {
+                    return steerer.steer(agent: obs, target: target, prompt: trimmed, uid: uid)
+                }
+                return steerer.steer(agent: obs, prompt: trimmed, uid: uid)
             }.value
             isSteering = false
             if outcome.succeeded {
-                steerPromptText = ""
-                steeringAgentID = nil
+                if steerSessionGeneration == generation {
+                    steerPromptText = ""
+                    selectedSteerSessionID = nil
+                    steeringAgentID = nil
+                }
                 showBanner(outcome.detail ?? "Sent instruction to \(obs.agentName)")
                 try? await Task.sleep(nanoseconds: 350_000_000)
                 refresh()
@@ -1281,15 +1375,15 @@ final class DashboardModel: ObservableObject {
         let home = homeDirectory
         let retentionDays = sessionLogRetentionDays
         let currentAgents = agentRows
-        let currentInspector = inspector
         Task {
             let report = await Task.detached(priority: .userInitiated) {
                 let scanner = SessionLogRetentionScanner(homeDirectory: home)
+                let processInspector = NativeProcessInspector()
                 return scanner.trashStaleLogs(
                     logsToTrash,
                     olderThanDays: retentionDays,
                     activeAgents: currentAgents,
-                    liveAgents: { currentInspector.snapshot().agentObservations }
+                    liveProcesses: { processInspector.inspectProcesses(uid: Int(getuid())) }
                 )
             }.value
             isPerformingAction = false
@@ -1299,7 +1393,8 @@ final class DashboardModel: ObservableObject {
                         originalPath: outcome.path,
                         trashedURL: URL(fileURLWithPath: trashedPath),
                         category: "Stale Session Log (>\(retentionDays)d)",
-                        bytes: outcome.bytes
+                        bytes: outcome.bytes,
+                        recovery: outcome.recovery
                     )
                 }
             }
@@ -1352,7 +1447,8 @@ final class DashboardModel: ObservableObject {
                         originalPath: outcome.path,
                         trashedURL: URL(fileURLWithPath: trashedPath),
                         category: category,
-                        bytes: outcome.bytes
+                        bytes: outcome.bytes,
+                        recovery: outcome.recovery
                     )
                 }
             }
@@ -1385,7 +1481,8 @@ final class DashboardModel: ObservableObject {
                         originalPath: outcome.path,
                         trashedURL: trashedURL,
                         category: "Git Worktree (\(branchLabel))",
-                        bytes: 0
+                        bytes: 0,
+                        recovery: outcome.recovery
                     )
                     trashedHistory = trashRecoveryStore.records()
                 }
@@ -1395,6 +1492,10 @@ final class DashboardModel: ObservableObject {
                 showBanner(outcome.error ?? "Could not move worktree to Trash", isError: true)
             }
         }
+    }
+
+    func canRestoreTrashedItem(_ item: TrashedItemRecord) -> Bool {
+        item.fileIdentity != nil
     }
 
     func restoreTrashedItem(_ item: TrashedItemRecord) {
@@ -1423,7 +1524,7 @@ final class DashboardModel: ObservableObject {
     }
 
     var currentAppVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.3"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.6"
     }
 
     func checkForUpdates() {

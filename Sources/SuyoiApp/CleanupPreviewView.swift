@@ -4,20 +4,27 @@ import SuyoiCore
 
 struct CleanupPreviewView: View {
     let report: CleanupReport
+    var theme: SuyoiExperienceTheme = .nativeGlass
     let recheckingCandidateIDs: Set<String>
     let trashedHistory: [TrashedItemRecord]
+    let canRestoreItem: ((TrashedItemRecord) -> Bool)?
     let onTrashCandidate: ((CleanupCandidate) -> Void)?
     let onRecheckCandidate: ((CleanupCandidate) -> Void)?
     let onTrashWorktree: ((WorktreeRecord) -> Void)?
     let onRestoreTrashedItem: ((TrashedItemRecord) -> Void)?
     let onTrashAllEligible: (() -> Void)?
     let onDismiss: () -> Void
-    private let leafGreen = Color(red: 0.22, green: 0.53, blue: 0.39)
+
+    private var accent: Color {
+        ThemeStyling.accentColor(for: theme)
+    }
 
     init(
         report: CleanupReport,
+        theme: SuyoiExperienceTheme = .nativeGlass,
         recheckingCandidateIDs: Set<String> = [],
         trashedHistory: [TrashedItemRecord] = [],
+        canRestoreItem: ((TrashedItemRecord) -> Bool)? = nil,
         onTrashCandidate: ((CleanupCandidate) -> Void)? = nil,
         onRecheckCandidate: ((CleanupCandidate) -> Void)? = nil,
         onTrashWorktree: ((WorktreeRecord) -> Void)? = nil,
@@ -26,8 +33,10 @@ struct CleanupPreviewView: View {
         onDismiss: @escaping () -> Void
     ) {
         self.report = report
+        self.theme = theme
         self.recheckingCandidateIDs = recheckingCandidateIDs
         self.trashedHistory = trashedHistory
+        self.canRestoreItem = canRestoreItem
         self.onTrashCandidate = onTrashCandidate
         self.onRecheckCandidate = onRecheckCandidate
         self.onTrashWorktree = onTrashWorktree
@@ -68,8 +77,8 @@ struct CleanupPreviewView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Label("Cleanup Safety Preview", systemImage: "shield.lefthalf.filled")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(leafGreen)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(accent)
                 Spacer()
                 if !eligibleCandidates.isEmpty, let onTrashAllEligible {
                     Button {
@@ -77,9 +86,11 @@ struct CleanupPreviewView: View {
                         onDismiss()
                     } label: {
                         Label("Move \(eligibleCandidates.count) to Trash (\(bytes(totalEligibleLogicalBytes)))", systemImage: "trash")
+                            .font(.system(size: 11.5, weight: .semibold))
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .tint(accent)
                 }
                 Button("Done") { onDismiss() }
                     .buttonStyle(.bordered)
@@ -133,33 +144,33 @@ struct CleanupPreviewView: View {
 
             HStack(spacing: 6) {
                 Image(systemName: "trash.circle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(leafGreen)
+                    .font(.system(size: 12))
+                    .foregroundStyle(accent)
                 Text("Items are moved to macOS Trash after re-verifying inode/device identity and non-symlink path.")
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer()
             }
         }
         .padding(16)
-        .frame(width: 440, height: 470)
+        .frame(width: 560, height: 500)
     }
 
     private func metricPill(_ title: String, value: String, detail: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
-            Text(value).font(.system(size: 13.5, weight: .semibold, design: .rounded)).monospacedDigit()
-            Text(detail).font(.system(size: 9)).foregroundStyle(.secondary)
+            Text(title).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 14, weight: .bold, design: .rounded)).monospacedDigit()
+            Text(detail).font(.system(size: 10.5)).foregroundStyle(.secondary)
         }
-        .padding(8)
+        .padding(9)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .themedSurfaceCard(theme: theme, isHovered: false)
     }
 
     private func sectionHeader(_ text: String) -> some View {
         Text(text.uppercased())
-            .font(.system(size: 9, weight: .semibold))
-            .tracking(0.6)
+            .font(.system(size: 10, weight: .bold))
+            .tracking(0.5)
             .foregroundStyle(.secondary)
     }
 
@@ -167,28 +178,29 @@ struct CleanupPreviewView: View {
         let assessment = report.assessments[candidate.id]
         let diagnostic = assessment.map { SafetyDiagnostics.explain(assessment: $0, candidate: candidate) }
         let isRechecking = recheckingCandidateIDs.contains(candidate.id)
-        return VStack(alignment: .leading, spacing: 4) {
+        return VStack(alignment: .leading, spacing: 5) {
             HStack {
                 Text(candidate.agentName.map { "\($0) · \(candidate.category)" } ?? candidate.category)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 12.5, weight: .semibold))
                 Spacer()
                 Text("\(candidate.partial ? "≥ " : "")\(bytes(candidate.bytes))")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .font(.system(size: 12.5, weight: .bold, design: .rounded))
                     .monospacedDigit()
             }
             HStack(spacing: 8) {
                 Text(displayPath(candidate.path))
-                    .font(.system(size: 9.5, design: .monospaced))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help(candidate.path)
                 Spacer()
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: candidate.path)])
                 } label: {
                     Image(systemName: "folder")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(leafGreen)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(accent)
                 }
                 .buttonStyle(.plain)
                 .help("Reveal in Finder")
@@ -197,17 +209,17 @@ struct CleanupPreviewView: View {
                     Button {
                         onRecheckCandidate(candidate)
                     } label: {
-                        HStack(spacing: 3) {
+                        HStack(spacing: 4) {
                             if isRechecking {
                                 ProgressView().controlSize(.mini)
                             } else {
                                 Image(systemName: "arrow.clockwise")
-                                    .font(.system(size: 9.5, weight: .semibold))
+                                    .font(.system(size: 10.5, weight: .semibold))
                             }
                             Text("Recheck")
-                                .font(.system(size: 9.5, weight: .medium))
+                                .font(.system(size: 11, weight: .semibold))
                         }
-                        .foregroundStyle(leafGreen)
+                        .foregroundStyle(accent)
                     }
                     .buttonStyle(.plain)
                     .disabled(isRechecking)
@@ -218,9 +230,13 @@ struct CleanupPreviewView: View {
                     Button {
                         onTrashCandidate(candidate)
                     } label: {
-                        Image(systemName: "trash")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.red)
+                        HStack(spacing: 3) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 10.5))
+                            Text("Trash")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundStyle(.red)
                     }
                     .buttonStyle(.plain)
                     .help("Move to Trash")
@@ -228,52 +244,70 @@ struct CleanupPreviewView: View {
             }
 
             if blocked, let diagnostic {
-                Text("\(diagnostic.headline) (\(diagnostic.checkName)) — \(diagnostic.remediationHint)")
-                    .font(.system(size: 9))
+                Text(diagnostic.headline)
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(diagnostic.remediationHint)
             } else if let reasons = assessment?.blockedReasons, !reasons.isEmpty {
                 Text(reasons.joined(separator: " · "))
-                    .font(.system(size: 9))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             } else if let assessment {
                 Text(regenerabilityText(assessment.regenerability))
-                    .font(.system(size: 9))
-                    .foregroundStyle(leafGreen)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(accent)
             }
         }
-        .padding(9)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(10)
+        .themedSurfaceCard(theme: theme, isHovered: false)
     }
 
     private func worktreeCard(_ wt: WorktreeRecord) -> some View {
         let isEligible = !wt.isMain && wt.blockedReasons.isEmpty && wt.isMergedToDefault == true && !wt.isDirty && !wt.isLocked && wt.usage == .clear
-        return VStack(alignment: .leading, spacing: 4) {
+        let branchTitle = wt.branch?.replacingOccurrences(of: "refs/heads/", with: "") ?? wt.headCommit ?? "Detached worktree"
+        return VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text(wt.branch?.replacingOccurrences(of: "refs/heads/", with: "") ?? wt.headCommit ?? "Detached worktree")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                HStack(spacing: 6) {
+                    Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(isEligible ? accent : .secondary)
+                    Text(branchTitle)
+                        .font(.system(size: 12.5, weight: .semibold, design: .monospaced))
+                    if wt.isMain {
+                        Text("Primary")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(Color.primary.opacity(0.07), in: Capsule())
+                    }
+                }
                 Spacer()
                 Text(isEligible ? "Clean & merged" : "Protected")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(isEligible ? leafGreen : .secondary)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(isEligible ? accent : .secondary)
             }
+
             HStack(spacing: 8) {
                 Text(displayPath(wt.path))
-                    .font(.system(size: 9.5, design: .monospaced))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .help(wt.path)
                 Spacer()
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: wt.path)])
                 } label: {
-                    Image(systemName: "folder")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(leafGreen)
+                    Label("Finder", systemImage: "folder")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(accent)
                 }
                 .buttonStyle(.plain)
-                .help("Reveal worktree in Finder")
+                .help("Reveal \(wt.path) in Finder")
 
                 if isEligible, let onTrashWorktree {
                     Button {
@@ -281,9 +315,9 @@ struct CleanupPreviewView: View {
                     } label: {
                         HStack(spacing: 3) {
                             Image(systemName: "trash")
-                                .font(.system(size: 10))
+                                .font(.system(size: 10.5))
                             Text("Trash")
-                                .font(.system(size: 9.5, weight: .medium))
+                                .font(.system(size: 11, weight: .semibold))
                         }
                         .foregroundStyle(.red)
                     }
@@ -291,26 +325,29 @@ struct CleanupPreviewView: View {
                     .help("Move clean, merged secondary worktree to macOS Trash")
                 }
             }
+
             if !wt.blockedReasons.isEmpty {
                 Text(wt.blockedReasons.joined(separator: " · "))
-                    .font(.system(size: 9))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(wt.blockedReasons.joined(separator: "\n"))
             }
         }
-        .padding(9)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(10)
+        .themedSurfaceCard(theme: theme, isHovered: false)
     }
 
     private func trashedItemCard(_ item: TrashedItemRecord) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let restorable = canRestoreItem?(item) ?? (item.fileIdentity != nil)
+        return VStack(alignment: .leading, spacing: 5) {
             HStack {
                 Text(item.category)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 12.5, weight: .semibold))
                 Spacer()
                 if item.bytes > 0 {
                     Text(bytes(item.bytes))
-                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                        .font(.system(size: 11.5, weight: .medium, design: .rounded))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
@@ -318,26 +355,37 @@ struct CleanupPreviewView: View {
                     Button {
                         onRestoreTrashedItem(item)
                     } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "arrow.uturn.backward.circle.fill")
-                                .font(.system(size: 10.5))
-                            Text("Put Back")
-                                .font(.system(size: 9.5, weight: .semibold))
+                        HStack(spacing: 4) {
+                            Image(systemName: restorable ? "arrow.uturn.backward.circle.fill" : "exclamationmark.circle")
+                                .font(.system(size: 11))
+                            Text(restorable ? "Put Back" : "Unavailable")
+                                .font(.system(size: 11, weight: .semibold))
                         }
-                        .foregroundStyle(leafGreen)
+                        .foregroundStyle(restorable ? accent : .secondary)
                     }
                     .buttonStyle(.plain)
-                    .help("Restore \(displayPath(item.originalPath)) from macOS Trash")
+                    .disabled(!restorable)
+                    .help(
+                        restorable
+                            ? "Restore \(displayPath(item.originalPath)) from macOS Trash"
+                            : "Put Back unavailable: original and trashed item identity evidence was not captured"
+                    )
                 }
             }
             Text(displayPath(item.originalPath))
-                .font(.system(size: 9.5, design: .monospaced))
+                .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .help(item.originalPath)
+            if !restorable {
+                Text("Put Back requires verified file identity evidence captured when moved to Trash.")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
         }
-        .padding(9)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(10)
+        .themedSurfaceCard(theme: theme, isHovered: false)
     }
 
     private func regenerabilityText(_ reg: Regenerability) -> String {

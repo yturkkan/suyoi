@@ -7,13 +7,16 @@ public struct WorktreeTrashOutcome: Equatable, Sendable {
     public let trashed: Bool
     public let trashedURL: URL?
     public let error: String?
+    public let recovery: TrashRecoveryEvidence?
 
-    public init(path: String, branch: String?, trashed: Bool, trashedURL: URL?, error: String?) {
+    public init(path: String, branch: String?, trashed: Bool, trashedURL: URL?, error: String?,
+                recovery: TrashRecoveryEvidence? = nil) {
         self.path = path
         self.branch = branch
         self.trashed = trashed
         self.trashedURL = trashedURL
         self.error = error
+        self.recovery = recovery
     }
 }
 
@@ -66,8 +69,8 @@ public struct WorktreeCleanupExecutor: Sendable {
               liveProcesses.value.allSatisfy({ $0.cwd?.hasPrefix("/") == true }) else {
             return failure("Live process usage could not be fully verified")
         }
-        let inspection = WorktreeInspector(runner: runner, openFileCheck: openFileCheck)
-            .inspect(root: parentRoot, processes: liveProcesses)
+        let inspector = WorktreeInspector(runner: runner, openFileCheck: openFileCheck)
+        let inspection = inspector.inspect(root: parentRoot, processes: liveProcesses)
         guard inspection.status == .complete, inspection.warnings.isEmpty else {
             return failure("Live worktree inspection is unavailable or incomplete")
         }
@@ -91,16 +94,30 @@ public struct WorktreeCleanupExecutor: Sendable {
         }
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL
         let policyRoot = url.path.hasPrefix(home.path + "/") ? home : URL(fileURLWithPath: "/")
-        if let blocker = reader.trashDescendantBlocker(at: url, expectedIdentity: identity, homeDirectory: policyRoot) {
+        if let blocker = inspector.freshTrashBlocker(live, inspectContents: { paths in
+            var entries = 0
+            if let blocker = reader.trashDescendantBlocker(at: url, expectedIdentity: identity, homeDirectory: policyRoot,
+                permitsWorktreeEntry: { path, mode in
+                    guard paths.permits(path, mode: mode) else { return false }
+                    entries += 1
+                    return true
+                }) {
+                return blocker
+            }
+            return entries == paths.files.count + paths.directories.count
+                ? nil : "Worktree contents changed during verification"
+        }) {
             return failure(blocker)
         }
-        guard Self.isCanonicalDirectory(url), reader.identity(at: url) == identity else {
+        guard Self.isCanonicalDirectory(url),
+              let recovery = TrashRecoveryEvidence.prepare(original: url, expectedIdentity: identity) else {
             return failure("Worktree file identity changed during verification")
         }
         do {
             let resulting = try trashHandler(url)
             return WorktreeTrashOutcome(path: worktree.path, branch: worktree.branch,
-                                        trashed: true, trashedURL: resulting, error: nil)
+                                        trashed: true, trashedURL: resulting, error: nil,
+                                        recovery: recovery.completed(at: resulting))
         } catch {
             return failure("Could not move worktree to Trash")
         }

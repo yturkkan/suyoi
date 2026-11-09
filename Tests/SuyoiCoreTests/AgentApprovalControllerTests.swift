@@ -13,9 +13,20 @@ private final class ApprovalResponses: @unchecked Sendable {
     }
 }
 
+private final class ApprovalLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = true
+    var active: Bool { lock.withLock { storage } }
+    func revoke() { lock.withLock { storage = false } }
+}
+
 @Suite("Hook approvals and questions")
 struct AgentApprovalControllerTests {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
+    private let scope = ApprovalScope(
+        process: ProcessIdentity(pid: 321, uid: 501, startTimeMicroseconds: 123, executablePath: "/bin/claude"),
+        sessionID: "session-1", projectPath: "/workspace/sample", generation: UUID())
+
 
     private func event(_ kind: HookEventKind = .permissionRequest, session: String = "session-1",
                        tool: String = "Bash", input: [String: Any] = ["command": "swift build"],
@@ -78,38 +89,43 @@ struct AgentApprovalControllerTests {
         #expect(controller.submitDecision(.allowOnce, forRequestID: first.id))
         #expect(responses.values == [["decision": "approve"]])
         #expect(controller.pendingRequests() == [second])
-        #expect(!controller.isSessionAutoApproved(first.sessionID))
+        #expect(!controller.isSessionAutoApproved(for: first))
         #expect(!controller.submitDecision(.allowOnce, forRequestID: first.id))
         #expect(!controller.submitDecision(.deny(reason: nil), forRequestID: "missing"))
         #expect(responses.values.count == 1)
     }
 
-    @Test func allowForSessionDrainsToolsButPreservesQuestionsAndOtherSessions() throws {
+    @Test func allowForSessionDrainsOnlyMatchingVerifiedToolRequests() throws {
         let controller = AgentApprovalController(), responses = ApprovalResponses()
-        let first = try #require(controller.ingestHookEvent(try event(), responder: { responses.record($0) }))
-        controller.ingestHookEvent(try event(tool: "Read"), responder: { responses.record($0) })
-        let question = try #require(controller.ingestHookEvent(try question(), responder: { responses.record($0) }))
-        let other = try #require(controller.ingestHookEvent(try event(session: "session-2")))
+        let payload = try event()
+        let first = try #require(controller.ingestHookEvent(payload, scope: scope, isScopeCurrent: { true }, responder: { responses.record($0) }))
+        controller.ingestHookEvent(payload, scope: scope, isScopeCurrent: { true }, responder: { responses.record($0) })
+        let question = try #require(controller.ingestHookEvent(try question(), scope: scope, isScopeCurrent: { true }))
+        let other = try #require(controller.ingestHookEvent(try event(fields: ["agent_name": "Codex", "pid": 88, "cwd": "/other"])))
+        #expect(controller.canAutoApprove(request: first))
+        #expect(!controller.canAutoApprove(request: question))
+        #expect(!controller.canAutoApprove(request: other))
+        #expect(!controller.submitDecision(.allowForSession, forRequestID: other.id))
         #expect(controller.submitDecision(.allowForSession, forRequestID: first.id))
-        #expect(controller.isSessionAutoApproved("session-1"))
-        #expect(!controller.isSessionAutoApproved("session-2"))
+        #expect(controller.isSessionAutoApproved(for: first))
+        #expect(!controller.isSessionAutoApproved(for: other))
         #expect(controller.pendingRequests() == [question, other])
         #expect(responses.values == Array(repeating: ["decision": "approve"], count: 2))
-        #expect(controller.ingestHookEvent(try event(), responder: { responses.record($0) }) == nil)
+        #expect(controller.ingestHookEvent(payload, scope: scope, isScopeCurrent: { true }, responder: { responses.record($0) }) == nil)
         #expect(responses.values.count == 3)
-        #expect(controller.ingestHookEvent(try self.question()) != nil)
     }
 
-    @Test func explicitAutoApproveToggleDrainsAndCanBeRevoked() throws {
+    @Test func explicitAutoApproveCanBeRevoked() throws {
         let controller = AgentApprovalController(), responses = ApprovalResponses()
-        controller.ingestHookEvent(try event(), responder: { responses.record($0) })
-        let question = try #require(controller.ingestHookEvent(try question()))
-        controller.setSessionAutoApprove(true, sessionID: "session-1")
-        #expect(controller.pendingRequests() == [question])
+        let payload = try event()
+        let request = try #require(controller.ingestHookEvent(payload, scope: scope, isScopeCurrent: { true },
+                                                              responder: { responses.record($0) }))
+        controller.setSessionAutoApprove(true, for: request)
+        #expect(controller.activeAutoApproveRequests() == [request])
         #expect(responses.values == [["decision": "approve"]])
-        controller.setSessionAutoApprove(false, sessionID: "session-1")
-        #expect(!controller.isSessionAutoApproved("session-1"))
-        #expect(controller.ingestHookEvent(try event()) != nil)
+        controller.setSessionAutoApprove(false, for: request)
+        #expect(controller.activeAutoApproveRequests().isEmpty)
+        #expect(controller.ingestHookEvent(payload, scope: scope, isScopeCurrent: { true }) != nil)
     }
 
     @Test func denySerializesEscapedReasonAndOptionalReason() throws {
@@ -126,7 +142,6 @@ struct AgentApprovalControllerTests {
 
     @Test func nestedQuestionRequiresAnOfferedOption() throws {
         let controller = AgentApprovalController(), responses = ApprovalResponses()
-        controller.setSessionAutoApprove(true, sessionID: "session-1")
         let request = try #require(controller.ingestHookEvent(try question(), responder: { responses.record($0) }))
         #expect(request.summary == "Which target?")
         #expect(request.questionOptions == ["Debug", "Release"])
@@ -142,7 +157,6 @@ struct AgentApprovalControllerTests {
 
     @Test func flatQuestionOptionsAndEmptyQuestionsNeverAutoApprove() throws {
         let controller = AgentApprovalController(), responses = ApprovalResponses()
-        controller.setSessionAutoApprove(true, sessionID: "session-1")
         let request = try #require(controller.ingestHookEvent(try event(tool: "AskUserQuestion", input: [
             "question": "Continue?", "options": ["Yes", "No"]
         ]), responder: { responses.record($0) }))
@@ -202,29 +216,30 @@ struct AgentApprovalControllerTests {
         #expect(responses.values.last == ["decision": "block", "reason": "No permission"])
     }
 
-    @Test func stopAndEndCancelOnlyTheirSessionAndEndRevokesAutoApprove() throws {
+    @Test func revokedLifetimeBlocksQueuedRequests() throws {
         let controller = AgentApprovalController(), responses = ApprovalResponses()
-        controller.setSessionAutoApprove(true, sessionID: "session-1")
-        let pending = try #require(controller.ingestHookEvent(try question(), responder: { responses.record($0) }))
-        let other = try #require(controller.ingestHookEvent(try event(session: "session-2")))
-        #expect(controller.ingestHookEvent(try event(.stop)) == nil)
-        #expect(controller.pendingRequests() == [other])
-        #expect(controller.isSessionAutoApproved("session-1"))
+        let lifetime = ApprovalLifetime()
+        let payload = try event()
+        let request = try #require(controller.ingestHookEvent(payload, scope: scope, isScopeCurrent: { lifetime.active },
+                                                              responder: { responses.record($0) }))
+        lifetime.revoke()
+        #expect(!controller.canAutoApprove(request: request))
+        #expect(!controller.submitDecision(.allowOnce, forRequestID: request.id))
+        #expect(!controller.submitDecision(.allowForSession, forRequestID: request.id))
+        #expect(controller.pruneExpiredRequests() == 1)
         #expect(responses.values.first?["decision"] == "block")
-        #expect(!controller.submitDecision(.allowOnce, forRequestID: pending.id))
-        controller.ingestHookEvent(try question(), responder: { responses.record($0) })
-        controller.ingestHookEvent(try event(.sessionEnd))
-        #expect(!controller.isSessionAutoApproved("session-1"))
-        #expect(controller.pendingRequests() == [other])
-        #expect(responses.values.count == 2)
-        #expect(controller.ingestHookEvent(try event()) != nil)
+        #expect(controller.pendingRequests().isEmpty)
     }
 
-    @Test func lifecycleCleanupDoesNotRequireToolMetadata() throws {
+    @Test func scopedStopCancelsOnlyRequestsFromEarlierInTheSameTurn() throws {
         let controller = AgentApprovalController(), responses = ApprovalResponses()
-        controller.ingestHookEvent(try event(), responder: { responses.record($0) })
-        controller.ingestHookEvent(Data(#"{"hook_event_name":"SessionEnd","session_id":"session-1"}"#.utf8))
-        #expect(controller.pendingRequests().isEmpty)
+        let request = try question()
+        controller.ingestHookEvent(request, scope: scope, now: now.addingTimeInterval(-1), isScopeCurrent: { true },
+                                   responder: { responses.record($0) })
+        controller.ingestHookEvent(request, scope: scope, now: now.addingTimeInterval(1), isScopeCurrent: { true },
+                                   responder: { responses.record($0) })
+        controller.ingestHookEvent(try event(.stop), scope: scope, now: now, isScopeCurrent: { true })
+        #expect(controller.pendingRequests().count == 1)
         #expect(responses.values.first?["decision"] == "block")
     }
 
@@ -252,8 +267,6 @@ struct AgentApprovalControllerTests {
             #expect(controller.ingestHookEvent(payload, responder: { responses.record($0) }) == nil)
         }
         for id in ["", " ", " session-1", "session-1\n", "session\u{202E}-1", String(repeating: "s", count: 257)] {
-            controller.setSessionAutoApprove(true, sessionID: id)
-            #expect(!controller.isSessionAutoApproved(id))
             #expect(controller.ingestHookEvent(try event(session: id), responder: { responses.record($0) }) == nil)
         }
         #expect(controller.pendingRequests().isEmpty)
@@ -306,21 +319,18 @@ struct AgentApprovalControllerTests {
 
     @Test func callbacksMayReenterControllerAfterStateTransition() throws {
         let controller = AgentApprovalController(), responses = ApprovalResponses()
-        let request = try #require(controller.ingestHookEvent(try event(), responder: { data in
+        let request = try #require(controller.ingestHookEvent(try event(), scope: scope, isScopeCurrent: { true }, responder: { data in
             #expect(controller.pendingRequests().isEmpty)
-            #expect(controller.isSessionAutoApproved("session-1"))
-            controller.setSessionAutoApprove(false, sessionID: "session-1")
+            if let grant = controller.activeAutoApproveRequests().first {
+                controller.setSessionAutoApprove(false, for: grant)
+            } else {
+                Issue.record("Grant should be present when its response is delivered")
+            }
             responses.record(data)
         }))
         #expect(controller.submitDecision(.allowForSession, forRequestID: request.id))
         #expect(responses.values == [["decision": "approve"]])
-        #expect(!controller.isSessionAutoApproved("session-1"))
-        controller.setSessionAutoApprove(true, sessionID: "session-1")
-        controller.ingestHookEvent(try event(), responder: { data in
-            controller.setSessionAutoApprove(false, sessionID: "session-1")
-            responses.record(data)
-        })
-        #expect(responses.values.count == 2)
+        #expect(controller.activeAutoApproveRequests().isEmpty)
     }
 
     @Test func concurrentIngestionAndDuplicateDecisionsRespondExactlyOnce() throws {
@@ -342,25 +352,24 @@ struct AgentApprovalControllerTests {
         #expect(responses.values.filter { $0["decision"] == "approve" }.count == 50)
     }
 
-    @Test func concurrentAutoApprovalCleanupAndIngestionDoNotLoseResponders() throws {
+    @Test func concurrentAutoApprovalAndRevocationDoNotLoseResponders() throws {
         let controller = AgentApprovalController(), responses = ApprovalResponses()
-        let payload = try event(), stop = try event(.stop), end = try event(.sessionEnd)
+        let payload = try event()
         DispatchQueue.concurrentPerform(iterations: 300) { index in
-            controller.ingestHookEvent(payload, responder: { responses.record($0) })
-            switch index % 4 {
-            case 0: controller.setSessionAutoApprove(true, sessionID: "session-1")
-            case 1: controller.setSessionAutoApprove(false, sessionID: "session-1")
-            case 2: controller.ingestHookEvent(stop)
-            default: controller.ingestHookEvent(end)
+            if let request = controller.ingestHookEvent(payload, scope: scope, isScopeCurrent: { true },
+                                                        responder: { responses.record($0) }), index % 2 == 0 {
+                controller.setSessionAutoApprove(true, for: request)
             }
-            _ = controller.isSessionAutoApproved("session-1")
+            for grant in controller.activeAutoApproveRequests() {
+                controller.setSessionAutoApprove(false, for: grant)
+            }
             #expect(controller.pendingRequests().count <= 50)
         }
-        controller.ingestHookEvent(end)
+        for request in controller.pendingRequests() {
+            controller.submitDecision(.deny(reason: nil), forRequestID: request.id)
+        }
         #expect(controller.pendingRequests().isEmpty)
-        #expect(!controller.isSessionAutoApproved("session-1"))
         #expect(responses.values.count == 300)
-        #expect(responses.values.allSatisfy { ["approve", "block"].contains($0["decision"] ?? "") })
     }
 
     @Test func snippetQuotesShellMetacharactersAndRejectsUnsafePaths() {

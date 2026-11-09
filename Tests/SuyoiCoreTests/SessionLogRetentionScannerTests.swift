@@ -37,7 +37,7 @@ import Testing
         _ = try fixture.log(".claude/projects/project/boundary.jsonl", daysOld: 1)
         _ = try fixture.log(".claude/projects/project/recent.jsonl", daysOld: 0)
         #expect(fixture.scanner.scanStaleSessionLogs(olderThanDays: -5, now: fixture.now).map(\.path) == [old.path])
-        let report = fixture.scanner.trashStaleLogs(fixture.scan(days: 0), olderThanDays: 0, now: fixture.now) { _ in nil }
+        let report = fixture.scanner.trashStaleLogs(fixture.scan(days: 0), olderThanDays: 0, liveProcesses: { fixture.processes() }, now: fixture.now) { _ in nil }
         #expect(report.trashedCount == 1)
     }
 
@@ -63,7 +63,7 @@ import Testing
         let agent = fixture.agent(cwd: useProject ? "/workspace/other" : project.path,
                                   projectRoot: useProject ? project.path : nil)
         #expect(fixture.scan(agents: [agent]).map(\.path) == [unrelated.path])
-        let report = fixture.scanner.trashStaleLogs(fixture.scan(), activeAgents: [agent], now: fixture.now) { _ in nil }
+        let report = fixture.scanner.trashStaleLogs(fixture.scan(), activeAgents: [agent], liveProcesses: { fixture.processes([agent.process]) }, now: fixture.now) { _ in nil }
         #expect(report.trashedCount == 1)
         #expect(report.outcomes.filter { !$0.succeeded }.count == 1)
     }
@@ -90,7 +90,7 @@ import Testing
         try FileManager.default.moveItem(at: component, to: original)
         try FileManager.default.createSymbolicLink(at: component, withDestinationURL: original)
         #expect(fixture.scan().isEmpty)
-        let report = fixture.scanner.trashStaleLogs(captured, now: fixture.now) { _ in
+        let report = fixture.scanner.trashStaleLogs(captured, liveProcesses: { fixture.processes() }, now: fixture.now) { _ in
             Issue.record("A symlink reached Trash")
             return nil
         }
@@ -120,7 +120,7 @@ import Testing
         let forged = StaleSessionLogSummary(id: replacement.id, agentName: replacement.agentName, path: replacement.path,
             bytes: replacement.bytes, modifiedAt: replacement.modifiedAt,
             identity: FileIdentity(device: replacement.identity.device ^ 1, inode: replacement.identity.inode))
-        let report = fixture.scanner.trashStaleLogs([captured, forged], now: fixture.now) { _ in
+        let report = fixture.scanner.trashStaleLogs([captured, forged], liveProcesses: { fixture.processes() }, now: fixture.now) { _ in
             Issue.record("A mismatched identity reached Trash")
             return nil
         }
@@ -143,7 +143,7 @@ import Testing
         }
         let agents = change == "session" ? [fixture.agent(sessionID: "active-session")] : []
         let report = fixture.scanner.trashStaleLogs(logs, olderThanDays: change == "retention" ? 30 : 14,
-            activeAgents: agents, now: fixture.now) { _ in
+            activeAgents: agents, liveProcesses: { fixture.processes(agents.map(\.process)) }, now: fixture.now) { _ in
                 Issue.record("An ineligible log reached Trash")
                 return nil
             }
@@ -160,7 +160,7 @@ import Testing
                      "relative.jsonl", outside.path + "\0.jsonl"]
         let forged = paths.map { StaleSessionLogSummary(id: $0, agentName: "Codex", path: $0, bytes: 10,
             modifiedAt: fixture.now.addingTimeInterval(-20 * 86_400), identity: actual) }
-        let report = fixture.scanner.trashStaleLogs(forged, now: fixture.now) { _ in
+        let report = fixture.scanner.trashStaleLogs(forged, liveProcesses: { fixture.processes() }, now: fixture.now) { _ in
             Issue.record("An unapproved path reached Trash")
             return nil
         }
@@ -184,7 +184,7 @@ import Testing
         let trash = fixture.root.appendingPathComponent("test-trash")
         try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: false)
         var calls: [URL] = []
-        let report = fixture.scanner.trashStaleLogs(logs, now: fixture.now) { url in
+        let report = fixture.scanner.trashStaleLogs(logs, liveProcesses: { fixture.processes() }, now: fixture.now) { url in
             calls.append(url)
             if url == failure { throw NSError(domain: "private-diagnostic", code: 1) }
             let destination = trash.appendingPathComponent(url.lastPathComponent)
@@ -209,7 +209,7 @@ import Testing
         _ = try fixture.log(".claude/projects/project/old.jsonl", bytes: 30)
         let log = try #require(fixture.scan().first)
         var calls = 0
-        let report = fixture.scanner.trashStaleLogs([log, log], now: fixture.now) { _ in calls += 1; return nil }
+        let report = fixture.scanner.trashStaleLogs([log, log], liveProcesses: { fixture.processes() }, now: fixture.now) { _ in calls += 1; return nil }
         #expect(calls == 1)
         #expect(report.trashedCount == 1)
         #expect(report.reclaimedBytes == 30)
@@ -224,7 +224,7 @@ import Testing
         let second = try fixture.log(".claude/projects/project/second.jsonl", bytes: 20)
         let logs = fixture.scan()
         var calls: [URL] = []
-        let report = fixture.scanner.trashStaleLogs(logs, now: fixture.now) { url in
+        let report = fixture.scanner.trashStaleLogs(logs, liveProcesses: { fixture.processes() }, now: fixture.now) { url in
             calls.append(url)
             try FileManager.default.setAttributes([.modificationDate: fixture.now], ofItemAtPath: second.path)
             return nil
@@ -235,11 +235,85 @@ import Testing
         #expect(report.outcomes.last?.succeeded == false)
     }
 
+    @Test(arguments: [ObservationStatus.partial, .unavailable])
+    func incompleteEmptyInventoryCannotDisproveKnownOwner(_ status: ObservationStatus) throws {
+        let fixture = try RetentionFixture()
+        defer { fixture.remove() }
+        _ = try fixture.log(".codex/sessions/2026/01/02/old-session.jsonl")
+        let owner = fixture.agent(sessionID: "old-session")
+        let report = fixture.scanner.trashStaleLogs(fixture.scan(), activeAgents: [owner],
+            liveProcesses: { fixture.processes(status: status) }, now: fixture.now) { _ in
+            Issue.record("Incomplete process evidence reached Trash")
+            return nil
+        }
+        #expect(report.trashedCount == 0)
+        #expect(report.outcomes.first?.error == "Live session ownership could not be verified")
+    }
+
+    @Test func sameProviderProcessWithUnknownSessionBlocksTrash() throws {
+        let fixture = try RetentionFixture()
+        defer { fixture.remove() }
+        _ = try fixture.log(".codex/sessions/2026/01/02/old-session.jsonl")
+        let process = ObservedProcess(pid: 42, parentPID: 1, uid: Int(getuid()), cpuPercent: 0,
+            residentBytes: 0, executable: "/usr/bin/codex", startTimeMicroseconds: 123)
+        let report = fixture.scanner.trashStaleLogs(fixture.scan(),
+            liveProcesses: { fixture.processes([process]) }, now: fixture.now) { _ in
+            Issue.record("Unresolved session ownership reached Trash")
+            return nil
+        }
+        #expect(report.trashedCount == 0)
+        #expect(report.outcomes.first?.error == "A running agent may still own this session log")
+    }
+
+    @Test func exactFileCheckBlocksAnOpenOldLogAndAllowsItAfterClose() throws {
+        let fixture = try RetentionFixture()
+        defer { fixture.remove() }
+        let file = try fixture.log(".codex/sessions/2026/01/02/old-session.jsonl")
+        let logs = fixture.scan()
+        let capturedOwner = fixture.agent(sessionID: "old-session")
+        let scanner = SessionLogRetentionScanner(homeDirectory: fixture.root)
+        let handle = try FileHandle(forReadingFrom: file)
+        let blocked = scanner.trashStaleLogs(logs, activeAgents: [capturedOwner],
+            liveProcesses: { fixture.processes() }, now: fixture.now) { _ in
+            Issue.record("An open file reached Trash")
+            return nil
+        }
+        #expect(blocked.trashedCount == 0)
+        #expect(blocked.outcomes.first?.error?.contains("is open") == true)
+        try handle.close()
+        let moved = scanner.trashStaleLogs(logs, activeAgents: [capturedOwner],
+            liveProcesses: { fixture.processes() }, now: fixture.now) { original in
+            let destination = fixture.root.appendingPathComponent("fixture-trash")
+            try FileManager.default.moveItem(at: original, to: destination)
+            return destination
+        }
+        #expect(moved.trashedCount == 1)
+        #expect(moved.outcomes.first?.recovery?.fileIdentity == logs.first?.identity)
+    }
+
+    @Test func batchRequiresNewCompleteProcessEvidenceForEachItem() throws {
+        let fixture = try RetentionFixture()
+        defer { fixture.remove() }
+        let first = try fixture.log(".claude/projects/project/first.jsonl", bytes: 40)
+        let second = try fixture.log(".claude/projects/project/second.jsonl", bytes: 20)
+        var reads = 0
+        let report = fixture.scanner.trashStaleLogs(fixture.scan(), liveProcesses: {
+            reads += 1
+            return fixture.processes(status: reads == 1 ? .complete : .partial)
+        }, now: fixture.now) { url in
+            #expect(url == first)
+            return nil
+        }
+        #expect(reads == 2)
+        #expect(report.trashedCount == 1)
+        #expect(report.outcomes.last?.path == second.path && report.outcomes.last?.succeeded == false)
+    }
+
     @Test func emptyOrMissingRootsReturnEmptyReports() throws {
         let fixture = try RetentionFixture()
         defer { fixture.remove() }
         #expect(fixture.scan().isEmpty)
-        let report = fixture.scanner.trashStaleLogs([], now: fixture.now)
+        let report = fixture.scanner.trashStaleLogs([], liveProcesses: { fixture.processes() }, now: fixture.now)
         #expect(report.outcomes.isEmpty)
         #expect(report.trashedCount == 0)
         #expect(report.reclaimedBytes == 0)
@@ -249,7 +323,14 @@ import Testing
 private struct RetentionFixture {
     let root: URL
     let now = Date(timeIntervalSince1970: 1_800_000_000)
-    var scanner: SessionLogRetentionScanner { SessionLogRetentionScanner(homeDirectory: root) }
+    var scanner: SessionLogRetentionScanner {
+        SessionLogRetentionScanner(homeDirectory: root, openFileCheck: { _ in .clear })
+    }
+
+    func processes(_ value: [ObservedProcess] = [], status: ObservationStatus = .complete,
+                   warnings: [String] = [], capturedAt: Date = Date()) -> Observation<[ObservedProcess]> {
+        Observation(value: value, status: status, warnings: warnings, capturedAt: capturedAt)
+    }
 
     init() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).resolvingSymlinksInPath()

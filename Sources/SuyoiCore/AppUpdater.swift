@@ -236,13 +236,12 @@ public struct AppUpdater: AppUpdating, Sendable {
         }
     }
 
-    public func launchReplacementAndRelaunch(_ staged: StagedAppUpdate, currentPID: Int32) throws {
-        // Fixed positional-argument shell script; never interpolates paths into script source.
-        // $1 = PID to wait for
-        // $2 = Target Suyoi.app destination path
-        // $3 = Verified new Suyoi.app source path
-        // $4 = Temporary staging directory path
-        let script = """
+    // Fixed positional-argument shell script; never interpolates paths into script source.
+    // $1 = PID to wait for
+    // $2 = Target Suyoi.app destination path
+    // $3 = Verified new Suyoi.app source path
+    // $4 = Temporary staging directory path
+    static let replacementScript = """
         pid="$1"
         target_app="$2"
         new_app="$3"
@@ -250,10 +249,14 @@ public struct AppUpdater: AppUpdating, Sendable {
         backup_app="${staging_dir}/Suyoi-backup.app"
 
         i=0
-        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 60 ]; do
+        while [ "$i" -lt 60 ] && kill -0 "$pid" 2>/dev/null; do
             /bin/sleep 0.1
             i=$((i + 1))
         done
+
+        if kill -0 "$pid" 2>/dev/null; then
+            exit 1
+        fi
 
         if [ -e "$target_app" ]; then
             /bin/mv "$target_app" "$backup_app" || exit 1
@@ -278,11 +281,12 @@ public struct AppUpdater: AppUpdating, Sendable {
         exit 1
         """
 
+    public func launchReplacementAndRelaunch(_ staged: StagedAppUpdate, currentPID: Int32) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = [
             "-c",
-            script,
+            Self.replacementScript,
             "suyoi-updater",
             String(currentPID),
             staged.targetAppBundleURL.path,
@@ -372,7 +376,7 @@ public struct AppUpdater: AppUpdating, Sendable {
         if let dashIndex = trimmed.firstIndex(of: "-") {
             trimmed = String(trimmed[..<dashIndex])
         }
-        let parts = trimmed.split(separator: ".")
+        let parts = trimmed.split(separator: ".", omittingEmptySubsequences: false)
         guard !parts.isEmpty, parts.count <= 4, parts.allSatisfy({ Int($0) != nil }) else {
             return ""
         }
@@ -468,8 +472,10 @@ public struct AppUpdater: AppUpdating, Sendable {
             throw AppUpdaterError.bundleVerificationFailed("bundle identifier mismatch")
         }
 
-        if let bundleVersion = plist["CFBundleShortVersionString"] as? String,
-           normalizeVersion(bundleVersion) != normalizeVersion(expectedVersion) {
+        let normalizedExpectedVersion = normalizeVersion(expectedVersion)
+        guard !normalizedExpectedVersion.isEmpty,
+              let bundleVersion = plist["CFBundleShortVersionString"] as? String,
+              normalizeVersion(bundleVersion) == normalizedExpectedVersion else {
             throw AppUpdaterError.bundleVerificationFailed("version mismatch")
         }
 

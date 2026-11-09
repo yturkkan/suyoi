@@ -8,10 +8,14 @@ private struct HookBridgeFixture: Sendable {
     let root: URL
     let client: HookBridgeClient
 
-    init() throws {
+    init(owner: ObservedProcess? = nil) throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         client = HookBridgeClient(inboxDirectory: root.appendingPathComponent("inbox", isDirectory: true),
-                                  outboxDirectory: root.appendingPathComponent("outbox", isDirectory: true))
+                                  outboxDirectory: root.appendingPathComponent("outbox", isDirectory: true),
+                                  hookOwner: { owner }, processLookup: { pid, uid in
+                                      guard let owner, owner.pid == Int(pid), owner.uid == uid else { return nil }
+                                      return owner
+                                  })
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
@@ -58,11 +62,28 @@ private final class HookBridgeNotifications: @unchecked Sendable {
 @Suite("Hook bridge transport and inbox notifications", .serialized)
 struct HookBridgeServiceTests {
     private let approved = Data(#"{"decision":"approve"}"#.utf8)
-    private let timedOut = Data(#"{"decision":"block","reason":"Approval timed out"}"#.utf8)
-    private let invalidPayload = Data(#"{"decision":"block","reason":"Invalid hook payload"}"#.utf8)
+    private let session = "00000000-0000-4000-8000-000000000123"
+    private let project = "/workspace/sample"
 
-    private func payload(_ event: String) throws -> Data {
-        try JSONSerialization.data(withJSONObject: ["hook_event_name": event, "session_id": "session-1"])
+    private func payload(_ event: String, extra: [String: Any] = [:]) throws -> Data {
+        var fields: [String: Any] = ["hook_event_name": event, "session_id": session, "cwd": project,
+                                     "tool_name": "Bash", "tool_input": ["command": "swift build"]]
+        fields.merge(extra) { _, new in new }
+        return try JSONSerialization.data(withJSONObject: fields)
+    }
+
+    private func decision(_ data: Data) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let output = root["hookSpecificOutput"] as? [String: Any] else { return nil }
+        return (output["permissionDecision"] as? String)
+            ?? (output["decision"] as? [String: Any])?["behavior"] as? String
+    }
+
+    private func reducedFields(at url: URL) throws -> [String: Any] {
+        let envelope = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let encoded = try #require(envelope["fields"] as? String)
+        let bytes = try #require(Data(base64Encoded: encoded))
+        return try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
     }
 
     @Test func defaultDirectoriesUseProvidedHome() {
@@ -74,79 +95,145 @@ struct HookBridgeServiceTests {
     }
 
     @Test(arguments: ["PermissionRequest", "PreToolUse"])
-    func roundTripReturnsExactResponseAndCleansSpool(event: String) async throws {
+    func roundTripUsesProviderDecisionAndSpoolsOnlyRedactedFields(event: String) async throws {
         let fixture = try HookBridgeFixture()
         defer { fixture.cleanUp() }
-        let input = try payload(event)
+        let input = try payload(event, extra: [
+            "tool_input": ["command": "curl -H 'Bearer /secret+fixture~token=='", "description": "PRIVATE DESCRIPTION"],
+            "tool_response": ["stdout": "PRIVATE STDOUT"], "prompt": "PRIVATE PROMPT"
+        ])
         let task = Task.detached { fixture.client.forwardEventAndWait(input, timeout: 5, pollInterval: 0.005) }
-        do {
-            let request = try await fixture.waitForRequest()
-            #expect(UUID(uuidString: request.deletingPathExtension().lastPathComponent) != nil)
-            #expect(try Data(contentsOf: request) == input)
-            let responseURL = fixture.responseURL(for: request)
-            let response = Data(#"{"decision":"block","reason":"User declined"}"#.utf8)
-            try response.write(to: responseURL, options: .atomic)
-            #expect(await task.value == response)
-            #expect(!FileManager.default.fileExists(atPath: request.path))
-            #expect(!FileManager.default.fileExists(atPath: responseURL.path))
-            #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.client.inboxDirectory.path).isEmpty)
-        } catch {
-            _ = await task.value
-            throw error
-        }
+        let request = try await fixture.waitForRequest()
+        let fields = try reducedFields(at: request)
+        #expect((fields["tool_input"] as? [String: String]) == ["command": "curl -H '[REDACTED]'"])
+        #expect(fields["tool_response"] == nil && fields["prompt"] == nil)
+        let controller = AgentApprovalController()
+        #expect(fixture.client.drainInbox(into: controller) == 1)
+        let pending = try #require(controller.pendingRequests().first)
+        #expect(!controller.canAutoApprove(request: pending))
+        #expect(controller.submitDecision(.allowOnce, forRequestID: pending.id))
+        let response = await task.value
+        let expected = event == "PreToolUse"
+            ? #"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#
+            : #"{"hookSpecificOutput":{"decision":{"behavior":"allow"},"hookEventName":"PermissionRequest"}}"#
+        #expect(response == Data(expected.utf8))
+        #expect(!FileManager.default.fileExists(atPath: request.path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.responseURL(for: request).path))
     }
 
     @Test func timeoutFailsClosedAndRemovesRequest() throws {
         let fixture = try HookBridgeFixture()
         defer { fixture.cleanUp() }
         let started = ProcessInfo.processInfo.systemUptime
-        let result = fixture.client.forwardEventAndWait(HookBridgeClient.simulatedApprovalPayload(),
-                                                        timeout: 0.05, pollInterval: 10)
-        #expect(result == timedOut)
+        let result = fixture.client.forwardEventAndWait(try payload("PermissionRequest"), timeout: 0.05, pollInterval: 10)
+        #expect(decision(result) == "deny")
         #expect(ProcessInfo.processInfo.systemUptime - started < 2)
-        #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.client.inboxDirectory.path).isEmpty)
+        #expect(fixture.requests().isEmpty)
     }
 
     @Test func invalidAndOversizedPayloadsNeverReachInbox() throws {
         let fixture = try HookBridgeFixture()
         defer { fixture.cleanUp() }
-        var oversized = HookBridgeClient.simulatedApprovalPayload()
+        var oversized = try payload("PreToolUse")
         oversized.append(Data(repeating: 32, count: 65_537 - oversized.count))
         let invalid = [Data(), Data("{".utf8), Data("[]".utf8), Data("null".utf8),
                        Data(#"{"hook_event_name":"PermissionRequest"}"#.utf8),
                        Data(#"{"session_id":"session-1"}"#.utf8),
                        Data(#"{"hook_event_name":12,"session_id":"session-1"}"#.utf8),
-                       Data(#"{"hook_event_name":"Stop","session_id":null}"#.utf8),
-                       Data(#"{"hook_event_name":"Stop","session_id":" "}"#.utf8),
                        try payload("Unknown"), oversized]
         for input in invalid {
-            #expect(fixture.client.forwardEventAndWait(input, timeout: 0.01) == invalidPayload)
+            #expect(!fixture.client.forwardEventAndWait(input, timeout: 0.01).isEmpty)
         }
         #expect(!FileManager.default.fileExists(atPath: fixture.client.inboxDirectory.path))
     }
 
     @Test(arguments: ["Stop", "SessionEnd", "SessionStart", "PostToolUse", "Notification"])
-    func lifecycleEventsReturnImmediatelyAndRemainForIngestion(event: String) throws {
+    func unusedOrUnverifiedLifecycleEventsDoNotWriteSpool(event: String) throws {
         let fixture = try HookBridgeFixture()
         defer { fixture.cleanUp() }
-        let input = try payload(event)
-        let started = ProcessInfo.processInfo.systemUptime
-        #expect(fixture.client.forwardEventAndWait(input, timeout: 0, pollInterval: 10) == approved)
-        #expect(ProcessInfo.processInfo.systemUptime - started < 2)
-        let request = try #require(fixture.requests().first)
-        #expect(fixture.requests().count == 1)
-        #expect(try Data(contentsOf: request) == input)
+        let input = try payload(event, extra: ["tool_response": ["stdout": "PRIVATE STDOUT"]])
+        #expect(fixture.client.forwardEventAndWait(input, timeout: 0, pollInterval: 10).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.client.inboxDirectory.path))
         #expect(!FileManager.default.fileExists(atPath: fixture.client.outboxDirectory.path))
     }
 
-    @Test func acceptsExactly64KiB() throws {
+    @Test func acceptsExactly64KiBWithoutSpoolingUnusedInput() throws {
         let fixture = try HookBridgeFixture()
         defer { fixture.cleanUp() }
-        var input = try payload("Stop")
+        var input = try payload("PostToolUse")
         input.append(Data(repeating: 32, count: 65_536 - input.count))
-        #expect(fixture.client.forwardEventAndWait(input) == approved)
-        let request = try #require(fixture.requests().first)
-        #expect(try Data(contentsOf: request).count == 65_536)
+        #expect(fixture.client.forwardEventAndWait(input).isEmpty)
+        #expect(fixture.requests().isEmpty)
+    }
+
+    @Test func sessionEndInvalidatesOldRequestsBeforeDrainAndStartCannotReuseGrant() async throws {
+        let owner = ObservedProcess(pid: 123_456, parentPID: 12, uid: Int(getuid()), cpuPercent: 0, residentBytes: 0,
+                                    executable: "/tools/claude", startTimeMicroseconds: 1_000, cwd: project)
+        let fixture = try HookBridgeFixture(owner: owner)
+        defer { fixture.cleanUp() }
+        let controller = AgentApprovalController()
+        let start = try payload("SessionStart")
+        let end = try payload("SessionEnd", extra: ["cwd": "/changed-project"])
+        let permission = try payload("PreToolUse")
+        #expect(fixture.client.forwardEventAndWait(start).isEmpty)
+        let original = Task.detached { fixture.client.forwardEventAndWait(permission, timeout: 5) }
+        _ = try await fixture.waitForRequest()
+        #expect(fixture.client.drainInbox(into: controller) == 1)
+        let pending = try #require(controller.pendingRequests().first)
+        #expect(controller.canAutoApprove(request: pending))
+        #expect(controller.submitDecision(.allowForSession, forRequestID: pending.id))
+        #expect(decision(await original.value) == "allow")
+
+        let automatic = Task.detached { fixture.client.forwardEventAndWait(permission, timeout: 5) }
+        _ = try await fixture.waitForRequest()
+        #expect(fixture.client.drainInbox(into: controller) == 0)
+        #expect(decision(await automatic.value) == "allow")
+
+        let restartedController = AgentApprovalController()
+        let afterAppRestart = Task.detached { fixture.client.forwardEventAndWait(permission, timeout: 5) }
+        _ = try await fixture.waitForRequest()
+        #expect(fixture.client.drainInbox(into: restartedController) == 1)
+        let restartRequest = try #require(restartedController.pendingRequests().first)
+        #expect(restartedController.submitDecision(.deny(reason: nil), forRequestID: restartRequest.id))
+        #expect(decision(await afterAppRestart.value) == "deny")
+
+        let queuedBeforeEnd = Task.detached { fixture.client.forwardEventAndWait(permission, timeout: 5) }
+        _ = try await fixture.waitForRequest()
+        #expect(fixture.client.forwardEventAndWait(end).isEmpty)
+        #expect(fixture.client.forwardEventAndWait(start).isEmpty)
+        #expect(fixture.client.drainInbox(into: controller) == 0)
+        #expect(decision(await queuedBeforeEnd.value) == "deny")
+        #expect(controller.activeAutoApproveRequests().isEmpty)
+
+        let newSession = Task.detached { fixture.client.forwardEventAndWait(permission, timeout: 5) }
+        _ = try await fixture.waitForRequest()
+        #expect(fixture.client.drainInbox(into: controller) == 1)
+        let newRequest = try #require(controller.pendingRequests().first)
+        #expect(controller.canAutoApprove(request: newRequest))
+        #expect(controller.submitDecision(.deny(reason: "No"), forRequestID: newRequest.id))
+        #expect(decision(await newSession.value) == "deny")
+    }
+
+    @Test func structuredQuestionAnswerUsesOriginalProviderInputWithoutSpoolingIt() async throws {
+        let fixture = try HookBridgeFixture()
+        defer { fixture.cleanUp() }
+        let question = ["question": "Which build?", "multiSelect": false, "options": [["label": "Release", "description": "PRIVATE DETAILS"]]] as [String: Any]
+        let input = try payload("PreToolUse", extra: ["tool_name": "AskUserQuestion", "tool_input": ["questions": [question]]])
+        let task = Task.detached { fixture.client.forwardEventAndWait(input, timeout: 5, pollInterval: 0.005) }
+        let request = try await fixture.waitForRequest()
+        let reduced = try #require(try reducedFields(at: request)["tool_input"] as? [String: Any])
+        #expect(reduced["questions"] == nil)
+        #expect(reduced["options"] as? [String] == ["Release"])
+        let controller = AgentApprovalController()
+        #expect(fixture.client.drainInbox(into: controller) == 1)
+        let pending = try #require(controller.pendingRequests().first)
+        #expect(controller.submitDecision(.answerQuestion(selectedOption: "Release"), forRequestID: pending.id))
+        let result = await task.value
+        #expect(decision(result) == "allow")
+        let object = try #require(JSONSerialization.jsonObject(with: result) as? [String: Any])
+        let output = try #require(object["hookSpecificOutput"] as? [String: Any])
+        let updated = try #require(output["updatedInput"] as? [String: Any])
+        #expect(updated["answers"] as? [String: String] == ["Which build?": "Release"])
     }
 
     @Test func simulatedPayloadIsAcceptedByController() throws {
@@ -193,7 +280,7 @@ struct HookBridgeServiceTests {
             case "fifo": #expect(mkfifo(response.path, 0o600) == 0)
             default: try Data(repeating: 32, count: 16_385).write(to: response, options: .atomic)
             }
-            #expect(await task.value == Data(#"{"decision":"block","reason":"Invalid approval response"}"#.utf8))
+            #expect(decision(await task.value) == "deny")
             #expect(fixture.requests().isEmpty)
             #expect(try Data(contentsOf: target) == approved)
         } catch {
@@ -212,8 +299,12 @@ struct HookBridgeServiceTests {
             let request = try await fixture.waitForRequest()
             var response = approved
             response.append(Data(repeating: 32, count: 16_384 - response.count))
-            try response.write(to: fixture.responseURL(for: request), options: .atomic)
-            #expect(await task.value == response)
+            let url = fixture.responseURL(for: request)
+            let staged = url.deletingLastPathComponent().appendingPathComponent(".test-response")
+            try response.write(to: staged)
+            try #require(chmod(staged.path, 0o600) == 0)
+            try FileManager.default.moveItem(at: staged, to: url)
+            #expect(decision(await task.value) == "allow")
         } catch {
             _ = await task.value
             throw error
@@ -229,7 +320,7 @@ struct HookBridgeServiceTests {
         let directory = name == "inbox" ? fixture.client.inboxDirectory : fixture.client.outboxDirectory
         try FileManager.default.createSymbolicLink(at: directory, withDestinationURL: target)
         let result = fixture.client.forwardEventAndWait(HookBridgeClient.simulatedApprovalPayload(), timeout: 0.05)
-        #expect(result == Data(#"{"decision":"block","reason":"Hook bridge unavailable"}"#.utf8))
+        #expect(decision(result) == "deny")
         #expect(try FileManager.default.contentsOfDirectory(atPath: target.path).isEmpty)
     }
 
@@ -272,24 +363,21 @@ struct HookBridgeServiceTests {
         #expect(notifications.count == 0)
     }
 
-    @Test func drainInboxIngestsRequestsWritesOutboxAndPrunesExpired() throws {
+    @Test func drainInboxPrunesExpiredAndRejectsUnversionedInput() throws {
         let fixture = try HookBridgeFixture()
         defer { fixture.cleanUp() }
-        try FileManager.default.createDirectory(at: fixture.client.inboxDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: fixture.client.inboxDirectory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
         let expiredURL = fixture.client.inboxDirectory.appendingPathComponent("expired.json")
-        try HookBridgeClient.simulatedApprovalPayload(sessionID: "expired-1").write(to: expiredURL, options: .atomic)
+        try payload("PreToolUse").write(to: expiredURL)
         try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-300)], ofItemAtPath: expiredURL.path)
-        let requestURL = fixture.client.inboxDirectory.appendingPathComponent("req-1.json")
-        try HookBridgeClient.simulatedApprovalPayload(sessionID: "drain-1").write(to: requestURL, options: .atomic)
+        let requestURL = fixture.client.inboxDirectory.appendingPathComponent(UUID().uuidString + ".json")
+        try payload("PreToolUse").write(to: requestURL)
+        #expect(chmod(requestURL.path, 0o600) == 0)
         let controller = AgentApprovalController()
-        let added = fixture.client.drainInbox(into: controller)
-        #expect(added == 1)
+        #expect(fixture.client.drainInbox(into: controller) == 0)
         #expect(!FileManager.default.fileExists(atPath: expiredURL.path))
         #expect(!FileManager.default.fileExists(atPath: requestURL.path))
-        let pending = try #require(controller.pendingRequests().first)
-        #expect(pending.sessionID == "drain-1")
-        #expect(controller.submitDecision(.allowOnce, forRequestID: pending.id))
-        let responseURL = fixture.client.outboxDirectory.appendingPathComponent("req-1.response.json")
-        #expect(try Data(contentsOf: responseURL) == approved)
+        #expect(controller.pendingRequests().isEmpty)
     }
 }
