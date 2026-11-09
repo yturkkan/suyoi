@@ -8,14 +8,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let model = DashboardModel()
-    private lazy var islandController = IslandWindowController(
-        onOpenDashboard: { [weak self] in
-            self?.showPopoverIfNeeded()
-        },
-        onFocusPrimaryAgent: { [weak self] in
-            self?.model.focusPrimaryAgent()
+    private lazy var islandController: IslandWindowController = {
+        let controller = IslandWindowController(
+            onOpenDashboard: { [weak self] in
+                self?.showPopoverIfNeeded()
+            },
+            onFocusPrimaryAgent: { [weak self] in
+                self?.model.focusPrimaryAgent()
+            }
+        )
+        controller.onApprovePending = { [weak self] id in
+            self?.model.approvePendingRequest(id: id)
         }
-    )
+        controller.onDenyPending = { [weak self] id in
+            self?.model.denyPendingRequest(id: id)
+        }
+        return controller
+    }()
     private var refreshTimer: Timer?
     private var globalClickMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
@@ -59,6 +68,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             .store(in: &cancellables)
 
+        model.$experienceTheme
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateIslandSurface()
+            }
+            .store(in: &cancellables)
+
+        model.$statusBarStyle
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateStatusItemBadge()
+            }
+            .store(in: &cancellables)
+
+        model.$quotaSnapshot
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateStatusItemBadge()
+            }
+            .store(in: &cancellables)
+
+        model.$liveQuotas
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateStatusItemBadge()
+            }
+            .store(in: &cancellables)
+
         model.$isPopoverPinned
             .receive(on: RunLoop.main)
             .sink { [weak self] isPinned in
@@ -91,25 +128,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let waitingCount = agents.filter { $0.activityState == .waiting }.count
         let activeCount = agents.filter { $0.activityState == .active }.count
 
-        if agents.isEmpty && servers.isEmpty {
-            button.title = ""
-            button.toolTip = "Suyoi · No active agents or dev servers"
-            return
-        }
+        button.title = DashboardFilterAndBadgeFormatter.formatStatusBarTitle(
+            style: model.statusBarStyle,
+            agents: agents,
+            servers: servers,
+            pendingApprovalsCount: model.pendingApprovals.count,
+            highestQuotaPercent: model.highestObservedQuotaPercent
+        )
 
-        var parts: [String] = []
-        if !agents.isEmpty {
-            if waitingCount > 0 {
-                parts.append("\(agents.count)A·\(waitingCount)⏳")
-            } else {
-                parts.append("\(agents.count)A")
-            }
+        if agents.isEmpty && servers.isEmpty && model.pendingApprovals.isEmpty {
+            button.toolTip = "Suyoi · No active agents or dev servers"
+        } else {
+            button.toolTip = "Suyoi · \(agents.count) agents (\(activeCount) active, \(waitingCount) waiting) · \(servers.count) dev servers"
         }
-        if !servers.isEmpty {
-            parts.append("\(servers.count)S")
-        }
-        button.title = " " + parts.joined(separator: " ")
-        button.toolTip = "Suyoi · \(agents.count) agents (\(activeCount) active, \(waitingCount) waiting) · \(servers.count) dev servers"
     }
 
     private func scheduleRefreshTimer(interval: TimeInterval) {

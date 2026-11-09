@@ -6,6 +6,7 @@ public enum CLIOptions: Equatable, Sendable {
     case scanCleanup(path: String?)
     case quotas
     case agentStorage
+    case hookBridge
     case help
 
     public enum ParseError: Error, Equatable, LocalizedError {
@@ -20,6 +21,7 @@ public enum CLIOptions: Equatable, Sendable {
         case "--snapshot" where arguments.count == 1: self = .snapshot
         case "--quotas" where arguments.count == 1: self = .quotas
         case "--agent-storage" where arguments.count == 1: self = .agentStorage
+        case "--hook-bridge" where arguments.count == 1: self = .hookBridge
         case "--help" where arguments.count == 1: self = .help
         case "--scan-cleanup":
             guard arguments.count <= 2 else { throw ParseError.invalidArguments }
@@ -38,6 +40,7 @@ public enum CLIOptions: Equatable, Sendable {
     Suyoi --scan-cleanup [path]   Review generated folders (default: ~/Developer) and allowlisted agent caches
     Suyoi --agent-storage         Print allowlisted agent cache inventory JSON
     Suyoi --quotas                Print bounded local account-wide quota and token usage JSON
+      --hook-bridge          Read a hook JSON event from stdin and print the approval decision JSON
     Suyoi --help                  Show this help
 
     Choose one command. No process termination, file deletion, network probes, or live quota requests. Quotas read allowlisted numeric session telemetry only.

@@ -11,12 +11,14 @@ struct CLIOptionsTests {
         #expect(try CLIOptions(arguments: ["--scan-cleanup", "~/Developer"]) == .scanCleanup(path: "~/Developer"))
         #expect(try CLIOptions(arguments: ["--agent-storage"]) == .agentStorage)
         #expect(try CLIOptions(arguments: ["--quotas"]) == .quotas)
+        #expect(try CLIOptions(arguments: ["--hook-bridge"]) == .hookBridge)
         #expect(try CLIOptions(arguments: ["--help"]) == .help)
     }
 
     @Test(arguments: [
         ["--quotas", "path"], ["--quotas", "--snapshot"], ["--unknown"], ["project"], ["--snapshot", "--scan-cleanup"],
         ["--snapshot", "--snapshot"], ["--help", "--snapshot"],
+        ["--hook-bridge", "path"], ["--hook-bridge", "--snapshot"], ["--hook-bridge", ""],
         ["--scan-cleanup", "--agent-storage"], ["--scan-cleanup", "--unknown"],
         ["--scan-cleanup", "one", "two"], ["--scan-cleanup", ""],
         ["--agent-storage", "path"], ["--snapshot", "path"], ["--scan-cleanup", "-x"]
@@ -28,7 +30,7 @@ struct CLIOptionsTests {
     }
 
     @Test func helpIncludesEveryCommandAndReadOnlyBoundary() {
-        for command in ["--snapshot", "--scan-cleanup", "--agent-storage", "--quotas", "--help"] {
+        for command in ["--snapshot", "--scan-cleanup", "--agent-storage", "--quotas", "--hook-bridge", "--help"] {
             #expect(CLIOptions.usage.contains(command))
         }
         #expect(CLIOptions.usage.contains("read-only"))

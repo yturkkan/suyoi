@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Darwin
 import SQLite3
@@ -68,19 +69,20 @@ public struct AgentTaskInspector: Sendable {
             }
             guard peers.isEmpty else { return AgentTaskContext(currentTask: running) }
         }
-        let context: AgentTaskContext
-        switch agentName {
-        case "OpenCode": context = openCode(directory: specificDir, running: running)
-        case "Codex": context = codex(directory: specificDir, running: running)
-        default: context = AgentTaskContext(currentTask: running)
-        }
-        // Keep generic-directory labels visible while omitting the ambiguous
-        // identifier when another live process of this provider could own it.
         let hasProviderPeer = allProcesses.contains {
             $0.pid != process.pid && $0.uid == process.uid && !$0.isStopped &&
             !isSameProcessLineage($0) &&
             AgentRecognizer.agentName(for: $0) == agentName
         }
+        let context: AgentTaskContext
+        switch agentName {
+        case "OpenCode": context = openCode(directory: specificDir, running: running)
+        case "Codex": context = codex(directory: specificDir, running: running)
+        case "Gemini CLI": context = gemini(directory: specificDir, hasProviderPeer: hasProviderPeer, running: running)
+        default: context = AgentTaskContext(currentTask: running)
+        }
+        // Keep generic-directory labels visible while omitting the ambiguous
+        // identifier when another live process of this provider could own it.
         guard specificDir == nil, hasProviderPeer else { return context }
         return AgentTaskContext(sessionTitle: context.sessionTitle, currentTask: context.currentTask)
     }
@@ -228,6 +230,131 @@ public struct AgentTaskInspector: Sendable {
         }
         let decoder = JSONDecoder()
         return chunks.flatMap { $0.split(separator: 10).compactMap { try? decoder.decode(Record.self, from: Data($0)) } }
+    }
+
+    private struct GeminiHeader: Decodable {
+        let sessionId: String?
+        let session_id: String?
+        let sessionID: String?
+        let cwd: String?
+        let projectRoot: String?
+    }
+
+    private func gemini(directory: String?, hasProviderPeer: Bool, running: String?) -> AgentTaskContext {
+        let expectedBucket = directory.map { dir in
+            SHA256.hash(data: Data(dir.utf8)).map { String(format: "%02x", $0) }.joined()
+        }
+        for (file, bucketName) in recentGeminiFiles() {
+            guard let id = extractGeminiSessionID(from: file, directory: directory, bucketName: bucketName, expectedBucket: expectedBucket, hasProviderPeer: hasProviderPeer) else {
+                continue
+            }
+            return AgentTaskContext(sessionID: id, sessionTitle: nil, currentTask: running)
+        }
+        return AgentTaskContext(currentTask: running)
+    }
+
+    private func recentGeminiFiles() -> [(URL, String?)] {
+        var found: [(URL, String?, Date)] = []
+        var budget = 4_096
+        let deadline = Date().addingTimeInterval(1)
+        let tmpRoot = homeDirectory.appendingPathComponent(".gemini/tmp")
+        if QuotaParsing.safePath(tmpRoot),
+           let buckets = FileManager.default.enumerator(
+               at: tmpRoot,
+               includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+               options: [.skipsSubdirectoryDescendants]
+           ) {
+            while budget > 0, Date() < deadline, let bucketURL = buckets.nextObject() as? URL {
+                budget -= 1
+                guard QuotaParsing.safePath(bucketURL),
+                      let bVal = try? bucketURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                      bVal.isDirectory == true, bVal.isSymbolicLink != true else { continue }
+                let chatsDir = bucketURL.appendingPathComponent("chats")
+                guard QuotaParsing.safePath(chatsDir),
+                      let files = FileManager.default.enumerator(
+                          at: chatsDir,
+                          includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey],
+                          options: [.skipsSubdirectoryDescendants]
+                      ) else { continue }
+                while budget > 0, Date() < deadline, let fileURL = files.nextObject() as? URL {
+                    budget -= 1
+                    guard QuotaParsing.safePath(fileURL),
+                          let fVal = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]),
+                          fVal.isRegularFile == true, fVal.isSymbolicLink != true,
+                          ["json", "jsonl"].contains(fileURL.pathExtension) else { continue }
+                    found.append((fileURL, bucketURL.lastPathComponent, fVal.contentModificationDate ?? .distantPast))
+                }
+            }
+        }
+        let sessionsRoot = homeDirectory.appendingPathComponent(".gemini/sessions")
+        if QuotaParsing.safePath(sessionsRoot),
+           let files = FileManager.default.enumerator(
+               at: sessionsRoot,
+               includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey],
+               options: [.skipsSubdirectoryDescendants]
+           ) {
+            while budget > 0, Date() < deadline, let fileURL = files.nextObject() as? URL {
+                budget -= 1
+                guard QuotaParsing.safePath(fileURL),
+                      let fVal = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]),
+                      fVal.isRegularFile == true, fVal.isSymbolicLink != true,
+                      ["json", "jsonl"].contains(fileURL.pathExtension) else { continue }
+                found.append((fileURL, nil, fVal.contentModificationDate ?? .distantPast))
+            }
+        }
+        return found
+            .sorted { $0.2 == $1.2 ? $0.0.path < $1.0.path : $0.2 > $1.2 }
+            .prefix(12)
+            .map { ($0.0, $0.1) }
+    }
+
+    private func extractGeminiSessionID(
+        from url: URL,
+        directory: String?,
+        bucketName: String?,
+        expectedBucket: String?,
+        hasProviderPeer: Bool
+    ) -> String? {
+        guard QuotaParsing.safePath(url) else { return nil }
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size > 0, info.st_size <= 256 * 1024 else {
+            return nil
+        }
+        let readCount = min(Int(info.st_size), 64 * 1024)
+        var data = Data(count: readCount)
+        let n = data.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, readCount) }
+        guard n > 0 else { return nil }
+        data.count = n
+
+        let decoder = JSONDecoder()
+        let header: GeminiHeader?
+        if url.pathExtension == "json" {
+            header = try? decoder.decode(GeminiHeader.self, from: data)
+        } else {
+            let firstLine = data.split(separator: 10, maxSplits: 1).first.map { Data($0) } ?? data
+            header = try? decoder.decode(GeminiHeader.self, from: firstLine)
+        }
+
+        if let directory {
+            if let metaDir = header?.cwd ?? header?.projectRoot, metaDir.hasPrefix("/") {
+                guard URL(fileURLWithPath: metaDir).standardizedFileURL.path == directory else { return nil }
+            } else if hasProviderPeer {
+                guard let bucketName, let expectedBucket, bucketName == expectedBucket else { return nil }
+            }
+        }
+
+        if let rawID = header?.sessionId ?? header?.session_id ?? header?.sessionID,
+           let valid = AgentContextValidation.sessionID(rawID) {
+            return valid
+        }
+        let stem = url.deletingPathExtension().lastPathComponent
+        if stem.hasPrefix("session-"), let valid = AgentContextValidation.sessionID(String(stem.dropFirst(8))) {
+            return valid
+        }
+        return AgentContextValidation.sessionID(stem)
     }
 }
 

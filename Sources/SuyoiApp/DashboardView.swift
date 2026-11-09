@@ -12,7 +12,12 @@ struct DashboardView: View {
             header
             tabBar
                 .padding(.horizontal, 14)
-                .padding(.bottom, 10)
+                .padding(.bottom, model.tab == .quotas ? 10 : 6)
+            if model.tab != .quotas {
+                searchBar
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
+            }
             if let release = model.availableUpdate {
                 updateBar(release)
                     .padding(.horizontal, 14)
@@ -267,6 +272,43 @@ struct DashboardView: View {
         return "\(tab.rawValue) (\(count))"
     }
 
+    private var searchBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+            TextField(
+                model.tab == .agents
+                    ? "Filter agents by project, branch, task, PID…"
+                    : (model.tab == .ports ? "Filter servers by port, framework, project…" : "Filter caches or build folders…"),
+                text: $model.searchQuery
+            )
+            .textFieldStyle(.plain)
+            .font(.system(size: 11))
+            if !model.searchQuery.isEmpty {
+                Button {
+                    model.searchQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear filter")
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(
+            Color(nsColor: .controlBackgroundColor),
+            in: RoundedRectangle(cornerRadius: ThemeStyling.cardCornerRadius(for: model.experienceTheme), style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: ThemeStyling.cardCornerRadius(for: model.experienceTheme), style: .continuous)
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 0.6)
+        )
+    }
+
     // MARK: - Agents Section
 
     private var agentsSection: some View {
@@ -290,10 +332,10 @@ struct DashboardView: View {
                 trailing: "Focus · steer · reveal · stop"
             )
             if model.snapshot != nil {
-                let rows = model.agentRows
+                let rows = model.filteredAgentRows
                 if rows.isEmpty {
                     emptyState(
-                        "No active coding agents found",
+                        model.searchQuery.isEmpty ? "No active coding agents found" : "No agents match '\(model.searchQuery)'",
                         detail: "Supported agents (Claude Code, Codex, OpenCode, Gemini CLI, Antigravity CLI, Hermes Agent, Qwen Code, Kimi CLI, OpenClaw, Pi, Aider, Cursor, Windsurf, Copilot, Goose, Amp, Droid, Kiro) will appear here when running.",
                         symbol: "terminal"
                     )
@@ -303,6 +345,8 @@ struct DashboardView: View {
                         AgentCardRow(
                             obs: row,
                             visualProfile: model.visualProfile(for: row.agentName),
+                            mascotState: model.mascotState(for: row),
+                            theme: model.experienceTheme,
                             turnPreview: model.turnPreview(for: row),
                             isAutoApproved: model.isSessionAutoApproved(row.sessionID),
                             quotaItem: model.combinedQuotaItem(forAgentName: row.agentName),
@@ -335,11 +379,11 @@ struct DashboardView: View {
                 trailing: "Open localhost · copy URL · stop"
             )
             if model.snapshot != nil {
-                let devGroups = model.developmentServerGroups
-                let other = model.otherListeners
-                if devGroups.isEmpty {
+                let devGroups = model.filteredDevelopmentServerGroups
+                let other = model.filteredOtherListeners
+                if devGroups.isEmpty && (other.isEmpty || model.searchQuery.isEmpty) {
                     emptyState(
-                        "No development servers active",
+                        model.searchQuery.isEmpty ? "No development servers active" : "No servers match '\(model.searchQuery)'",
                         detail: "Local Node, Vite, Next.js, Python, Rust, Go, and Swift servers listening on TCP ports will be grouped here.",
                         symbol: "network"
                     )
@@ -348,6 +392,7 @@ struct DashboardView: View {
                         let rowID = "server-\(group.id)"
                         ServerGroupCardRow(
                             group: group,
+                            theme: model.experienceTheme,
                             healthBadge: model.serverHealthBadge(for: group),
                             namedURL: model.namedServerURL(for: group),
                             isHovered: model.hoveredRowID == rowID,
@@ -545,25 +590,74 @@ struct DashboardView: View {
                 .surfaceCardStyle(isHovered: false)
             }
 
+            if !model.staleSessionLogs.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color(nsColor: .systemOrange))
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text("\(model.staleSessionLogs.count) stale session log\(model.staleSessionLogs.count == 1 ? "" : "s") (>\(model.sessionLogRetentionDays)d)")
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text("\(formatBytes(model.totalStaleSessionLogBytes)) in inactive Codex / Claude JSONL transcripts")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        model.trashAllStaleSessionLogs()
+                    } label: {
+                        Label("Trash Stale (\(formatBytes(model.totalStaleSessionLogBytes)))", systemImage: "trash")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(model.isPerformingAction)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .themedSurfaceCard(theme: model.experienceTheme, isHovered: false)
+            }
+
             if let report = model.cleanup {
                 HStack(spacing: 6) {
                     Text("\(formatBytes(model.totalCleanupBytes)) observed")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(leafGreen)
-                    Text("· \(model.reviewableCleanupCandidates.count) ready for Trash (\(report.discoveredCount) total)")
+                    Text("· \(model.reviewableCleanupCandidates.count) ready (\(report.discoveredCount) total)")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                     Spacer()
                     if !model.reviewableCleanupCandidates.isEmpty {
                         Button {
-                            model.trashAllReviewable()
+                            model.selectAllReviewableCandidates()
                         } label: {
-                            Label("Trash Ready (\(formatBytes(model.totalReviewableBytes)))", systemImage: "trash")
-                                .font(.system(size: 10, weight: .semibold))
+                            Text(model.selectedReviewableCandidates.count == model.reviewableCleanupCandidates.count ? "Deselect" : "Select Ready")
+                                .font(.system(size: 9.5, weight: .medium))
                         }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(.bordered)
                         .controlSize(.mini)
-                        .disabled(model.isPerformingAction)
+
+                        if !model.selectedReviewableCandidates.isEmpty {
+                            Button {
+                                model.trashSelectedCandidates()
+                            } label: {
+                                Label("Trash Selected (\(model.selectedReviewableCandidates.count) · \(formatBytes(model.selectedReviewableBytes)))", systemImage: "trash")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                            .disabled(model.isPerformingAction)
+                        } else {
+                            Button {
+                                model.trashAllReviewable()
+                            } label: {
+                                Label("Trash Ready (\(formatBytes(model.totalReviewableBytes)))", systemImage: "trash")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                            .disabled(model.isPerformingAction)
+                        }
                     }
                 }
                 .padding(.horizontal, 10)
@@ -582,12 +676,15 @@ struct DashboardView: View {
                         let rowID = "cleanup-\(candidate.id)"
                         CleanupCandidateCardRow(
                             candidate: candidate,
+                            theme: model.experienceTheme,
                             assessment: model.assessment(for: candidate),
                             diagnostic: model.diagnosticDetail(for: candidate),
                             isHighImpact: model.isHighImpactCandidate(candidate),
+                            isSelected: model.isCandidateSelected(candidate),
                             isRechecking: model.recheckingCandidateIDs.contains(candidate.id),
                             isHovered: model.hoveredRowID == rowID,
                             onHover: { model.hoveredRowID = $0 ? rowID : (model.hoveredRowID == rowID ? nil : model.hoveredRowID) },
+                            onToggleSelect: { model.toggleCandidateSelection(candidate) },
                             onTrash: { model.trashCandidate(candidate) },
                             onRecheck: { model.recheckCandidate(candidate) },
                             onOpenPreview: { model.isShowingCleanupPreview = true }
@@ -819,6 +916,8 @@ private struct PendingApprovalCardView: View {
 private struct AgentCardRow: View {
     let obs: AgentObservation
     let visualProfile: AgentClientVisualProfile
+    let mascotState: MascotAnimationState
+    let theme: SuyoiExperienceTheme
     let turnPreview: SessionTurnPreview?
     let isAutoApproved: Bool
     let quotaItem: CombinedProviderQuotaItem?
@@ -885,7 +984,7 @@ private struct AgentCardRow: View {
                             HStack(spacing: 5) {
                                 Text(obs.agentName)
                                     .font(.system(size: 12.5, weight: .semibold))
-                                statusBadge(badgeInfo.label, tint: badgeInfo.tint)
+                                PixelMascotBadgeView(state: mascotState, theme: theme)
                                 if isAutoApproved {
                                     statusBadge("Auto-OK", tint: leafGreen)
                                 }
@@ -1088,13 +1187,14 @@ private struct AgentCardRow: View {
         }
         .padding(.horizontal, 11)
         .padding(.vertical, 9)
-        .surfaceCardStyle(isHovered: isHovered)
+        .themedSurfaceCard(theme: theme, isHovered: isHovered)
         .onHover(perform: onHover)
     }
 }
 
 private struct ServerGroupCardRow: View {
     let group: ServerGroup
+    let theme: SuyoiExperienceTheme
     let healthBadge: ServerHealthBadge?
     let namedURL: URL?
     let isHovered: Bool
@@ -1260,19 +1360,22 @@ private struct ServerGroupCardRow: View {
         }
         .padding(.horizontal, 11)
         .padding(.vertical, 9)
-        .surfaceCardStyle(isHovered: isHovered)
+        .themedSurfaceCard(theme: theme, isHovered: isHovered)
         .onHover(perform: onHover)
     }
 }
 
 private struct CleanupCandidateCardRow: View {
     let candidate: CleanupCandidate
+    let theme: SuyoiExperienceTheme
     let assessment: SafetyAssessment?
     let diagnostic: SafetyDiagnosticDetail?
     let isHighImpact: Bool
+    let isSelected: Bool
     let isRechecking: Bool
     let isHovered: Bool
     let onHover: (Bool) -> Void
+    let onToggleSelect: () -> Void
     let onTrash: () -> Void
     let onRecheck: () -> Void
     let onOpenPreview: () -> Void
@@ -1297,6 +1400,16 @@ private struct CleanupCandidateCardRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .center, spacing: 6) {
+                if isReviewable {
+                    Button(action: onToggleSelect) {
+                        Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(isSelected ? leafGreen : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(isSelected ? "Deselect item" : "Select item for batch Trash")
+                }
+
                 Image(systemName: candidate.scope == .agentCache ? "sparkles.rectangle.stack" : "hammer.fill")
                     .font(.system(size: 10.5))
                     .foregroundStyle(leafGreen)
@@ -1416,7 +1529,7 @@ private struct CleanupCandidateCardRow: View {
         }
         .padding(.horizontal, 11)
         .padding(.vertical, 8)
-        .surfaceCardStyle(isHovered: isHovered)
+        .themedSurfaceCard(theme: theme, isHovered: isHovered)
         .onHover(perform: onHover)
     }
 }

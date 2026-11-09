@@ -5,6 +5,8 @@ import SuyoiCore
 
 @MainActor
 final class SoundEffectPlayer {
+    private var activeSound: NSSound?
+
     func play(
         _ event: SuyoiAudioEvent,
         mode: SuyoiSoundMode,
@@ -13,17 +15,45 @@ final class SoundEffectPlayer {
     ) {
         guard mode != .muted else { return }
 
-        if mode == .soundPack,
-           let pack = selectedPack,
-           let relativeOrFullPath = pack.eventSoundPaths[event],
-           let resolvedPath = Self.resolveValidatedAudioPath(relativeOrFullPath, inPackDirectory: pack.directoryPath),
-           let sound = NSSound(contentsOfFile: resolvedPath, byReference: true) {
-            sound.play()
-            return
+        if mode == .soundPack {
+            if let pack = selectedPack,
+               let relativeOrFullPath = pack.eventSoundPaths[event],
+               let resolvedPath = Self.resolveValidatedAudioPath(relativeOrFullPath, inPackDirectory: pack.directoryPath),
+               let sound = NSSound(contentsOfFile: resolvedPath, byReference: true) {
+                activeSound = sound
+                sound.play()
+                return
+            }
+
+            let wavData = Self.synthesizedRetroWAV(for: event, theme: theme)
+            if let sound = NSSound(data: wavData) {
+                activeSound = sound
+                sound.play()
+                return
+            }
+        }
+
+        if mode == .systemSounds && (theme == .pixelArcade || theme == .pixelOlive) {
+            let wavData = Self.synthesizedRetroWAV(for: event, theme: theme)
+            if let sound = NSSound(data: wavData) {
+                activeSound = sound
+                sound.play()
+                return
+            }
         }
 
         let soundName = ExperienceThemeCatalog.systemSoundName(for: event, theme: theme)
-        NSSound(named: NSSound.Name(soundName))?.play()
+        if let sound = NSSound(named: NSSound.Name(soundName)) {
+            activeSound = sound
+            sound.play()
+        }
+    }
+
+    static func synthesizedRetroWAV(
+        for event: SuyoiAudioEvent,
+        theme: SuyoiExperienceTheme
+    ) -> Data {
+        ChiptuneWaveformGenerator.wavData(for: event, theme: theme)
     }
 
     private static func resolveValidatedAudioPath(_ path: String, inPackDirectory directoryPath: String) -> String? {

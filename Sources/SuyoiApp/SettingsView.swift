@@ -134,6 +134,33 @@ struct SettingsView: View {
 
                     HStack(alignment: .center, spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
+                            Text("Menu Bar Badge Style")
+                                .font(.system(size: 11.5, weight: .medium))
+                            Text("Configure status item title: icon only, counts, quota %, or agent RAM.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 6)
+                        Picker("", selection: Binding(
+                            get: { model.statusBarStyle },
+                            set: { model.setStatusBarStyle($0) }
+                        )) {
+                            ForEach(StatusBarDisplayStyle.allCases, id: \.self) { style in
+                                Text(style.rawValue).tag(style)
+                            }
+                        }
+                        .labelsHidden()
+                        .controlSize(.small)
+                        .frame(width: 165)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+
+                    Divider()
+                        .padding(.leading, 12)
+
+                    HStack(alignment: .center, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
                             Text("Experience Theme")
                                 .font(.system(size: 11.5, weight: .medium))
                             Text("Switches accent palette, card geometry, and pixel/monospaced styling.")
@@ -198,7 +225,7 @@ struct SettingsView: View {
                                 Text("OpenPeon Sound Pack")
                                     .font(.system(size: 11.5, weight: .medium))
                                 Text(model.availableSoundPacks.isEmpty
-                                     ? "No packs found in ~/.openpeon/packs (falling back to macOS sounds)."
+                                     ? "No packs found in ~/.openpeon/packs (install built-in 8-bit pack or rescan)."
                                      : "\(model.availableSoundPacks.count) CESP pack(s) discovered.")
                                     .font(.system(size: 10))
                                     .foregroundStyle(.secondary)
@@ -215,8 +242,15 @@ struct SettingsView: View {
                                 }
                                 .labelsHidden()
                                 .controlSize(.small)
-                                .frame(width: 140)
+                                .frame(width: 120)
                             }
+                            Button("Install 8-Bit") {
+                                model.installBuiltInRetroSoundPack()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .help("Install and activate the built-in Suyoi 8-Bit Chiptune OpenPeon pack")
+
                             Button("Rescan") {
                                 model.reloadSoundPacks()
                             }
@@ -230,20 +264,39 @@ struct SettingsView: View {
                     Divider()
                         .padding(.leading, 12)
 
-                    HStack(alignment: .center, spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("In-Panel Tool Approval Hook")
-                                .font(.system(size: 11.5, weight: .medium))
-                            Text("Copy read-only hook command snippet for Claude Code / Codex approval cards.")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .center, spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("In-Panel Tool Approval Hook")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                Text("Copy hook command (`SuyoiApp --hook-bridge`) or test approval cards.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 6)
+                            Button("Copy Hook Snippet") {
+                                model.copyHookSnippet()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                         }
-                        Spacer(minLength: 6)
-                        Button("Copy Hook Snippet") {
-                            model.copyHookSnippet()
+                        HStack(spacing: 6) {
+                            Button("Simulate Approval") {
+                                model.simulateApprovalRequest(isQuestion: false)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                            .help("Queue a simulated tool permission card in the Agents tab and Notch Island")
+
+                            Button("Simulate Question") {
+                                model.simulateApprovalRequest(isQuestion: true)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                            .help("Queue a simulated interactive multi-option question card")
+
+                            Spacer()
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)

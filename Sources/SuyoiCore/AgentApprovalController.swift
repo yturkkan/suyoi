@@ -115,6 +115,17 @@ public final class AgentApprovalController: @unchecked Sendable {
         lock.withLock { entries.map(\.request) }
     }
 
+    /// Removes pending requests older than `maxAge` and notifies their responders with a block decision.
+    @discardableResult
+    public func pruneExpiredRequests(olderThan maxAge: TimeInterval = 180, now: Date = Date()) -> Int {
+        guard maxAge.isFinite, maxAge > 0 else { return 0 }
+        let expired: [Entry] = lock.withLock {
+            removeEntries { now.timeIntervalSince($0.request.requestedAt) > maxAge }
+        }
+        respond(to: expired, with: Reply(decision: "block", reason: "Approval request expired"))
+        return expired.count
+    }
+
     public func isSessionAutoApproved(_ sessionID: String) -> Bool {
         lock.withLock { autoApprovedSessions.contains(sessionID) }
     }

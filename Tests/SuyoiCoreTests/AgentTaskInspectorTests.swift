@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SQLite3
 import Testing
@@ -140,5 +141,40 @@ struct AgentTaskInspectorTests {
         #expect(inspect(f).sessionID == nil)
         try f.write([["type": "session_meta", "payload": ["id": "safe", "cwd": "/project"]]], to: ".codex/sessions/2026/11/07/safe.jsonl")
         #expect(inspect(f, rows: [process(), process(pid: 402)]).sessionID == nil)
+    }
+
+    @Test func geminiSessionIDDiscoveryAndPeerDisambiguation() throws {
+        let f = try QuotaFixture(); defer { f.clean() }
+        let projectPath = "/workspace/a/project"
+        let bucketHash = SHA256.hash(data: Data(projectPath.utf8)).map { String(format: "%02x", $0) }.joined()
+        let doc = try JSONSerialization.data(withJSONObject: [
+            "sessionId": "gem-session-42",
+            "messages": [["role": "model", "text": "Ready"]]
+        ])
+        try f.write(doc, to: ".gemini/tmp/\(bucketHash)/chats/session-gem-session-42.json")
+        let geminiProc = process("gemini", pid: 500, cwd: projectPath)
+        let inspector = AgentTaskInspector(homeDirectory: f.home)
+        let singleContext = inspector.inspect(
+            agentName: "Gemini CLI",
+            process: geminiProc,
+            projectRoot: projectPath,
+            allProcesses: [geminiProc]
+        )
+        #expect(singleContext.sessionID == "gem-session-42")
+        let sameBasenamePeer = process("gemini", pid: 501, cwd: "/workspace/b/project")
+        let matchedPeerContext = inspector.inspect(
+            agentName: "Gemini CLI",
+            process: geminiProc,
+            projectRoot: projectPath,
+            allProcesses: [geminiProc, sameBasenamePeer]
+        )
+        #expect(matchedPeerContext.sessionID == "gem-session-42")
+        let unmatchedPeerContext = inspector.inspect(
+            agentName: "Gemini CLI",
+            process: sameBasenamePeer,
+            projectRoot: "/workspace/b/project",
+            allProcesses: [geminiProc, sameBasenamePeer]
+        )
+        #expect(unmatchedPeerContext.sessionID == nil)
     }
 }

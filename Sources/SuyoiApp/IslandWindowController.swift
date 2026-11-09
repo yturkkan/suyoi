@@ -10,9 +10,14 @@ struct IslandSurfaceSnapshot: Equatable {
     let primaryAgentName: String?
     let primaryAgentTask: String?
     let isWaitingForInput: Bool
+    var firstApprovalID: String? = nil
+    var firstApprovalToolName: String? = nil
+    var firstApprovalSummary: String? = nil
+    var firstApprovalIsQuestion: Bool = false
+    var theme: SuyoiExperienceTheme = .nativeGlass
 
     fileprivate var needsAttention: Bool {
-        waitingAgentCount > 0 || pendingApprovalCount > 0 || isWaitingForInput
+        firstApprovalID != nil || waitingAgentCount > 0 || pendingApprovalCount > 0 || isWaitingForInput
     }
 
     fileprivate var agentName: String {
@@ -40,6 +45,14 @@ struct IslandSurfaceSnapshot: Equatable {
         return "Waiting for input"
     }
 
+    fileprivate var approvalToolName: String {
+        firstApprovalToolName.flatMap(Self.displayText) ?? "Approval required"
+    }
+
+    fileprivate var approvalSummary: String {
+        firstApprovalSummary.flatMap(Self.displayText) ?? "Review the pending action"
+    }
+
     private static func displayText(_ text: String) -> String? {
         let bounded = String(text.prefix(256))
         let clean = String(bounded.unicodeScalars.filter {
@@ -53,11 +66,16 @@ struct IslandSurfaceSnapshot: Equatable {
 final class IslandWindowController: NSObject {
     var onOpenDashboard: () -> Void
     var onFocusPrimaryAgent: () -> Void
+    var onApprovePending: ((String) -> Void)?
+    var onDenyPending: ((String) -> Void)?
 
     private let state = IslandSurfaceState()
     private var mode: SuyoiSurfaceMode = .menuBarPopover
     private var notchPanel: IslandPanel?
     private var buddyPanel: IslandPanel?
+    private var isAdjustingBuddyPosition = false
+    private static let buddyOriginXKey = "suyoi.floatingBuddyOriginX"
+    private static let buddyOriginYKey = "suyoi.floatingBuddyOriginY"
 
     init(
         onOpenDashboard: @escaping () -> Void = {},
@@ -89,6 +107,7 @@ final class IslandWindowController: NSObject {
             if state.snapshot != snapshot { state.snapshot = snapshot }
             state.showsNotch = mode == .notchIsland
             state.showsBuddy = mode == .floatingBuddy
+            if mode != .notchIsland { state.isNotchHovered = false }
         }
 
         switch mode {
@@ -124,6 +143,7 @@ final class IslandWindowController: NSObject {
     private func hidePanels() {
         state.showsNotch = false
         state.showsBuddy = false
+        state.isNotchHovered = false
         notchPanel?.orderOut(nil)
         buddyPanel?.orderOut(nil)
     }
@@ -131,9 +151,19 @@ final class IslandWindowController: NSObject {
     private func makeNotchPanelIfNeeded() -> IslandPanel {
         if let notchPanel { return notchPanel }
         let panel = IslandPanel(size: NSSize(width: 220, height: 32))
-        let host = IslandHostingView(rootView: NotchIslandView(state: state) { [weak self] in
-            self?.onOpenDashboard()
-        })
+        let host = IslandHostingView(rootView: NotchIslandView(
+            state: state,
+            onOpen: { [weak self] in self?.onOpenDashboard() },
+            onHover: { [weak self] in self?.setNotchHovered($0) },
+            onApprove: { [weak self] id in
+                guard let self, self.state.snapshot.firstApprovalID == id else { return }
+                self.onApprovePending?(id)
+            },
+            onDeny: { [weak self] id in
+                guard let self, self.state.snapshot.firstApprovalID == id else { return }
+                self.onDenyPending?(id)
+            }
+        ))
         host.sizingOptions = []
         panel.contentView = host
         panel.setAccessibilityLabel("Suyoi status island")
@@ -154,17 +184,46 @@ final class IslandWindowController: NSObject {
         host.sizingOptions = []
         panel.contentView = host
         panel.setAccessibilityLabel("Suyoi floating companion")
-        panel.setFrameOrigin(NSPoint(
+        var origin = NSPoint(
             x: screen.visibleFrame.maxX - 190 - 16,
             y: screen.visibleFrame.maxY - 56 - 16
-        ))
+        )
+        let defaults = UserDefaults.standard
+        if let x = defaults.object(forKey: Self.buddyOriginXKey) as? NSNumber,
+           let y = defaults.object(forKey: Self.buddyOriginYKey) as? NSNumber,
+           x.doubleValue.isFinite, y.doubleValue.isFinite {
+            origin = NSPoint(x: x.doubleValue, y: y.doubleValue)
+        }
+        panel.setFrameOrigin(origin)
+        keepBuddyOnScreen(panel, fallback: screen)
         buddyPanel = panel
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(buddyPanelDidMove),
+            name: NSWindow.didMoveNotification, object: panel
+        )
         return panel
     }
 
+    private func setNotchHovered(_ hovered: Bool) {
+        guard mode == .notchIsland, state.isNotchHovered != hovered else { return }
+        let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        withAnimation(animate ? .easeInOut(duration: 0.24) : nil) {
+            state.isNotchHovered = hovered
+        }
+        guard let panel = notchPanel,
+              let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        positionNotch(panel, on: screen, animated: animate)
+    }
+
     private func positionNotch(_ panel: NSPanel, on screen: NSScreen, animated: Bool) {
-        let size = state.snapshot.needsAttention
-            ? NSSize(width: 390, height: 92) : NSSize(width: 220, height: 32)
+        let size: NSSize
+        if state.snapshot.firstApprovalID != nil {
+            size = NSSize(width: 410, height: 104)
+        } else if state.isNotchExpanded {
+            size = NSSize(width: 390, height: 92)
+        } else {
+            size = NSSize(width: 220, height: 32)
+        }
         // Keep the content below the physical camera cutout on built-in displays.
         let top = screen.frame.maxY - screen.safeAreaInsets.top
         let frame = NSRect(
@@ -183,16 +242,22 @@ final class IslandWindowController: NSObject {
     }
 
     private func keepBuddyOnScreen(_ panel: NSPanel, fallback: NSScreen) {
+        guard !isAdjustingBuddyPosition else { return }
+        isAdjustingBuddyPosition = true
+        defer { isAdjustingBuddyPosition = false }
         let screen = NSScreen.screens.max {
             intersectionArea(panel.frame, $0.visibleFrame)
                 < intersectionArea(panel.frame, $1.visibleFrame)
         }.flatMap { intersectionArea(panel.frame, $0.visibleFrame) > 0 ? $0 : nil }
             ?? fallback
-        let bounds = screen.visibleFrame.insetBy(dx: 8, dy: 8)
-        panel.setFrameOrigin(NSPoint(
-            x: min(max(panel.frame.minX, bounds.minX), max(bounds.minX, bounds.maxX - panel.frame.width)),
-            y: min(max(panel.frame.minY, bounds.minY), max(bounds.minY, bounds.maxY - panel.frame.height))
-        ))
+        let origin = IslandSurfaceCalculator.clampedFloatingOrigin(
+            proposed: panel.frame.origin,
+            panelSize: panel.frame.size,
+            visibleFrame: screen.visibleFrame
+        )
+        if panel.frame.origin != origin { panel.setFrameOrigin(origin) }
+        UserDefaults.standard.set(Double(origin.x), forKey: Self.buddyOriginXKey)
+        UserDefaults.standard.set(Double(origin.y), forKey: Self.buddyOriginYKey)
     }
 
     private func intersectionArea(_ lhs: NSRect, _ rhs: NSRect) -> CGFloat {
@@ -202,6 +267,12 @@ final class IslandWindowController: NSObject {
 
     @objc private func screenParametersChanged(_ notification: Notification) {
         setMode(mode, snapshot: state.snapshot)
+    }
+
+    @objc private func buddyPanelDidMove(_ notification: Notification) {
+        guard let panel = buddyPanel, notification.object as? NSWindow === panel,
+              let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        keepBuddyOnScreen(panel, fallback: screen)
     }
 }
 
@@ -214,6 +285,14 @@ private final class IslandSurfaceState: ObservableObject {
     )
     @Published var showsNotch = false
     @Published var showsBuddy = false
+    @Published var isNotchHovered = false
+
+    var isNotchExpanded: Bool { isNotchHovered || snapshot.needsAttention }
+
+    var accentColor: Color {
+        let tokens = ExperienceThemeCatalog.tokens(for: snapshot.theme)
+        return Color(red: tokens.accentRed, green: tokens.accentGreen, blue: tokens.accentBlue)
+    }
 }
 
 @MainActor
@@ -250,59 +329,114 @@ private final class IslandHostingView<Content: View>: NSHostingView<Content> {
 private struct NotchIslandView: View {
     @ObservedObject var state: IslandSurfaceState
     let onOpen: () -> Void
+    let onHover: (Bool) -> Void
+    let onApprove: (String) -> Void
+    let onDeny: (String) -> Void
 
     var body: some View {
-        Button(action: onOpen) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 6) {
-                    IslandActivityGlyph(
-                        attention: state.snapshot.needsAttention,
-                        animating: state.showsNotch && (state.snapshot.activeAgentCount > 0 || state.snapshot.needsAttention)
-                    )
-                    Text("\(max(0, state.snapshot.activeAgentCount)) active")
-                    Text("· \(max(0, state.snapshot.waitingAgentCount)) waiting")
-                        .foregroundStyle(.white.opacity(0.65))
-                    Spacer(minLength: 4)
-                    Image(systemName: "server.rack")
-                    Text("\(max(0, state.snapshot.serverCount))")
-                }
-                .font(.system(size: 10, weight: .medium, design: .rounded))
-                .monospacedDigit()
-                .frame(height: 16)
-
-                if state.snapshot.needsAttention {
-                    HStack(spacing: 10) {
-                        Image(systemName: "hand.raised.fill")
-                            .foregroundStyle(.orange)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(state.snapshot.agentName)
-                                .font(.system(size: 12, weight: .semibold))
-                            Text(state.snapshot.attentionSummary)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.7))
-                        }
-                        Spacer(minLength: 0)
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.6))
+        VStack(alignment: .leading, spacing: 8) {
+            Button(action: onOpen) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        IslandActivityGlyph(
+                            attention: state.snapshot.needsAttention,
+                            animating: state.showsNotch && (state.snapshot.activeAgentCount > 0 || state.snapshot.needsAttention),
+                            accent: state.accentColor
+                        )
+                        Text("\(max(0, state.snapshot.activeAgentCount)) active")
+                        Text("· \(max(0, state.snapshot.waitingAgentCount)) waiting")
+                            .foregroundStyle(.white.opacity(0.65))
+                        Spacer(minLength: 4)
+                        Image(systemName: "server.rack")
+                        Text("\(max(0, state.snapshot.serverCount))")
                     }
-                    .transition(.opacity)
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .frame(height: 16)
+
+                    if state.isNotchExpanded {
+                        HStack(spacing: 10) {
+                            Image(systemName: state.snapshot.needsAttention ? "hand.raised.fill" : "sparkles")
+                                .foregroundStyle(state.accentColor)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(state.snapshot.firstApprovalID != nil
+                                     ? state.snapshot.approvalToolName : state.snapshot.agentName)
+                                    .font(.system(size: 12, weight: .semibold))
+                                Text(state.snapshot.firstApprovalID != nil
+                                     ? state.snapshot.approvalSummary
+                                     : (state.snapshot.needsAttention
+                                        ? state.snapshot.attentionSummary : state.snapshot.taskSummary))
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.white.opacity(0.7))
+                            }
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.6))
+                        }
+                        .frame(height: 32)
+                        .transition(.opacity)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .lineLimit(1)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .contentShape(RoundedRectangle(cornerRadius: 16))
+            .buttonStyle(.plain)
+            .help("Open Suyoi dashboard")
+            .accessibilityLabel("Open Suyoi dashboard")
+            .accessibilityValue("\(max(0, state.snapshot.activeAgentCount)) active agents, \(max(0, state.snapshot.waitingAgentCount)) waiting, \(max(0, state.snapshot.pendingApprovalCount)) pending approvals, \(max(0, state.snapshot.serverCount)) servers")
+
+            if let approvalID = state.snapshot.firstApprovalID {
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    Button { onDeny(approvalID) } label: {
+                        Label("Deny", systemImage: "xmark")
+                            .padding(.horizontal, 12)
+                            .frame(height: 24)
+                            .background(Color.red.opacity(0.22), in: Capsule())
+                    }
+                    .foregroundStyle(Color.red)
+                    .accessibilityLabel("Deny pending approval")
+                    if state.snapshot.firstApprovalIsQuestion {
+                        Button(action: onOpen) {
+                            Label("Choose Option…", systemImage: "list.bullet")
+                                .padding(.horizontal, 12)
+                                .frame(height: 24)
+                                .background(state.accentColor, in: Capsule())
+                        }
+                        .foregroundStyle(Color.black)
+                        .accessibilityLabel("Choose question option in dashboard")
+                    } else {
+                        Button { onApprove(approvalID) } label: {
+                            Label("Approve", systemImage: "checkmark")
+                                .padding(.horizontal, 12)
+                                .frame(height: 24)
+                                .background(Color.green, in: Capsule())
+                        }
+                        .foregroundStyle(Color.black)
+                        .accessibilityLabel("Approve pending approval")
+                    }
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .buttonStyle(.plain)
+                .transition(.opacity)
+            }
         }
-        .buttonStyle(.plain)
+        .lineLimit(1)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .contentShape(RoundedRectangle(cornerRadius: 16))
+        .onHover(perform: onHover)
         .foregroundStyle(.white)
         .background(.black, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(state.accentColor.opacity(state.isNotchHovered ? 0.6 : 0.2), lineWidth: 1)
+                .allowsHitTesting(false)
+        }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .preferredColorScheme(.dark)
-        .help("Open Suyoi dashboard")
-        .accessibilityLabel("Open Suyoi dashboard")
-        .accessibilityValue("\(max(0, state.snapshot.activeAgentCount)) active agents, \(max(0, state.snapshot.waitingAgentCount)) waiting, \(max(0, state.snapshot.pendingApprovalCount)) pending approvals, \(max(0, state.snapshot.serverCount)) servers")
     }
 }
 
@@ -317,6 +451,7 @@ private struct FloatingBuddyView: View {
             IslandActivityGlyph(
                 attention: state.snapshot.needsAttention,
                 animating: state.showsBuddy && (state.snapshot.activeAgentCount > 0 || state.snapshot.needsAttention),
+                accent: state.accentColor,
                 mascot: true
             )
             VStack(alignment: .leading, spacing: 3) {
@@ -346,14 +481,14 @@ private struct FloatingBuddyView: View {
             }
             .font(.system(size: 12, weight: .medium))
             .buttonStyle(.borderless)
-            .tint(.white)
+            .tint(state.accentColor)
         }
         .padding(.horizontal, 10)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(white: 0.06), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(.white.opacity(0.12), lineWidth: 1)
+                .strokeBorder(state.accentColor.opacity(0.3), lineWidth: 1)
                 .allowsHitTesting(false)
         }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -366,6 +501,7 @@ private struct IslandActivityGlyph: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let attention: Bool
     let animating: Bool
+    let accent: Color
     var mascot = false
 
     var body: some View {
@@ -386,7 +522,7 @@ private struct IslandActivityGlyph: View {
                         .frame(width: 8, height: 12)
                 }
             }
-            .foregroundStyle(attention ? Color.orange : (animating ? Color.green : Color.gray))
+            .foregroundStyle(attention ? Color.orange : (animating ? accent : Color.gray))
         }
         .accessibilityHidden(true)
     }

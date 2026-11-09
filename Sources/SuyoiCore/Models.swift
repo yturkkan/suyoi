@@ -589,7 +589,7 @@ public struct TrashExecutionReport: Codable, Equatable, Sendable {
     }
 }
 
-// MARK: - Phase 3 quota contracts
+// MARK: - Quota contracts
 
 public enum QuotaProvider: String, Codable, CaseIterable, Equatable, Sendable {
     case codex, claude, gemini, openCode, cursor

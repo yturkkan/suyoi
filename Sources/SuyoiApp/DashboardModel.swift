@@ -92,6 +92,11 @@ final class DashboardModel: ObservableObject {
     @Published var selectedSoundPackID: String?
     @Published var pendingApprovals: [PendingApprovalRequest] = []
     @Published var agentTurnPreviews: [Int: SessionTurnPreview] = [:]
+    @Published var searchQuery: String = ""
+    @Published var statusBarStyle: StatusBarDisplayStyle
+    @Published var selectedCleanupCandidateIDs: Set<String> = []
+    @Published var staleSessionLogs: [StaleSessionLogSummary] = []
+    @Published var sessionLogRetentionDays: Int = 14
 
     private static let providerOrderKey = "suyoi.quotaProviderOrder"
     private static let hiddenProvidersKey = "suyoi.hiddenQuotaProviders"
@@ -103,6 +108,7 @@ final class DashboardModel: ObservableObject {
     private static let experienceThemeKey = "suyoi.experienceTheme"
     private static let soundModeKey = "suyoi.soundMode"
     private static let selectedSoundPackIDKey = "suyoi.selectedSoundPackID"
+    private static let statusBarStyleKey = "suyoi.statusBarStyle"
 
     let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
     private let inspector = SystemInspector()
@@ -117,6 +123,7 @@ final class DashboardModel: ObservableObject {
     private let turnPreviewInspector = SessionTurnPreviewInspector()
     private let approvalController = AgentApprovalController()
     private let soundPlayer = SoundEffectPlayer()
+    private var approvalInboxWatcher: ApprovalInboxWatcher?
     private var previousAgentStates: [Int: AgentActivityState] = [:]
     private var hasCompletedInitialRefresh = false
     private var alertTracker = AlertStateTracker()
@@ -210,6 +217,21 @@ final class DashboardModel: ObservableObject {
         } else {
             self.selectedSoundPackID = discoveredPacks.first?.id
         }
+        if let rawStatusBarStyle = UserDefaults.standard.string(forKey: Self.statusBarStyleKey),
+           let style = StatusBarDisplayStyle(rawValue: rawStatusBarStyle) {
+            self.statusBarStyle = style
+        } else {
+            self.statusBarStyle = .agentsAndServers
+        }
+        let watcher = ApprovalInboxWatcher(
+            inboxDirectory: HookBridgeClient.defaultInboxDirectory(homeDirectory: home)
+        ) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.pollApprovalInboxSpool()
+            }
+        }
+        self.approvalInboxWatcher = watcher
+        watcher.start()
     }
 
     var agentRows: [AgentObservation] {
@@ -228,6 +250,10 @@ final class DashboardModel: ObservableObject {
                 childServerPorts: []
             )
         }
+    }
+
+    var filteredAgentRows: [AgentObservation] {
+        DashboardFilterAndBadgeFormatter.filterAgents(agentRows, query: searchQuery)
     }
 
     var developmentServerGroups: [ServerGroup] {
@@ -255,10 +281,18 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    var filteredDevelopmentServerGroups: [ServerGroup] {
+        DashboardFilterAndBadgeFormatter.filterServers(developmentServerGroups, query: searchQuery)
+    }
+
     var otherListeners: [Listener] {
         guard let snapshot else { return [] }
         let devPorts = Set(developmentServerGroups.flatMap { $0.listeners.map(\.id) })
         return snapshot.listeners.filter { !devPorts.contains($0.id) }
+    }
+
+    var filteredOtherListeners: [Listener] {
+        DashboardFilterAndBadgeFormatter.filterListeners(otherListeners, query: searchQuery)
     }
 
     var allCleanupCandidates: [CleanupCandidate] {
@@ -280,10 +314,11 @@ final class DashboardModel: ObservableObject {
         case .agentCaches:
             items = cleanup.agentCacheCandidates
         }
-        return items.sorted {
+        let sorted = items.sorted {
             if $0.bytes != $1.bytes { return $0.bytes > $1.bytes }
             return $0.path < $1.path
         }
+        return DashboardFilterAndBadgeFormatter.filterCleanupCandidates(sorted, query: searchQuery)
     }
 
     func isHighImpactCandidate(_ candidate: CleanupCandidate) -> Bool {
@@ -592,6 +627,8 @@ final class DashboardModel: ObservableObject {
         let generation = cleanupScanGeneration
         isScanning = true
         let home = homeDirectory
+        let retentionDays = sessionLogRetentionDays
+        let currentAgents = agentRows
         let roots = Self.computeWorkspaceRoots(
             primaryRoot: cleanupRoot,
             home: home,
@@ -599,10 +636,12 @@ final class DashboardModel: ObservableObject {
         )
         scannedWorkspaceRoots = roots
         cleanupScanTask = Task {
-            let result = await Task.detached(priority: .utility) {
+            let (result, staleLogs) = await Task.detached(priority: .utility) { () -> (CleanupReport, [StaleSessionLogSummary]) in
                 let service = InventoryService(safetyEvaluator: SafetyEvaluator(), worktreeInspector: WorktreeInspector())
                 let report = service.scanCleanup(roots: roots, homeDirectory: home, entryLimit: 50_000_000, timeLimit: 300)
-                return CleanupReport(
+                let logScanner = SessionLogRetentionScanner(homeDirectory: home)
+                let logs = logScanner.scanStaleSessionLogs(olderThanDays: retentionDays, activeAgents: currentAgents)
+                let sortedReport = CleanupReport(
                     candidates: report.candidates.sorted {
                         if $0.bytes != $1.bytes { return $0.bytes > $1.bytes }
                         return $0.path < $1.path
@@ -617,9 +656,13 @@ final class DashboardModel: ObservableObject {
                     assessments: report.assessments,
                     discoveredCount: report.discoveredCount
                 )
+                return (sortedReport, logs)
             }.value
             guard !Task.isCancelled, self.cleanupScanGeneration == generation else { return }
             self.cleanup = result
+            self.staleSessionLogs = staleLogs
+            let validIDs = Set((result.candidates + result.agentCacheCandidates).map(\.id))
+            self.selectedCleanupCandidateIDs = self.selectedCleanupCandidateIDs.intersection(validIDs)
             self.cleanupScannedAt = Date()
             self.isScanning = false
         }
@@ -753,6 +796,22 @@ final class DashboardModel: ObservableObject {
         ExperienceThemeCatalog.tokens(for: experienceTheme)
     }
 
+    var highestObservedQuotaPercent: Double? {
+        var highest: Double?
+        for provider in providerOrder where !hiddenProviders.contains(provider) {
+            let status: ProviderQuotaStatus?
+            if isLiveQuotaEnabled, let live = liveQuotas[provider], live.status != .unavailable {
+                status = live
+            } else {
+                status = quotaSnapshot?.providers.first(where: { $0.provider == provider && $0.status != .unavailable })
+            }
+            for pct in (status?.windows ?? []).compactMap(\.usedPercent) where pct.isFinite {
+                highest = max(highest ?? pct, pct)
+            }
+        }
+        return highest
+    }
+
     var islandSurfaceSnapshot: IslandSurfaceSnapshot {
         let agents = agentRows
         let activeCount = agents.filter { $0.activityState == .active }.count
@@ -763,6 +822,7 @@ final class DashboardModel: ObservableObject {
         let primaryTask = primaryAgent.flatMap { obs in
             obs.currentTask ?? agentTurnPreviews[obs.id]?.lastAssistantReplyPreview ?? obs.sessionTitle
         }
+        let firstApproval = pendingApprovals.first
         return IslandSurfaceSnapshot(
             activeAgentCount: activeCount,
             waitingAgentCount: waitingCount,
@@ -770,8 +830,72 @@ final class DashboardModel: ObservableObject {
             serverCount: developmentServerGroups.count,
             primaryAgentName: primaryAgent?.agentName,
             primaryAgentTask: primaryTask,
-            isWaitingForInput: waitingCount > 0 || !pendingApprovals.isEmpty
+            isWaitingForInput: waitingCount > 0 || !pendingApprovals.isEmpty,
+            firstApprovalID: firstApproval?.id,
+            firstApprovalToolName: firstApproval.map { "\($0.agentName) · \($0.toolName)" },
+            firstApprovalSummary: firstApproval?.summary,
+            firstApprovalIsQuestion: !(firstApproval?.questionOptions.isEmpty ?? true),
+            theme: experienceTheme
         )
+    }
+
+    func approvePendingRequest(id: String) {
+        guard let request = pendingApprovals.first(where: { $0.id == id }),
+              request.questionOptions.isEmpty else { return }
+        submitApprovalDecision(.allowOnce, for: request)
+    }
+
+    func denyPendingRequest(id: String) {
+        guard let request = pendingApprovals.first(where: { $0.id == id }) else { return }
+        submitApprovalDecision(.deny(reason: "Denied from Notch Dynamic Island"), for: request)
+    }
+
+    func setStatusBarStyle(_ style: StatusBarDisplayStyle) {
+        statusBarStyle = style
+        UserDefaults.standard.set(style.rawValue, forKey: Self.statusBarStyleKey)
+        showBanner("Menu bar badge set to \(style.rawValue)")
+    }
+
+    func installBuiltInRetroSoundPack() {
+        do {
+            let pack = try ChiptuneWaveformGenerator.installBuiltInRetroPack(homeDirectory: homeDirectory)
+            reloadSoundPacks()
+            setSelectedSoundPackID(pack.id)
+            soundMode = .soundPack
+            UserDefaults.standard.set(SuyoiSoundMode.soundPack.rawValue, forKey: Self.soundModeKey)
+            soundPlayer.play(.taskCompleted, mode: .soundPack, theme: experienceTheme, selectedPack: pack)
+            showBanner("Installed & activated \(pack.displayName)")
+        } catch {
+            showBanner("Could not install 8-bit sound pack: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    func simulateApprovalRequest(isQuestion: Bool = false) {
+        let sessionID = "sim-\(UUID().uuidString.prefix(8))"
+        let payload: Data
+        if isQuestion {
+            payload = HookBridgeClient.simulatedApprovalPayload(
+                sessionID: String(sessionID),
+                agentName: "Claude Code",
+                toolName: "AskUserQuestion",
+                command: "Deploy target selection",
+                question: "Which test target should run before packaging?",
+                options: ["Run SuyoiCoreTests", "Full Suite + App Bundle", "Skip Tests"]
+            )
+        } else {
+            payload = HookBridgeClient.simulatedApprovalPayload(
+                sessionID: String(sessionID),
+                agentName: "Claude Code",
+                toolName: "Bash",
+                command: "./scripts/swift-local.sh test && ./scripts/build-app.sh"
+            )
+        }
+        if let created = approvalController.ingestHookEvent(payload) {
+            pendingApprovals = approvalController.pendingRequests()
+            let effectiveMode = soundMode == .muted ? .systemSounds : soundMode
+            soundPlayer.play(.attentionRequired, mode: effectiveMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+            showBanner("Simulated \(created.toolName) request — switch to Agents tab or Notch Island")
+        }
     }
 
     func focusPrimaryAgent() {
@@ -870,7 +994,7 @@ final class DashboardModel: ObservableObject {
             .appendingPathComponent("Library/Application Support/Suyoi/approvals/inbox")
             .path
         let bridgePath = Bundle.main.executableURL?.path ?? "/Applications/Suyoi.app/Contents/MacOS/SuyoiApp"
-        let snippet = AgentApprovalController.hookSnippet(for: agentName, bridgeExecutablePath: bridgePath)
+        let snippet = AgentApprovalController.hookSnippet(for: agentName, bridgeExecutablePath: bridgePath) + " --hook-bridge"
             + "\n# Or drop hook JSON payloads into: \(spoolInbox)"
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(snippet, forType: .string)
@@ -878,39 +1002,13 @@ final class DashboardModel: ObservableObject {
     }
 
     private func pollApprovalInboxSpool() {
-        let baseDir = homeDirectory.appendingPathComponent("Library/Application Support/Suyoi/approvals", isDirectory: true)
-        let inboxDir = baseDir.appendingPathComponent("inbox", isDirectory: true)
-        let outboxDir = baseDir.appendingPathComponent("outbox", isDirectory: true)
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: inboxDir,
-            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            pendingApprovals = approvalController.pendingRequests()
-            return
-        }
-        try? FileManager.default.createDirectory(at: outboxDir, withIntermediateDirectories: true)
-        var addedNewRequest = false
-        for fileURL in entries where fileURL.pathExtension == "json" {
-            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-                  values.isRegularFile == true,
-                  values.isSymbolicLink != true,
-                  let data = try? Data(contentsOf: fileURL),
-                  data.count <= 65_536 else {
-                try? FileManager.default.removeItem(at: fileURL)
-                continue
-            }
-            let responseFileURL = outboxDir.appendingPathComponent(fileURL.deletingPathExtension().lastPathComponent + ".response.json")
-            try? FileManager.default.removeItem(at: fileURL)
-            let created = approvalController.ingestHookEvent(data) { replyData in
-                try? replyData.write(to: responseFileURL, options: .atomic)
-            }
-            if created != nil {
-                addedNewRequest = true
-            }
-        }
+        let client = HookBridgeClient(
+            inboxDirectory: HookBridgeClient.defaultInboxDirectory(homeDirectory: homeDirectory),
+            outboxDirectory: HookBridgeClient.defaultOutboxDirectory(homeDirectory: homeDirectory)
+        )
+        let addedCount = client.drainInbox(into: approvalController)
         pendingApprovals = approvalController.pendingRequests()
-        if addedNewRequest {
+        if addedCount > 0 {
             soundPlayer.play(.attentionRequired, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
         }
     }
@@ -1132,14 +1230,101 @@ final class DashboardModel: ObservableObject {
         stopServer(singleGroup, force: false)
     }
 
+    func isCandidateSelected(_ candidate: CleanupCandidate) -> Bool {
+        selectedCleanupCandidateIDs.contains(candidate.id)
+    }
+
+    func toggleCandidateSelection(_ candidate: CleanupCandidate) {
+        guard assessment(for: candidate)?.isReviewableForTrash == true else { return }
+        if selectedCleanupCandidateIDs.contains(candidate.id) {
+            selectedCleanupCandidateIDs.remove(candidate.id)
+        } else {
+            selectedCleanupCandidateIDs.insert(candidate.id)
+        }
+    }
+
+    func selectAllReviewableCandidates() {
+        let ids = reviewableCleanupCandidates.map(\.id)
+        if !ids.isEmpty && ids.allSatisfy({ selectedCleanupCandidateIDs.contains($0) }) {
+            selectedCleanupCandidateIDs.subtract(ids)
+        } else {
+            selectedCleanupCandidateIDs.formUnion(ids)
+        }
+    }
+
+    var selectedReviewableCandidates: [CleanupCandidate] {
+        filteredCleanupCandidates.filter { candidate in
+            selectedCleanupCandidateIDs.contains(candidate.id)
+                && assessment(for: candidate)?.isReviewableForTrash == true
+        }
+    }
+
+    var selectedReviewableBytes: Int64 {
+        selectedReviewableCandidates.reduce(0) { $0 + $1.bytes }
+    }
+
+    func trashSelectedCandidates() {
+        let selected = selectedReviewableCandidates
+        guard !selected.isEmpty else { return }
+        selectedCleanupCandidateIDs.subtract(selected.map(\.id))
+        trashItems(selected)
+    }
+
+    var totalStaleSessionLogBytes: Int64 {
+        staleSessionLogs.reduce(0) { $0 + $1.bytes }
+    }
+
+    func trashAllStaleSessionLogs() {
+        guard !isPerformingAction, !staleSessionLogs.isEmpty else { return }
+        isPerformingAction = true
+        let logsToTrash = staleSessionLogs
+        let home = homeDirectory
+        let retentionDays = sessionLogRetentionDays
+        let currentAgents = agentRows
+        let currentInspector = inspector
+        Task {
+            let report = await Task.detached(priority: .userInitiated) {
+                let scanner = SessionLogRetentionScanner(homeDirectory: home)
+                return scanner.trashStaleLogs(
+                    logsToTrash,
+                    olderThanDays: retentionDays,
+                    activeAgents: currentAgents,
+                    liveAgents: { currentInspector.snapshot().agentObservations }
+                )
+            }.value
+            isPerformingAction = false
+            for outcome in report.outcomes where outcome.succeeded {
+                if let trashedPath = outcome.trashedURL {
+                    trashRecoveryStore.record(
+                        originalPath: outcome.path,
+                        trashedURL: URL(fileURLWithPath: trashedPath),
+                        category: "Stale Session Log (>\(retentionDays)d)",
+                        bytes: outcome.bytes
+                    )
+                }
+            }
+            trashedHistory = trashRecoveryStore.records()
+            if report.trashedCount > 0 {
+                let sizeText = ByteCountFormatter.string(fromByteCount: report.reclaimedBytes, countStyle: .file)
+                showBanner("Moved \(report.trashedCount) stale session log\(report.trashedCount == 1 ? "" : "s") (\(sizeText)) to Trash")
+                scanCleanup(forceRestart: true)
+            } else {
+                let err = report.outcomes.first?.error ?? "No stale session logs could be moved to Trash"
+                showBanner(err, isError: true)
+            }
+        }
+    }
+
     func trashCandidate(_ candidate: CleanupCandidate) {
         guard cleanup != nil else { return }
+        selectedCleanupCandidateIDs.remove(candidate.id)
         trashItems([candidate])
     }
 
     func trashAllReviewable() {
         let eligible = reviewableCleanupCandidates
         guard !eligible.isEmpty else { return }
+        selectedCleanupCandidateIDs.subtract(eligible.map(\.id))
         trashItems(eligible)
     }
 
@@ -1238,7 +1423,7 @@ final class DashboardModel: ObservableObject {
     }
 
     var currentAppVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.3"
     }
 
     func checkForUpdates() {

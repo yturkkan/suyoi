@@ -22,6 +22,11 @@ case .gui:
     }
 case .help:
     print(CLIOptions.usage)
+case .hookBridge:
+    let input = FileHandle.standardInput.readData(ofLength: 65_537)
+    let output = HookBridgeClient().forwardEventAndWait(input)
+    FileHandle.standardOutput.write(output)
+    FileHandle.standardOutput.write(Data("\n".utf8))
 case .snapshot, .scanCleanup, .agentStorage, .quotas:
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -42,7 +47,7 @@ case .snapshot, .scanCleanup, .agentStorage, .quotas:
             let report = CleanupReport(candidates: [], warnings: caches.warnings, partial: caches.partial,
                 agentCacheCandidates: caches.candidates, discoveredCount: caches.candidates.count)
             data = try encoder.encode(report)
-        case .gui, .help:
+        case .gui, .help, .hookBridge:
             preconditionFailure("Non-JSON command reached JSON output")
         }
         FileHandle.standardOutput.write(data)

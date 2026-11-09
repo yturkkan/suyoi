@@ -27,6 +27,9 @@ struct SessionTurnPreviewInspectorTests {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: url)
         }
+        func writeJSON(_ object: [String: Any], to path: String) throws {
+            try write(JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]), to: path)
+        }
         func inspect(_ agent: AgentObservation, processes: [ObservedProcess] = []) -> SessionTurnPreview? {
             SessionTurnPreviewInspector(homeDirectory: home).inspectPreview(for: agent, allProcesses: processes)
         }
@@ -339,5 +342,201 @@ struct SessionTurnPreviewInspectorTests {
         let encoded = String(decoding: try JSONEncoder().encode(preview), as: UTF8.self)
         #expect(!encoded.contains(secret))
         #expect(!encoded.contains("Hidden arbitrary text"))
+    }
+
+    @Test func openCodeMessageFilesExtractLatestTextAndRedactedTools() throws {
+        let f = try Fixture(); defer { f.clean() }
+        let base = ".local/share/opencode/storage/message/turn-a"
+        let secret = "sk-" + String(repeating: "a", count: 24)
+        let messages: [[String: Any]] = [
+            ["role": "user", "sessionID": "turn-a", "parts": [["type": "text", "text": "Earlier request"]]],
+            ["role": "user", "sessionID": "turn-a", "parts": [["type": "text", "text": "Check\n\(secret)"]]],
+            ["info": ["role": "assistant", "sessionID": "turn-a"], "timestamp": timestamp,
+             "parts": [["type": "reasoning", "text": "Hidden reasoning"],
+                       ["type": "text", "text": "Reply \(secret)"],
+                       ["type": "tool", "tool": "Read\n\(secret)", "callID": "call1",
+                        "state": ["status": "completed", "input": ["filePath": "/workspace/\(secret)", "private": "Hidden argument"], "output": "Hidden result"]]]]
+        ]
+        for (index, message) in messages.enumerated() {
+            let path = "\(base)/message-\(index).json"
+            try f.writeJSON(message, to: path)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: Double(100 + index))], ofItemAtPath: f.home.appendingPathComponent(path).path)
+        }
+        let preview = try #require(f.inspect(agent("OpenCode")))
+        #expect(preview.sessionID == "turn-a")
+        #expect(preview.lastUserPromptPreview == "Check [REDACTED]")
+        #expect(preview.lastAssistantReplyPreview == "Reply [REDACTED]")
+        #expect(preview.recentTools == [SessionToolCallSummary(toolName: "Read [REDACTED]", targetSummary: "/workspace/[REDACTED]", status: "completed")])
+        let encoded = String(decoding: try JSONEncoder().encode(preview), as: UTF8.self)
+        #expect(!encoded.contains(secret))
+        #expect(!encoded.contains("Hidden"))
+    }
+
+    @Test(arguments: [".open-code/sessions/turn-a.jsonl", ".local/share/opencode/sessions/turn-a.json"])
+    func openCodeSessionLayouts(_ path: String) throws {
+        let f = try Fixture(); defer { f.clean() }
+        let messages: [[String: Any]] = [
+            ["role": "user", "content": "Review changes"],
+            ["role": "assistant", "content": "Reviewed", "tool_calls": [
+                ["id": "call1", "function": ["name": "shell", "arguments": "{\"command\":\"git diff\"}"]]
+            ]]
+        ]
+        if path.hasSuffix("jsonl") { try f.write(messages, to: path) }
+        else { try f.writeJSON(["sessionID": "turn-a", "messages": messages], to: path) }
+        let preview = try #require(f.inspect(agent("OpenCode")))
+        #expect(preview.lastUserPromptPreview == "Review changes")
+        #expect(preview.lastAssistantReplyPreview == "Reviewed")
+        #expect(preview.recentTools == [SessionToolCallSummary(toolName: "shell", targetSummary: "git diff", status: "running")])
+    }
+
+    @Test func openCodeMessageChronologyUsesCreationTimeOverFileModificationTime() throws {
+        let f = try Fixture(); defer { f.clean() }
+        let base = ".local/share/opencode/storage/message/turn-a"
+        for (file, text, created, modified) in [("a", "Latest prompt", 1_794_132_002_000.0, 100.0), ("z", "Earlier prompt", 1_794_132_000_000.0, 200.0)] {
+            let path = "\(base)/\(file).json"
+            try f.writeJSON(["role": "user", "sessionID": "turn-a", "time": ["created": created], "content": text], to: path)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: modified)], ofItemAtPath: f.home.appendingPathComponent(path).path)
+        }
+        let preview = try #require(f.inspect(agent("OpenCode")))
+        #expect(preview.lastUserPromptPreview == "Latest prompt")
+        #expect(preview.updatedAt == Date(timeIntervalSince1970: 1_794_132_002))
+    }
+
+    @Test func openCodeSeparatePartsRequireMatchingSessionAndMessage() throws {
+        let f = try Fixture(); defer { f.clean() }
+        let secret = "ghp_" + String(repeating: "d", count: 24)
+        try f.writeJSON(["id": "msg-a", "sessionID": "turn-a", "role": "user"], to: ".local/share/opencode/storage/message/turn-a/msg-a.json")
+        let base = ".local/share/opencode/storage/part/msg-a"
+        try f.writeJSON(["sessionID": "turn-a", "messageID": "msg-a", "type": "text", "text": "Check \(secret)"], to: "\(base)/part-a.json")
+        try f.writeJSON(["sessionID": "other", "messageID": "msg-a", "type": "text", "text": "Hidden session"], to: "\(base)/part-b.json")
+        try f.writeJSON(["sessionID": "turn-a", "messageID": "msg-other", "type": "text", "text": "Hidden message"], to: "\(base)/part-c.json")
+        try f.writeJSON(["sessionID": "turn-a", "messageID": "msg-a", "type": "text", "text": "Hidden symlink"], to: "target.json")
+        try FileManager.default.createSymbolicLink(at: f.home.appendingPathComponent("\(base)/part-d.json"), withDestinationURL: f.home.appendingPathComponent("target.json"))
+        #expect(f.inspect(agent("OpenCode"))?.lastUserPromptPreview == "Check [REDACTED]")
+    }
+
+    @Test(arguments: [".gemini/tmp/project/chats/session-current.json", ".gemini/sessions/turn-a.jsonl"])
+    func geminiChatLayoutsRedactMessagesAndToolCalls(_ path: String) throws {
+        let f = try Fixture(); defer { f.clean() }
+        let secret = "AIza" + String(repeating: "b", count: 24)
+        let records: [[String: Any]] = [
+            ["sessionId": "turn-a"],
+            ["type": "user", "content": "Earlier request"],
+            ["role": "user", "content": [["text": "Check \(secret)"]]],
+            ["role": "model", "timestamp": timestamp, "parts": [
+                ["text": "Hidden thought", "thought": true], ["text": "Checked\n\(secret)"],
+                ["functionCall": ["name": "run_shell_command", "args": ["command": "echo \(secret)"]]]
+            ]],
+            ["type": "gemini", "content": "Done \(secret)", "thoughts": [["text": "Hidden reasoning"]], "toolCalls": [
+                ["id": "call2", "name": "Read \(secret)", "args": ["file_path": "/workspace/\(secret)", "secret": "Hidden input"], "status": "success", "result": "Hidden output"]
+            ]],
+            ["type": "info", "content": "Hidden info"], ["role": "tool", "content": "Hidden tool output"]
+        ]
+        if path.hasSuffix("jsonl") { try f.write(records, to: path) }
+        else { try f.writeJSON(["sessionId": "turn-a", "messages": Array(records.dropFirst())], to: path) }
+        let preview = try #require(f.inspect(agent("Gemini CLI")))
+        #expect(preview.lastUserPromptPreview == "Check [REDACTED]")
+        #expect(preview.lastAssistantReplyPreview == "Done [REDACTED]")
+        #expect(preview.recentTools == [
+            SessionToolCallSummary(toolName: "Read [REDACTED]", targetSummary: "/workspace/[REDACTED]", status: "completed"),
+            SessionToolCallSummary(toolName: "run_shell_command", targetSummary: "echo [REDACTED]", status: "running")
+        ])
+        let encoded = String(decoding: try JSONEncoder().encode(preview), as: UTF8.self)
+        #expect(!encoded.contains(secret))
+        #expect(!encoded.contains("Hidden"))
+    }
+
+    @Test(arguments: ["OpenCode", "Gemini CLI", "Cursor", "Aider", "Windsurf", "Antigravity CLI"])
+    func otherAgentsHaveRunningChildAndTaskFallbacks(_ name: String) throws {
+        let f = try Fixture(); defer { f.clean() }
+        let rows = [process("sh", pid: 401, parent: 400), process("swift", pid: 402, parent: 401)]
+        let preview = try #require(f.inspect(agent(name), processes: rows))
+        #expect(preview.sessionID == nil)
+        #expect(preview.lastUserPromptPreview == nil)
+        #expect(preview.lastAssistantReplyPreview == nil)
+        #expect(preview.recentTools == [SessionToolCallSummary(toolName: "swift", targetSummary: nil, status: "running")])
+        #expect(f.inspect(agent(name, stopped: true), processes: rows) == nil)
+        #expect(f.inspect(agent(name), processes: [process("git", pid: 401, parent: 400, uid: 502)]) == nil)
+        #expect(f.inspect(agent(name), processes: [process("git", pid: 401, parent: 999)]) == nil)
+        #expect(f.inspect(agent(name)) == nil)
+        let secret = "ghp_" + String(repeating: "c", count: 24)
+        #expect(f.inspect(agent(name, task: "Running: git show \(secret)"))?.recentTools.first?.targetSummary == "git show [REDACTED]")
+    }
+
+    @Test(arguments: ["OpenCode", "Gemini CLI"])
+    func additionalProviderToolListsAreBoundedAndIncludeRunningWork(_ name: String) throws {
+        let f = try Fixture(); defer { f.clean() }
+        let path = name == "OpenCode" ? ".local/share/opencode/sessions/turn-a.json" : ".gemini/tmp/project/chats/turn-a.json"
+        let secret = "sk-" + String(repeating: "e", count: 24)
+        let tools: [[String: Any]] = (0..<4).map { index in
+            ["id": "call\(index)", "name": "tool\(index)", "args": ["command": "echo \(secret)"], "status": index == 2 ? "error" : "success"]
+        }
+        try f.writeJSON(["sessionID": "turn-a", "messages": [["role": "assistant", "toolCalls": tools]]], to: path)
+        let preview = try #require(f.inspect(agent(name, task: "Running: swift build")))
+        #expect(preview.recentTools.map(\.toolName) == ["swift", "tool3", "tool2"])
+        #expect(preview.recentTools.map(\.status) == ["running", "completed", "failed"])
+        #expect(preview.recentTools.last?.targetSummary == "echo [REDACTED]")
+    }
+
+    @Test(arguments: ["OpenCode", "Gemini CLI"])
+    func additionalProvidersRejectUnassociatedAndMixedSessions(_ name: String) throws {
+        let f = try Fixture(); defer { f.clean() }
+        let path = name == "OpenCode" ? ".local/share/opencode/sessions/turn-a.json" : ".gemini/tmp/project/chats/turn-a.json"
+        try f.writeJSON(["sessionId": "other", "messages": [["role": "user", "content": "Unrelated prompt"]]], to: path)
+        #expect(f.inspect(agent(name)) == nil)
+        #expect(f.inspect(agent(name, sessionID: nil)) == nil)
+        #expect(f.inspect(agent(name, sessionID: "../turn-a")) == nil)
+        #expect(f.inspect(agent(name, sessionID: "../turn-a", task: "Running: git diff"))?.recentTools.first?.toolName == "git")
+        try f.writeJSON(["sessionId": "turn-a", "messages": [["sessionID": "other", "role": "user", "content": "Mixed prompt"]]], to: path)
+        #expect(f.inspect(agent(name)) == nil)
+    }
+
+    @Test func geminiSelectsLatestMatchingSessionWithoutShowingOlderEmptySnapshot() throws {
+        let f = try Fixture(); defer { f.clean() }
+        let base = ".gemini/tmp/project/chats"
+        for (name, id, text, time) in [("old", "turn-a", "Old prompt", 100), ("new", "turn-a", "Current prompt", 200), ("unrelated", "other", "Unrelated prompt", 300)] {
+            let path = "\(base)/\(name).json"
+            try f.writeJSON(["sessionId": id, "messages": [["role": "user", "content": text]]], to: path)
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: Double(time))], ofItemAtPath: f.home.appendingPathComponent(path).path)
+        }
+        #expect(f.inspect(agent("Gemini CLI"))?.lastUserPromptPreview == "Current prompt")
+        try f.writeJSON(["sessionId": "turn-a", "messages": []], to: "\(base)/new.json")
+        #expect(f.inspect(agent("Gemini CLI")) == nil)
+    }
+
+    @Test(arguments: ["OpenCode", "Gemini CLI"])
+    func additionalProvidersRejectSymlinksNonRegularAndOversizedDocuments(_ name: String) throws {
+        let f = try Fixture(); defer { f.clean() }
+        let path = name == "OpenCode" ? ".local/share/opencode/sessions/turn-a.json" : ".gemini/tmp/project/chats/turn-a.json"
+        let payload: [String: Any] = ["sessionId": "turn-a", "messages": [["role": "user", "content": "Hidden prompt"]]]
+        try f.writeJSON(payload, to: "target.json")
+        let url = f.home.appendingPathComponent(path)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: url, withDestinationURL: f.home.appendingPathComponent("target.json"))
+        #expect(f.inspect(agent(name)) == nil)
+        try FileManager.default.removeItem(at: url)
+        #expect(mkfifo(url.path, 0o600) == 0)
+        #expect(f.inspect(agent(name)) == nil)
+        try FileManager.default.removeItem(at: url)
+        try f.writeJSON(["sessionId": "turn-a", "messages": [["role": "user", "content": String(repeating: "x", count: 70_000)]]], to: path)
+        #expect(f.inspect(agent(name)) == nil)
+        #expect(f.inspect(agent(name, task: "Running: git diff"))?.recentTools.first?.toolName == "git")
+        try FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        try f.writeJSON(payload, to: "turn-a.json")
+        try FileManager.default.createSymbolicLink(at: url.deletingLastPathComponent(), withDestinationURL: f.home)
+        #expect(f.inspect(agent(name)) == nil)
+    }
+
+    @Test(arguments: [".open-code/sessions/turn-a.jsonl", ".gemini/sessions/turn-a.jsonl"])
+    func additionalProviderJSONLTailsRemainBounded(_ path: String) throws {
+        let f = try Fixture(); defer { f.clean() }
+        try f.write([["sessionId": "turn-a"], ["role": "user", "content": "Old head prompt"]], to: path)
+        var data = try Data(contentsOf: f.home.appendingPathComponent(path))
+        data.append(Data(("{\"role\":\"user\",\"content\":\"" + String(repeating: "x", count: 100_000) + "\"}\n").utf8))
+        data.append(try JSONSerialization.data(withJSONObject: ["role": path.hasPrefix(".gemini") ? "model" : "assistant", "content": "Recent reply"]))
+        try f.write(data, to: path)
+        let preview = try #require(f.inspect(agent(path.hasPrefix(".gemini") ? "Gemini CLI" : "OpenCode")))
+        #expect(preview.lastUserPromptPreview == nil)
+        #expect(preview.lastAssistantReplyPreview == "Recent reply")
     }
 }
