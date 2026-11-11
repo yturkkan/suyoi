@@ -501,7 +501,7 @@ enum DashboardFixture {
                     currentTask: scenario == .steering ? nil : "Running: swift test --filter Phase5FeaturesTests"),
                 AgentObservation(id: claude.pid, agentName: "Claude Code", process: claude, project: service,
                     terminalApp: "Terminal", statusSource: .processOnly, childServerPorts: [],
-                    activityState: .waitingForInput, activityDetail: "Waiting for tool approval",
+                    activityState: .waiting, activityDetail: "Waiting for tool approval",
                     lastActivityAt: now.addingTimeInterval(-25),
                     sessionID: "06eb0a11-b8aa-464e-834b-eb7eced111e4",
                     currentTask: "Pending Bash approval: swift test"),

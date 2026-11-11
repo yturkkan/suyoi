@@ -302,7 +302,7 @@ final class DashboardModel: ObservableObject {
         isLaunchAtLoginEnabled = true
         surfaceMode = fixture.surfaceMode
         experienceTheme = theme
-        soundMode = .themeSynthesized
+        soundMode = .systemSounds
         statusBarStyle = .agentsAndServers
 
         self.tab = tab
