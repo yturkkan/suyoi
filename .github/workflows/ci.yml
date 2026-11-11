@@ -5,16 +5,32 @@ on:
     branches:
       - main
       - "**"
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Optional existing CI run ID whose verified Suyoi-Next-macOS artifact should be attached to release_tag"
+        required: false
+        default: ""
+      release_tag:
+        description: "Optional release tag (e.g. v0.4.0-next.1) to upload verified Suyoi-Next.app.zip assets to"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
   macos-build-and-test:
     name: Build, Test & Package Suyoi Next (macOS 15)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_id == '' }}
     runs-on: macos-15
     timeout-minutes: 20
     steps:
@@ -55,3 +71,32 @@ jobs:
           path: |
             build/Suyoi-Next.app.zip
             build/Suyoi-Next.app.zip.sha256
+
+      - name: Publish release assets on tag push
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" build/Suyoi-Next.app.zip build/Suyoi-Next.app.zip.sha256 --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" build/Suyoi-Next.app.zip build/Suyoi-Next.app.zip.sha256 --title "Suyoi Next ${GITHUB_REF_NAME}" --generate-notes
+          fi
+
+  attach-release-assets:
+    name: Attach Verified Artifact to Release
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_id != '' && inputs.release_tag != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download verified artifact and attach to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          mkdir -p dist
+          gh run download "$RUN_ID" -n Suyoi-Next-macOS --dir dist
+          (cd dist && sha256sum -c Suyoi-Next.app.zip.sha256)
+          gh release upload "$RELEASE_TAG" dist/Suyoi-Next.app.zip dist/Suyoi-Next.app.zip.sha256 --clobber
