@@ -84,7 +84,11 @@ jobs:
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release upload "${GITHUB_REF_NAME}" build/Suyoi-Next.app.zip build/Suyoi-Next.app.zip.sha256 --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" build/Suyoi-Next.app.zip build/Suyoi-Next.app.zip.sha256 --title "Suyoi Next ${GITHUB_REF_NAME}" --generate-notes
+            PRERELEASE_FLAG=""
+            case "${GITHUB_REF_NAME}" in
+              *-next*|*-beta*|*-rc*|*-alpha*) PRERELEASE_FLAG="--prerelease" ;;
+            esac
+            gh release create "${GITHUB_REF_NAME}" build/Suyoi-Next.app.zip build/Suyoi-Next.app.zip.sha256 ${PRERELEASE_FLAG} --title "Suyoi Next ${GITHUB_REF_NAME}" --generate-notes
           fi
 
   attach-release-assets:
