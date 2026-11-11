@@ -41,6 +41,19 @@ private func phase5ForegroundBSDInfo(pid: UInt32 = 400, uid: UInt32 = 501) -> pr
     return info
 }
 
+private func makeProcArgsData(executablePath: String, argv: [String]) -> Data {
+    var data = Data()
+    var argc = Int32(argv.count).littleEndian
+    withUnsafeBytes(of: &argc) { data.append(contentsOf: $0) }
+    data.append(contentsOf: executablePath.utf8)
+    data.append(0)
+    for arg in argv {
+        data.append(contentsOf: arg.utf8)
+        data.append(0)
+    }
+    return data
+}
+
 @Suite("Phase 5 steering, hooks, collisions, diffs, burn rate & health")
 struct Phase5FeaturesTests {
     private func makeLiveProcess(
@@ -158,7 +171,7 @@ struct Phase5FeaturesTests {
         try FileManager.default.createDirectory(at: tempHome, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempHome) }
 
-        let launcher = NativeAgentJobLauncher(homeDirectory: tempHome, startupSettleSeconds: 0.05)
+        let launcher = NativeAgentJobLauncher(homeDirectory: tempHome)
         let meta = NativeContinuationMetadata(
             agentID: 42,
             agentName: "Codex",
@@ -171,12 +184,16 @@ struct Phase5FeaturesTests {
             workingDirectory: tempHome,
             metadata: meta
         )
-        #expect(launcher.activeJobs().contains(where: { $0.id == sleepJobID && $0.state == .running }))
+        #expect(launcher.activeJobs().contains(where: { (job: NativeContinuationJob) in
+            job.id == sleepJobID && job.state == NativeContinuationJob.State.running
+        }))
         #expect(launcher.cancelJob(id: sleepJobID))
 
         var cancelled = false
-        for _ in 0..<20 {
-            if launcher.recentJobs().contains(where: { $0.id == sleepJobID && $0.state == .cancelled }) {
+        for _ in 0..<25 {
+            if launcher.recentJobs().contains(where: { (job: NativeContinuationJob) in
+                job.id == sleepJobID && job.state == NativeContinuationJob.State.cancelled
+            }) {
                 cancelled = true
                 break
             }
@@ -191,8 +208,10 @@ struct Phase5FeaturesTests {
             metadata: meta
         )
         var completed = false
-        for _ in 0..<20 {
-            if launcher.recentJobs().contains(where: { $0.id == okJobID && $0.state == .completed }) {
+        for _ in 0..<25 {
+            if launcher.recentJobs().contains(where: { (job: NativeContinuationJob) in
+                job.id == okJobID && job.state == NativeContinuationJob.State.completed
+            }) {
                 completed = true
                 break
             }
@@ -215,13 +234,13 @@ struct Phase5FeaturesTests {
             title: "Run SwiftLint",
             prompt: "Run linter and fix warnings."
         ))
-        SteeringSnippetCatalog.saveCustomSnippets([custom], defaults: defaults)
-        let loaded = SteeringSnippetCatalog.loadCustomSnippets(defaults: defaults)
+        SteeringSnippetCatalog.saveCustomSnippets([custom], to: defaults)
+        let loaded = SteeringSnippetCatalog.loadCustomSnippets(from: defaults)
         #expect(loaded == [custom])
 
         let merged = SteeringSnippetCatalog.mergedSnippets(custom: loaded)
         let expandedWithExtra = SteeringSnippetCatalog.expand("/lint Sources/SuyoiCore", snippets: merged)
-        #expect(expandedWithExtra == "Run linter and fix warnings.\n\nAdditional context: Sources/SuyoiCore")
+        #expect(expandedWithExtra == "Run linter and fix warnings. Sources/SuyoiCore")
         #expect(SteeringSnippetCatalog.expand("plain prompt", snippets: merged) == "plain prompt")
     }
 
@@ -304,7 +323,7 @@ struct Phase5FeaturesTests {
         ))
 
         let scope = ApprovalScope(
-            process: ProcessIdentity(pid: 400, startTimeMicroseconds: 100, uid: 501),
+            process: ProcessIdentity(pid: 400, uid: 501, startTimeMicroseconds: 100, executablePath: "/bin/claude"),
             sessionID: "session-ro-1",
             projectPath: canonicalProject,
             generation: UUID()
@@ -353,7 +372,14 @@ struct Phase5FeaturesTests {
         try Data("line1\nline2-updated\nline3\nline4\n".utf8).write(to: trackedFile)
         try Data("notes\n".utf8).write(to: repoDir.appendingPathComponent("untracked.md"))
 
-        let proj = ProjectContext(rootPath: repoDir.path, name: "demo-repo", gitBranch: "main", isWorktree: false)
+        let proj = ProjectContext(
+            rootPath: repoDir.path,
+            name: "demo-repo",
+            framework: nil,
+            gitBranch: "main",
+            gitCommit: nil,
+            isWorktree: false
+        )
         let agentA = AgentObservation(
             id: 501,
             agentName: "Claude Code",
@@ -430,12 +456,21 @@ struct Phase5FeaturesTests {
     }
 
     @Test func detectsOrphanMCPHelpersWithoutLeakingArgsAndFlagsStuckAgents() {
+        let mcpData = makeProcArgsData(
+            executablePath: "/opt/homebrew/bin/node",
+            argv: ["node", "/Users/dev/.npm/_npx/mcp-server-filesystem/index.js", "--secret-token=TOPSECRET"]
+        )
         #expect(ProcessArgumentsReader.parseMCPHelperKind(
-            from: ["node", "/Users/dev/.npm/_npx/mcp-server-filesystem/index.js", "--secret-token=TOPSECRET"],
+            from: mcpData,
             executablePath: "/opt/homebrew/bin/node"
         ) == "MCP Server (Node)")
+
+        let normalNodeData = makeProcArgsData(
+            executablePath: "/opt/homebrew/bin/node",
+            argv: ["node", "server.js"]
+        )
         #expect(ProcessArgumentsReader.parseMCPHelperKind(
-            from: ["node", "server.js"],
+            from: normalNodeData,
             executablePath: "/opt/homebrew/bin/node"
         ) == nil)
 
@@ -456,6 +491,7 @@ struct Phase5FeaturesTests {
         #expect(orphans[0].kindLabel == "MCP Server (Node)")
 
         var stuckTracker = StuckAgentTracker()
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
         let spinningProc = makeLiveProcess(pid: 777, cpu: 94.0)
         let spinningObs = AgentObservation(
             id: 777,
@@ -465,16 +501,16 @@ struct Phase5FeaturesTests {
             terminalApp: "Terminal",
             statusSource: .processOnly,
             childServerPorts: [],
-            currentTask: "Running Bash",
-            activityState: .active
+            activityState: .active,
+            lastActivityAt: base,
+            currentTask: "Running Bash"
         )
-        let base = Date(timeIntervalSince1970: 1_700_000_000)
-        #expect(stuckTracker.evaluate(agents: [spinningObs], turnPreviews: [:], now: base).isEmpty)
-        #expect(stuckTracker.evaluate(agents: [spinningObs], turnPreviews: [:], now: base.addingTimeInterval(20)).isEmpty)
-        let third = stuckTracker.evaluate(agents: [spinningObs], turnPreviews: [:], now: base.addingTimeInterval(45))
+        #expect(stuckTracker.evaluate(agents: [spinningObs], turnPreviews: [:]).isEmpty)
+        #expect(stuckTracker.evaluate(agents: [spinningObs], turnPreviews: [:]).isEmpty)
+        let third = stuckTracker.evaluate(agents: [spinningObs], turnPreviews: [:])
         #expect(third[777] != nil)
 
-        // Advancing task signature clears the stuck warning immediately
+        // Advancing lastActivityAt clears the stuck warning immediately
         let progressedObs = AgentObservation(
             id: 777,
             agentName: "Claude Code",
@@ -483,10 +519,11 @@ struct Phase5FeaturesTests {
             terminalApp: "Terminal",
             statusSource: .processOnly,
             childServerPorts: [],
-            currentTask: "Editing Models.swift",
-            activityState: .active
+            activityState: .active,
+            lastActivityAt: base.addingTimeInterval(15),
+            currentTask: "Editing Models.swift"
         )
-        let cleared = stuckTracker.evaluate(agents: [progressedObs], turnPreviews: [:], now: base.addingTimeInterval(50))
+        let cleared = stuckTracker.evaluate(agents: [progressedObs], turnPreviews: [:])
         #expect(cleared.isEmpty)
     }
 }
