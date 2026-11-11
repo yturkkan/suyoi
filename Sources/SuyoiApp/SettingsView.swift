@@ -510,7 +510,7 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
-                        Text("Suyoi")
+                        Text(model.appDisplayName)
                             .font(.system(size: 16, weight: .bold))
                         Text("v.\(model.currentAppVersion)")
                             .font(.system(size: 10, weight: .semibold, design: .monospaced))
@@ -556,6 +556,8 @@ struct SettingsView: View {
                     Spacer()
                 }
 
+                let repoSlug = model.isParallelBuild ? "yturkkan/suyoi-next" : "yturkkan/suyoi"
+                let repoURL = "https://github.com/\(repoSlug)"
                 HStack(spacing: 7) {
                     Button {
                         if let url = URL(string: "https://x.com/yturkkan") {
@@ -582,16 +584,16 @@ struct SettingsView: View {
                     .help("https://www.linkedin.com/in/yturkkan")
 
                     Button {
-                        if let url = URL(string: "https://github.com/yturkkan/suyoi") {
+                        if let url = URL(string: repoURL) {
                             NSWorkspace.shared.open(url)
                         }
                     } label: {
-                        Label("GitHub · yturkkan/suyoi", systemImage: "chevron.left.forwardslash.chevron.right")
+                        Label("GitHub · \(repoSlug)", systemImage: "chevron.left.forwardslash.chevron.right")
                             .font(.system(size: 10.5, weight: .medium))
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .help("https://github.com/yturkkan/suyoi")
+                    .help(repoURL)
 
                     Spacer()
                 }
@@ -607,7 +609,7 @@ struct SettingsView: View {
                 aboutFeatureRow(
                     symbol: "terminal.fill",
                     title: "Live Agent & Task Visibility + Native Steering",
-                    detail: "Inspects running coding agents (Codex, Claude Code, OpenCode, Gemini CLI, Aider), shows active session tasks, and steers sessions via Terminal/iTerm2 TTY or native CLI."
+                    detail: "Inspects running coding agents (Codex, Claude Code, OpenCode, Gemini CLI, Aider), shows active session tasks, and steers sessions via Terminal/iTerm2/tmux or native CLI."
                 )
                 Divider()
                 aboutFeatureRow(

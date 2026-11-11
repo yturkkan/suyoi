@@ -98,11 +98,11 @@ struct DashboardView: View {
         let agentCount = model.agentRows.count
         let serverCount = model.developmentServerGroups.count
         return HStack(spacing: 8) {
-            Image(systemName: "leaf.fill")
+            Image(systemName: model.isParallelBuild ? "leaf.circle.fill" : "leaf.fill")
                 .font(.system(size: 13.5, weight: .semibold))
                 .foregroundStyle(accent)
 
-            Text("Suyoi")
+            Text(model.appDisplayName)
                 .font(.system(size: 14, weight: .bold))
 
             Text("·")

@@ -1152,6 +1152,9 @@ final class DashboardModel: ObservableObject {
         showBanner("Copied \(url.absoluteString)")
     }
 
+    var isParallelBuild: Bool { SuyoiAppIdentity.isParallelNextBuild }
+    var appDisplayName: String { SuyoiAppIdentity.displayName }
+
     func steerMode(for obs: AgentObservation) -> AgentSteerMode? {
         AgentSteerer.preferredMode(for: obs) ?? AgentSteerer.nativeMode(for: obs)
     }
@@ -1160,11 +1163,15 @@ final class DashboardModel: ObservableObject {
         guard let mode = steerMode(for: obs) else { return nil }
         switch mode {
         case .terminalTTY:
-            return "Terminal (\(obs.process.tty ?? "TTY"))"
+            return "\(obs.terminalApp ?? "Terminal") (\(obs.process.tty ?? "TTY"))"
+        case .tmuxPane:
+            return "tmux (\(obs.process.tty ?? "TTY"))"
         case .openCodeSession:
             return "Continue an OpenCode session"
         case .codexResume:
             return "Continue a Codex session"
+        case .claudeResume:
+            return "Continue a Claude Code session"
         }
     }
 
@@ -1192,7 +1199,7 @@ final class DashboardModel: ObservableObject {
         selectedSteerSessionID = nil
         let generation = UUID()
         steerSessionGeneration = generation
-        guard let mode = steerMode(for: obs), mode != .terminalTTY else {
+        guard let mode = steerMode(for: obs), !mode.isLiveTerminalDelivery else {
             steerSessionTargets = []
             isLoadingSteerSessions = false
             return
@@ -1222,7 +1229,7 @@ final class DashboardModel: ObservableObject {
     func canSendSteerPrompt(to obs: AgentObservation) -> Bool {
         guard !isSteering, let mode = steerMode(for: obs),
               !steerPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        return mode == .terminalTTY || (steerContext == obs.process.identity &&
+        return mode.isLiveTerminalDelivery || (steerContext == obs.process.identity &&
             steerSessionTargets.contains { $0.sessionID == selectedSteerSessionID })
     }
 
@@ -1236,7 +1243,7 @@ final class DashboardModel: ObservableObject {
         let generation = steerSessionGeneration
         Task {
             let outcome = await Task.detached(priority: .userInitiated) {
-                if mode != .terminalTTY, let target {
+                if !mode.isLiveTerminalDelivery, let target {
                     return steerer.steer(agent: obs, target: target, prompt: trimmed, uid: uid)
                 }
                 return steerer.steer(agent: obs, prompt: trimmed, uid: uid)

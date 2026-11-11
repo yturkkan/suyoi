@@ -507,4 +507,195 @@ struct AgentSteererTests {
             #expect(!json.contains("PRIVATE"))
         }
     }
+
+    @Test func cleanPromptNormalizesLineBreaksIntoSpacesWithoutGluingWords() throws {
+        #expect(AgentSteerer.cleanPrompt("first line\nsecond line") == "first line second line")
+        #expect(AgentSteerer.cleanPrompt("alpha\r\nbeta\r\n\r\ngamma") == "alpha beta gamma")
+        #expect(AgentSteerer.cleanPrompt("  \0\n--follow up\r\u{2028}next  ") == "--follow up next")
+        #expect(AgentSteerer.cleanPrompt("keep  double   spaces\tand\ttabs") == "keep  double   spaces\tand\ttabs")
+        #expect(AgentSteerer.cleanPrompt(" \r\n\u{2029}\0 ") == nil)
+    }
+
+    @Test func tmuxLiveSteeringVerifiesPaneStateAndSendsLiteralKeys() throws {
+        let p = process(tty: "ttys001")
+        let row = agent("Claude Code", process: p, terminal: "tmux")
+        #expect(AgentSteerer.preferredMode(for: row) == .tmuxPane)
+        #expect(AgentSteerer.canSteer(row))
+
+        let panesOutput = "/dev/ttys000\t%1\t0\t0\n/dev/ttys001\t%7\t0\t0\n"
+        let runner = SteeringRunner(stdout: panesOutput)
+        let prompt = "line one\nline two $(uname)"
+        let outcome = steerer(runner, live: p).steer(agent: row, prompt: prompt, uid: 501)
+        #expect(outcome.succeeded)
+        #expect(outcome.mode == .tmuxPane)
+        #expect(outcome.detail == "Sent instruction to tmux (ttys001)")
+        #expect(runner.requests.count == 3)
+        #expect(runner.requests[0].executable == "/usr/bin/env")
+        #expect(runner.requests[0].arguments == ["tmux", "list-panes", "-a", "-F", "#{pane_tty}\t#{pane_id}\t#{pane_dead}\t#{pane_in_mode}"])
+        #expect(runner.requests[0].includeStandardUserPaths)
+        #expect(runner.requests[1].arguments == ["tmux", "send-keys", "-t", "%7", "-l", "--", "line one line two $(uname)"])
+        #expect(runner.requests[2].arguments == ["tmux", "send-keys", "-t", "%7", "Enter"])
+
+        // Reject pane in copy/scrollback mode (pane_in_mode == 1)
+        let copyModeRunner = SteeringRunner(stdout: "/dev/ttys001\t%7\t0\t1\n")
+        let copyOutcome = steerer(copyModeRunner, live: p).steer(agent: row, prompt: "hello", uid: 501)
+        #expect(!copyOutcome.succeeded)
+        #expect(copyOutcome.error?.contains("copy or view mode") == true)
+        #expect(copyModeRunner.requests.count == 1)
+
+        // Reject dead pane, ambiguous TTYs, or invalid pane IDs
+        for badOutput in [
+            "/dev/ttys001\t%7\t1\t0\n",
+            "/dev/ttys001\t%7\t0\t0\n/dev/ttys001\t%8\t0\t0\n",
+            "/dev/ttys001\tinvalid\t0\t0\n",
+            "/dev/ttys009\t%7\t0\t0\n"
+        ] {
+            let badRunner = SteeringRunner(stdout: badOutput)
+            #expect(!steerer(badRunner, live: p).steer(agent: row, prompt: "hello", uid: 501).succeeded)
+            #expect(badRunner.requests.count == 1)
+        }
+    }
+
+    @Test func foregroundVerifierAllowsNonTTYReadingDescendantsAndRejectsTTYReaders() {
+        let p = process(tty: "ttys001")
+        let row = agent(process: p, terminal: "Terminal")
+
+        var childInfo = foregroundBSDInfo()
+        childInfo.pbi_pid = 401
+        childInfo.pbi_ppid = 400
+        childInfo.pbi_pgid = 400
+        childInfo.e_tpgid = 400
+        let allowedChild = childInfo
+
+        // Non-TTY-reading descendant (e.g. MCP server or git subprocess with piped stdio) is allowed
+        let safeVerifier = TerminalForegroundVerifier(
+            bsdInfo: { pid in
+                if pid == 400 { return foregroundBSDInfo() }
+                if pid == 401 { return allowedChild }
+                return nil
+            },
+            groupMembers: { $0 == 400 ? [400, 401] : nil },
+            ttyDevice: { $0 == "/dev/ttys001" ? 17 : nil },
+            currentUID: { 501 },
+            hasReadableTTY: { pid, dev in (pid == 401 && dev == 17) ? false : nil }
+        )
+        let okRunner = SteeringRunner()
+        #expect(steerer(okRunner, live: p, foreground: safeVerifier).steer(agent: row, prompt: "hello", uid: 501).succeeded)
+        #expect(okRunner.requests.count == 1)
+
+        // Child holding open FREAD descriptor on the controlling TTY is rejected
+        let readerVerifier = TerminalForegroundVerifier(
+            bsdInfo: { pid in
+                if pid == 400 { return foregroundBSDInfo() }
+                if pid == 401 { return allowedChild }
+                return nil
+            },
+            groupMembers: { $0 == 400 ? [400, 401] : nil },
+            ttyDevice: { $0 == "/dev/ttys001" ? 17 : nil },
+            currentUID: { 501 },
+            hasReadableTTY: { pid, dev in (pid == 401 && dev == 17) ? true : nil }
+        )
+        let blockedRunner = SteeringRunner()
+        #expect(!steerer(blockedRunner, live: p, foreground: readerVerifier).steer(agent: row, prompt: "hello", uid: 501).succeeded)
+        #expect(blockedRunner.requests.isEmpty)
+
+        // Non-descendant in same group (ppid = 1) is rejected
+        var orphanChild = allowedChild
+        orphanChild.pbi_ppid = 1
+        let orphanSnapshot = orphanChild
+        let orphanVerifier = TerminalForegroundVerifier(
+            bsdInfo: { pid in
+                if pid == 400 { return foregroundBSDInfo() }
+                if pid == 401 { return orphanSnapshot }
+                return nil
+            },
+            groupMembers: { $0 == 400 ? [400, 401] : nil },
+            ttyDevice: { $0 == "/dev/ttys001" ? 17 : nil },
+            currentUID: { 501 },
+            hasReadableTTY: { _, _ in false }
+        )
+        let orphanRunner = SteeringRunner()
+        #expect(!steerer(orphanRunner, live: p, foreground: orphanVerifier).steer(agent: row, prompt: "hello", uid: 501).succeeded)
+        #expect(orphanRunner.requests.isEmpty)
+    }
+
+    @Test func claudeCodeSessionDiscoveryValidationAndContinuation() throws {
+        let fixture = try QuotaFixture(); defer { fixture.clean() }
+        let project = fixture.home.appendingPathComponent("claude-project").resolvingSymlinksInPath()
+        let other = fixture.home.appendingPathComponent("other-project").resolvingSymlinksInPath()
+        for dir in [project, other] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        let sessionID = "9b2a1d44-62f8-4f88-98ab-112233445566"
+        let otherID = "11223344-5566-4778-899a-aabbccddeeff"
+        try fixture.write([
+            ["type": "user", "sessionId": sessionID, "cwd": project.path, "message": ["role": "user", "content": "Refactor chat steering sk-secret1234567890abcd"]],
+            ["type": "assistant", "sessionId": sessionID, "cwd": project.path, "message": ["role": "assistant", "content": "Working on it"]]
+        ], to: ".claude/projects/-Users-dev-claude-project/\(sessionID).jsonl")
+        try fixture.write([
+            ["type": "user", "sessionId": otherID, "cwd": other.path, "message": ["role": "user", "content": "Other repo task"]]
+        ], to: ".claude/projects/-Users-dev-other-project/\(otherID).jsonl")
+
+        let claudeBin = fixture.home.appendingPathComponent(".claude/local/claude")
+        try FileManager.default.createDirectory(at: claudeBin.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: claudeBin)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: claudeBin.path)
+
+        let uid = Int(getuid())
+        let live = process(uid: uid, cwd: project.path, executable: "/usr/local/bin/claude")
+        let row = agent("Claude Code", process: live)
+        #expect(AgentSteerer.nativeMode(for: row) == .claudeResume)
+
+        let inspector = AgentTaskInspector(homeDirectory: fixture.home)
+        let targets = inspector.nativeSessionTargets(for: row)
+        #expect(targets.map(\.sessionID) == [sessionID])
+        let choice = try #require(targets.first)
+        #expect(choice.mode == .claudeResume)
+        #expect(choice.title?.contains("[REDACTED]") == true)
+
+        let launcher = SteeringLauncher()
+        let steerer = AgentSteerer(
+            processLookup: { _, _ in live },
+            runner: SteeringRunner(),
+            homeDirectory: fixture.home,
+            nativeJobLauncher: launcher
+        )
+        let outcome = steerer.steer(agent: row, target: choice, prompt: "continue\nwith tests", uid: uid)
+        #expect(outcome.succeeded)
+        #expect(outcome.mode == .claudeResume)
+        let launched = try #require(launcher.requests.first)
+        #expect(launched.executable == claudeBin.path)
+        #expect(launched.arguments == ["--print", "--resume", sessionID, "--", "continue with tests"])
+        #expect(launched.workingDirectory?.path == project.path)
+
+        // Duplicate session UUID in another project directory must fail validation
+        try fixture.write([
+            ["type": "user", "sessionId": sessionID, "cwd": project.path, "message": ["role": "user", "content": "Duplicate"]]
+        ], to: ".claude/projects/-Users-dev-duplicate/\(sessionID).jsonl")
+        #expect(!steerer.steer(agent: row, target: choice, prompt: "again", uid: uid).succeeded)
+    }
+
+    @Test func nativeStartupExitReportsActionableSanitizedError() throws {
+        final class StartupExitLauncher: NativeAgentJobLaunching, @unchecked Sendable {
+            func launch(executable: String, arguments: [String], workingDirectory: URL?) throws {
+                throw NativeAgentJobLauncher.Error.startupExited(2)
+            }
+        }
+        let fixture = try QuotaFixture(); defer { fixture.clean() }
+        let uid = Int(getuid())
+        let live = process(uid: uid, cwd: "/", executable: "/bin/codex")
+        let row = agent(process: live)
+        let target = try codexTarget(in: fixture, for: row)
+        let steerer = AgentSteerer(
+            processLookup: { _, _ in live },
+            runner: SteeringRunner(),
+            executableResolver: { "/tools/\($0)" },
+            homeDirectory: fixture.home,
+            nativeJobLauncher: StartupExitLauncher()
+        )
+        let outcome = steerer.steer(agent: row, target: target, prompt: "PRIVATE SECRET", uid: uid)
+        #expect(!outcome.succeeded)
+        #expect(outcome.error?.contains("code 2") == true)
+        #expect(outcome.error?.contains("PRIVATE") == false)
+    }
 }

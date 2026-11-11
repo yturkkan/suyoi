@@ -33,13 +33,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let symbolName = model.isParallelBuild ? "leaf.circle.fill" : "leaf.fill"
+        let appName = model.appDisplayName
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "leaf.fill", accessibilityDescription: "Suyoi, local developer companion")
+            button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "\(appName), local developer companion")
             button.imagePosition = .imageLeading
             button.font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
             button.target = self
             button.action = #selector(togglePopover)
-            button.toolTip = "Suyoi · local developer companion"
+            button.toolTip = "\(appName) · local developer companion"
         }
         popover.behavior = .transient
         popover.animates = true
@@ -138,10 +140,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             highestQuotaPercent: model.highestObservedQuotaPercent
         )
 
+        let appName = model.appDisplayName
         if agents.isEmpty && servers.isEmpty && model.pendingApprovals.isEmpty {
-            button.toolTip = "Suyoi · No active agents or dev servers"
+            button.toolTip = "\(appName) · No active agents or dev servers"
         } else {
-            button.toolTip = "Suyoi · \(agents.count) agents (\(activeCount) active, \(waitingCount) waiting) · \(servers.count) dev servers"
+            button.toolTip = "\(appName) · \(agents.count) agents (\(activeCount) active, \(waitingCount) waiting) · \(servers.count) dev servers"
         }
     }
 

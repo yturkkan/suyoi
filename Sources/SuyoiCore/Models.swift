@@ -245,8 +245,34 @@ public struct AgentObservation: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+public enum SuyoiAppIdentity {
+    public static let standardBundleIdentifier = "local.suyoi.app"
+    public static let parallelNextBundleIdentifier = "local.suyoi.next"
+
+    public static var isParallelNextBuild: Bool {
+        Bundle.main.bundleIdentifier == parallelNextBundleIdentifier
+    }
+
+    public static var displayName: String {
+        isParallelNextBuild ? "Suyoi Next" : "Suyoi"
+    }
+
+    public static var supportFolderName: String {
+        isParallelNextBuild ? "SuyoiNext" : "Suyoi"
+    }
+}
+
 public enum AgentSteerMode: String, Codable, Equatable, Sendable {
-    case terminalTTY, openCodeSession, codexResume
+    case terminalTTY, tmuxPane, openCodeSession, codexResume, claudeResume
+
+    public var isLiveTerminalDelivery: Bool {
+        switch self {
+        case .terminalTTY, .tmuxPane:
+            return true
+        case .openCodeSession, .codexResume, .claudeResume:
+            return false
+        }
+    }
 }
 
 /// Sanitized action result; never contains the submitted prompt or raw command output.

@@ -26,12 +26,17 @@ struct ContractTests {
     }
 
     @Test func steeringContractsRoundTripAndSupportIndependentImplementations() throws {
-        for mode in [AgentSteerMode.terminalTTY, .openCodeSession, .codexResume] {
+        for mode in [AgentSteerMode.terminalTTY, .tmuxPane, .openCodeSession, .codexResume, .claudeResume] {
             try roundTrip(mode)
             try roundTrip(AgentSteerOutcome(agentID: 42, mode: mode, succeeded: true, detail: "Submitted"))
             try roundTrip(AgentSteerOutcome(agentID: 42, mode: mode, succeeded: false, error: "Identity mismatch"))
             try roundTrip(AgentSteerOutcome(agentID: 42, mode: mode, succeeded: false))
         }
+        #expect(AgentSteerMode.terminalTTY.isLiveTerminalDelivery)
+        #expect(AgentSteerMode.tmuxPane.isLiveTerminalDelivery)
+        #expect(!AgentSteerMode.openCodeSession.isLiveTerminalDelivery)
+        #expect(!AgentSteerMode.codexResume.isLiveTerminalDelivery)
+        #expect(!AgentSteerMode.claudeResume.isLiveTerminalDelivery)
         let minimal = Data(#"{"agentID":42,"mode":"terminalTTY","succeeded":false}"#.utf8)
         let outcome = try JSONDecoder().decode(AgentSteerOutcome.self, from: minimal)
         #expect(outcome.detail == nil && outcome.error == nil)

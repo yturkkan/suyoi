@@ -428,16 +428,16 @@ struct ProcessDetailView: View {
         detailSection("Steer or Continue Session") {
             if let mode = steerMode, let steerModeLabel {
                 HStack(spacing: 6) {
-                    Image(systemName: mode == .terminalTTY ? "terminal.fill" : "arrow.turn.down.right")
+                    Image(systemName: mode.isLiveTerminalDelivery ? "terminal.fill" : "arrow.turn.down.right")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(accent)
-                    Text(mode == .terminalTTY ? "Live Terminal Delivery (\(steerModeLabel))" : steerModeLabel)
+                    Text(mode.isLiveTerminalDelivery ? "Live Terminal Delivery (\(steerModeLabel))" : steerModeLabel)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.primary)
                     Spacer()
                 }
 
-                if mode != .terminalTTY {
+                if !mode.isLiveTerminalDelivery {
                     Text("Starts a separate continuation for the selected session.")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
@@ -520,11 +520,30 @@ struct ProcessDetailView: View {
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
                                 .background(accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                                if chosen.isLikelyActiveInProcess {
+                                    HStack(alignment: .top, spacing: 6) {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(Color(nsColor: .systemOrange))
+                                        Text("This session is currently open in the running process. Prefer Focus to message the live terminal directly and avoid concurrent session writes.")
+                                            .font(.system(size: 10.5))
+                                            .foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(Color(nsColor: .systemOrange).opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                }
                             }
                         }
                     }
                 } else {
-                    Text("Sends instruction to \(obs.terminalApp ?? "Terminal") (\(obs.process.tty ?? "TTY")).")
+                    Text(
+                        mode == .tmuxPane
+                            ? "Sends literal keys directly to the verified foreground tmux pane (\(obs.process.tty ?? "TTY"))."
+                            : "Sends instruction to \(obs.terminalApp ?? "Terminal") (\(obs.process.tty ?? "TTY"))."
+                    )
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -532,14 +551,14 @@ struct ProcessDetailView: View {
 
                 HStack(spacing: 6) {
                     TextField(
-                        mode == .terminalTTY
+                        mode.isLiveTerminalDelivery
                             ? "Send instruction to \(obs.agentName)…"
                             : (selectedSteerSessionID == nil ? "Select a session above first…" : "Continue selected \(obs.agentName) session…"),
                         text: $steerPromptText
                     )
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12))
-                    .disabled(isSteering || (mode != .terminalTTY && selectedSteerSessionID == nil))
+                    .disabled(isSteering || (!mode.isLiveTerminalDelivery && selectedSteerSessionID == nil))
                     .onSubmit {
                         if canSendSteer {
                             onSteerAgent?(obs)
@@ -552,7 +571,7 @@ struct ProcessDetailView: View {
                         if isSteering {
                             ProgressView().controlSize(.small)
                         } else {
-                            Label(mode == .terminalTTY ? "Send" : "Continue", systemImage: "paperplane.fill")
+                            Label(mode.isLiveTerminalDelivery ? "Send" : "Continue", systemImage: "paperplane.fill")
                                 .font(.system(size: 11.5, weight: .semibold))
                         }
                     }
@@ -610,6 +629,14 @@ struct ProcessDetailView: View {
                                                 .foregroundStyle(.primary.opacity(0.9))
                                                 .lineLimit(1)
                                         }
+                                        if target.isLikelyActiveInProcess {
+                                            Text("LIVE")
+                                                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                                                .foregroundStyle(Color(nsColor: .systemOrange))
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 1)
+                                                .background(Color(nsColor: .systemOrange).opacity(0.14), in: Capsule())
+                                        }
                                     }
                                     HStack(spacing: 6) {
                                         Text(shortenPath(target.projectPath))
@@ -647,10 +674,11 @@ struct ProcessDetailView: View {
     private func formatSessionTargetOption(_ target: NativeSessionTarget) -> String {
         let project = URL(fileURLWithPath: target.projectPath).lastPathComponent
         let titleOrID = (target.title?.isEmpty == false) ? target.title! : String(target.sessionID.prefix(18))
+        let liveSuffix = target.isLikelyActiveInProcess ? " [live]" : ""
         if let updated = target.updatedAt {
-            return "\(project) · \(titleOrID) (\(updated.formatted(date: .omitted, time: .shortened)))"
+            return "\(project) · \(titleOrID)\(liveSuffix) (\(updated.formatted(date: .omitted, time: .shortened)))"
         }
-        return "\(project) · \(titleOrID)"
+        return "\(project) · \(titleOrID)\(liveSuffix)"
     }
 
     // MARK: - Server Inspector Content

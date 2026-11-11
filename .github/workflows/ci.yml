@@ -1,0 +1,57 @@
+name: macOS CI & Parallel App Package
+
+on:
+  push:
+    branches:
+      - main
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-build-and-test:
+    name: Build, Test & Package Suyoi Next (macOS 15)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Swift 6 Xcode toolchain
+        run: |
+          if ! swift --version | grep -q "Swift version 6\."; then
+            XCODE_16="$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+            if [ -n "$XCODE_16" ]; then
+              sudo xcode-select -s "$XCODE_16/Contents/Developer"
+            fi
+          fi
+          xcodebuild -version
+          swift --version
+
+      - name: Run Swift test suite
+        run: swift test
+
+      - name: Build parallel side-by-side Suyoi Next.app
+        run: ./scripts/build-app.sh --parallel
+
+      - name: Verify Suyoi Next bundle, signature, CLI & archive checksum
+        run: |
+          test -d "build/Suyoi Next.app"
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "build/Suyoi Next.app/Contents/Info.plist")"
+          test "$BUNDLE_ID" = "local.suyoi.next"
+          /usr/bin/codesign --verify --deep --strict "build/Suyoi Next.app"
+          "build/Suyoi Next.app/Contents/MacOS/Suyoi" --help
+          (cd build && /usr/bin/shasum -a 256 -c Suyoi-Next.app.zip.sha256)
+
+      - name: Upload Suyoi-Next.app.zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Suyoi-Next-macOS
+          if-no-files-found: error
+          path: |
+            build/Suyoi-Next.app.zip
+            build/Suyoi-Next.app.zip.sha256

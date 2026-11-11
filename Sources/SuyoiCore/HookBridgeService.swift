@@ -27,11 +27,11 @@ public struct HookBridgeClient: Sendable {
     }
 
     public static func defaultInboxDirectory(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
-        homeDirectory.appendingPathComponent("Library/Application Support/Suyoi/approvals/inbox", isDirectory: true)
+        homeDirectory.appendingPathComponent("Library/Application Support/\(SuyoiAppIdentity.supportFolderName)/approvals/inbox", isDirectory: true)
     }
 
     public static func defaultOutboxDirectory(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
-        homeDirectory.appendingPathComponent("Library/Application Support/Suyoi/approvals/outbox", isDirectory: true)
+        homeDirectory.appendingPathComponent("Library/Application Support/\(SuyoiAppIdentity.supportFolderName)/approvals/outbox", isDirectory: true)
     }
 
     private struct Envelope: Codable {

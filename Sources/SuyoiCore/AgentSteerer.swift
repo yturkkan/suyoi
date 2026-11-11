@@ -51,14 +51,22 @@ public struct AgentSteerer: AgentSteering, Sendable {
         switch agent.agentName {
         case "OpenCode": return .openCodeSession
         case "Codex": return .codexResume
+        case "Claude Code": return .claudeResume
         default: return nil
         }
     }
 
     public static func preferredMode(for agent: AgentObservation) -> AgentSteerMode? {
-        guard agent.process.identity.isActionEligible else { return nil }
-        if let tty = agent.process.tty, isValidTTY(tty), ["Terminal", "iTerm2"].contains(agent.terminalApp) { return .terminalTTY }
-        return nil
+        guard agent.process.identity.isActionEligible, !agent.process.isStopped,
+              let tty = agent.process.tty, isValidTTY(tty) else { return nil }
+        switch agent.terminalApp {
+        case "Terminal", "iTerm2":
+            return .terminalTTY
+        case "tmux":
+            return .tmuxPane
+        default:
+            return nil
+        }
     }
     public static func canSteer(_ agent: AgentObservation) -> Bool {
         preferredMode(for: agent) != nil
@@ -84,7 +92,14 @@ public struct AgentSteerer: AgentSteering, Sendable {
         }
         guard let clean = Self.cleanPrompt(prompt) else { return failure("Instruction must contain 1 to 2000 characters") }
         let catalog = NativeSessionCatalog(homeDirectory: homeDirectory)
-        let name = target.mode == .openCodeSession ? "opencode" : "codex"
+        let name: String
+        switch target.mode {
+        case .openCodeSession: name = "opencode"
+        case .codexResume: name = "codex"
+        case .claudeResume: name = "claude"
+        case .terminalTTY, .tmuxPane:
+            return failure("Native session target is invalid")
+        }
         guard let executable = resolve(name, agent: agent) else { return failure("Agent executable is unavailable") }
         let directory = URL(fileURLWithPath: target.projectPath, isDirectory: true)
         let arguments: [String]
@@ -109,7 +124,9 @@ public struct AgentSteerer: AgentSteering, Sendable {
                 return failure("Codex session store path is unavailable")
             }
             arguments = ["exec", "-c", "sqlite_home=" + path, "resume", target.sessionID, "--", clean]
-        case .terminalTTY:
+        case .claudeResume:
+            arguments = ["--print", "--resume", target.sessionID, "--", clean]
+        case .terminalTTY, .tmuxPane:
             return failure("Native session target is invalid")
         }
         guard catalog.validate(target, for: agent, live: live) else {
@@ -127,7 +144,11 @@ public struct AgentSteerer: AgentSteering, Sendable {
                 workingDirectory: directory)
             return AgentSteerOutcome(agentID: agent.id, mode: target.mode, succeeded: true,
                 detail: "Started continuation of the selected \(agent.agentName) session")
-        } catch { return failure("Unable to start local continuation process") }
+        } catch let NativeAgentJobLauncher.Error.startupExited(code) {
+            return failure("Local continuation process exited immediately (code \(code)). Check CLI authentication and setup.")
+        } catch {
+            return failure("Unable to start local continuation process")
+        }
     }
 
     private func verifiedDatabasePath(_ output: String, catalog: NativeSessionCatalog) -> Bool {
@@ -136,9 +157,28 @@ public struct AgentSteerer: AgentSteering, Sendable {
         return SessionFileEvidence.filesystemPath(URL(fileURLWithPath: path)) == catalog.openCodeDB.path
     }
 
-    private static func cleanPrompt(_ prompt: String) -> String? {
-        let clean = String(prompt.unicodeScalars.filter { $0 == "\t" || !CharacterSet.controlCharacters.contains($0) })
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    private static let lineBreakScalars: Set<Unicode.Scalar> = [
+        "\n", "\r", "\u{0085}", "\u{2028}", "\u{2029}"
+    ]
+
+    static func cleanPrompt(_ prompt: String) -> String? {
+        var result = String.UnicodeScalarView()
+        var pendingLineBreakSpace = false
+        for scalar in prompt.unicodeScalars {
+            if lineBreakScalars.contains(scalar) {
+                pendingLineBreakSpace = true
+                continue
+            }
+            guard scalar == "\t" || !CharacterSet.controlCharacters.contains(scalar) else {
+                continue
+            }
+            if pendingLineBreakSpace {
+                result.append(" ")
+                pendingLineBreakSpace = false
+            }
+            result.append(scalar)
+        }
+        let clean = String(result).trimmingCharacters(in: .whitespacesAndNewlines)
         return !clean.isEmpty && clean.count <= 2000 ? clean : nil
     }
 
@@ -148,7 +188,7 @@ public struct AgentSteerer: AgentSteering, Sendable {
         func failure(_ error: String) -> AgentSteerOutcome {
             AgentSteerOutcome(agentID: agent.id, mode: mode, succeeded: false, error: error)
         }
-        guard terminalMode != nil else {
+        guard let terminalMode else {
             let catalog = NativeSessionCatalog(homeDirectory: homeDirectory)
             guard let target = catalog.verifiedCodexTarget(for: agent) else {
                 return failure("No verified steering target is available")
@@ -162,11 +202,16 @@ public struct AgentSteerer: AgentSteering, Sendable {
         guard let live = processLookup(pid, uid), live.identity == identity, !live.isStopped else {
             return failure("Process identity changed, is stopped or process already exited")
         }
-        guard let tty = agent.process.tty, Self.isValidTTY(tty), live.tty == tty,
-              let terminal = agent.terminalApp, ["Terminal", "iTerm2"].contains(terminal) else {
+        guard let tty = agent.process.tty, Self.isValidTTY(tty), live.tty == tty else {
             return failure("Terminal association changed or is unavailable")
         }
         let device = tty.hasPrefix("/dev/") ? tty : "/dev/" + tty
+        if terminalMode == .tmuxPane {
+            return steerTmux(agent: agent, pid: pid, uid: uid, live: live, tty: tty, device: device, clean: clean)
+        }
+        guard let terminal = agent.terminalApp, ["Terminal", "iTerm2"].contains(terminal) else {
+            return failure("Terminal association changed or is unavailable")
+        }
         let request = CommandRequest(executable: "/usr/bin/osascript", arguments: ["-e", terminal == "Terminal" ? Self.terminalScript : Self.iTermScript, device, clean], timeout: 8)
         // Apple Events cannot atomically bind delivery to the kernel's foreground process.
         guard terminalForegroundVerifier.verify(agent: agent, live: live, device: device) else {
@@ -181,6 +226,99 @@ public struct AgentSteerer: AgentSteering, Sendable {
         } catch { return failure("Unable to execute steering command") }
     }
 
+    private func steerTmux(
+        agent: AgentObservation,
+        pid: Int32,
+        uid: Int,
+        live: ObservedProcess,
+        tty: String,
+        device: String,
+        clean: String
+    ) -> AgentSteerOutcome {
+        func failure(_ error: String) -> AgentSteerOutcome {
+            AgentSteerOutcome(agentID: agent.id, mode: .tmuxPane, succeeded: false, error: error)
+        }
+        guard agent.terminalApp == "tmux" else {
+            return failure("Terminal association changed or is unavailable")
+        }
+        guard terminalForegroundVerifier.verify(agent: agent, live: live, device: device) else {
+            return failure("Selected agent is not the verified foreground receiver of this terminal")
+        }
+        let listRequest = CommandRequest(
+            executable: "/usr/bin/env",
+            arguments: ["tmux", "list-panes", "-a", "-F", "#{pane_tty}\t#{pane_id}\t#{pane_dead}\t#{pane_in_mode}"],
+            timeout: 3,
+            maximumOutputBytes: 64 * 1_024,
+            includeStandardUserPaths: true
+        )
+        let listResult: CommandResult
+        do {
+            listResult = try runner.run(listRequest)
+        } catch {
+            return failure("Unable to inspect tmux panes")
+        }
+        guard listResult.exitCode == 0, !listResult.timedOut, !listResult.truncated else {
+            return failure(listResult.timedOut ? "tmux pane lookup timed out" : "tmux server or pane list is unavailable")
+        }
+        var matches: [(paneID: String, paneDead: String, paneInMode: String)] = []
+        for rawLine in listResult.stdoutText.split(whereSeparator: \.isNewline) {
+            let parts = rawLine.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 4 else {
+                return failure("tmux pane target is unavailable or ambiguous")
+            }
+            let rowDevice = parts[0].hasPrefix("/dev/") ? parts[0] : "/dev/" + parts[0]
+            if rowDevice == device {
+                matches.append((parts[1], parts[2], parts[3]))
+            }
+        }
+        guard matches.count == 1, let pane = matches.first, Self.isValidTmuxPaneID(pane.paneID) else {
+            return failure("tmux pane target is unavailable or ambiguous")
+        }
+        guard pane.paneDead == "0" else {
+            return failure("Selected tmux pane is no longer active")
+        }
+        guard pane.paneInMode == "0" else {
+            return failure("Selected tmux pane is in copy or view mode")
+        }
+        guard let current = processLookup(pid, uid), current.identity == agent.process.identity,
+              !current.isStopped, current.tty == tty,
+              terminalForegroundVerifier.verify(agent: agent, live: current, device: device) else {
+            return failure("Selected agent is not the verified foreground receiver of this terminal")
+        }
+        let sendLiteral = CommandRequest(
+            executable: "/usr/bin/env",
+            arguments: ["tmux", "send-keys", "-t", pane.paneID, "-l", "--", clean],
+            timeout: 5,
+            maximumOutputBytes: 16 * 1_024,
+            includeStandardUserPaths: true
+        )
+        let sendEnter = CommandRequest(
+            executable: "/usr/bin/env",
+            arguments: ["tmux", "send-keys", "-t", pane.paneID, "Enter"],
+            timeout: 5,
+            maximumOutputBytes: 16 * 1_024,
+            includeStandardUserPaths: true
+        )
+        do {
+            let literalResult = try runner.run(sendLiteral)
+            guard literalResult.exitCode == 0, !literalResult.timedOut, !literalResult.truncated else {
+                return failure(literalResult.timedOut ? "Steering command timed out; delivery is unconfirmed" : "Steering command did not confirm delivery")
+            }
+            let enterResult = try runner.run(sendEnter)
+            guard enterResult.exitCode == 0, !enterResult.timedOut, !enterResult.truncated else {
+                return failure(enterResult.timedOut ? "Steering command timed out; delivery is unconfirmed" : "Steering command did not confirm delivery")
+            }
+            return AgentSteerOutcome(agentID: agent.id, mode: .tmuxPane, succeeded: true, detail: "Sent instruction to tmux (\(tty))")
+        } catch {
+            return failure("Unable to execute steering command")
+        }
+    }
+
+    private static func isValidTmuxPaneID(_ value: String) -> Bool {
+        guard value.hasPrefix("%"), (2...16).contains(value.utf8.count) else { return false }
+        return value.dropFirst().utf8.allSatisfy { (48...57).contains($0) }
+    }
+
     private func resolve(_ name: String, agent: AgentObservation) -> String? {
         if let executableResolver {
             guard let path = executableResolver(name), path.hasPrefix("/"), URL(fileURLWithPath: path).lastPathComponent == name else { return nil }
@@ -189,6 +327,9 @@ public struct AgentSteerer: AgentSteering, Sendable {
         var candidates: [String] = []
         if agent.process.executable.hasSuffix("/" + name) { candidates.append(agent.process.executable) }
         candidates += ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
+        if name == "claude" {
+            candidates.append(homeDirectory.appendingPathComponent(".claude/local/claude").path)
+        }
         candidates += [".opencode/bin", ".local/bin", ".npm-global/bin", ".bun/bin", "Library/pnpm", ".volta/bin", ".asdf/shims", ".local/share/mise/shims"].map {
             homeDirectory.appendingPathComponent($0).appendingPathComponent(name).path
         }

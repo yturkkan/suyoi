@@ -101,8 +101,32 @@ public struct AppUpdater: AppUpdating, Sendable {
     public static let allowedDownloadURLPrefix = "https://github.com/yturkkan/suyoi/releases/download/"
     public static let expectedAssetName = "Suyoi.app.zip"
     public static let expectedChecksumAssetName = "Suyoi.app.zip.sha256"
-    public static let allowedBundleIdentifiers: Set<String> = ["local.suyoi.app", "io.suyoi.app"]
+    public static let nextLatestReleaseEndpoint = URL(string: "https://api.github.com/repos/yturkkan/suyoi-next/releases/latest")!
+    public static let nextAllowedReleaseURLPrefix = "https://github.com/yturkkan/suyoi-next/releases/"
+    public static let nextAllowedDownloadURLPrefix = "https://github.com/yturkkan/suyoi-next/releases/download/"
+    public static let nextExpectedAssetName = "Suyoi-Next.app.zip"
+    public static let nextExpectedChecksumAssetName = "Suyoi-Next.app.zip.sha256"
+    public static let allowedBundleIdentifiers: Set<String> = ["local.suyoi.app", "io.suyoi.app", "local.suyoi.next"]
     public static let maxAssetBytes: Int64 = 100 * 1024 * 1024
+
+    private static var activeReleaseEndpoint: URL {
+        SuyoiAppIdentity.isParallelNextBuild ? nextLatestReleaseEndpoint : latestReleaseEndpoint
+    }
+    private static var activeReleaseURLPrefix: String {
+        SuyoiAppIdentity.isParallelNextBuild ? nextAllowedReleaseURLPrefix : allowedReleaseURLPrefix
+    }
+    private static var activeDownloadURLPrefix: String {
+        SuyoiAppIdentity.isParallelNextBuild ? nextAllowedDownloadURLPrefix : allowedDownloadURLPrefix
+    }
+    private static var activeAssetName: String {
+        SuyoiAppIdentity.isParallelNextBuild ? nextExpectedAssetName : expectedAssetName
+    }
+    private static var activeChecksumAssetName: String {
+        SuyoiAppIdentity.isParallelNextBuild ? nextExpectedChecksumAssetName : expectedChecksumAssetName
+    }
+    private static var activeExtractedAppName: String {
+        SuyoiAppIdentity.isParallelNextBuild ? "Suyoi Next.app" : "Suyoi.app"
+    }
 
     private let downloadArchive: (@Sendable (URLRequest) async throws -> (URL, URLResponse))?
 
@@ -115,7 +139,7 @@ public struct AppUpdater: AppUpdating, Sendable {
 
     public func checkForUpdates(currentVersion: String) async throws -> AppUpdateCheckResult {
         let session = Self.makeEphemeralSession(timeout: 12)
-        var request = URLRequest(url: Self.latestReleaseEndpoint)
+        var request = URLRequest(url: Self.activeReleaseEndpoint)
         request.httpMethod = "GET"
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -139,7 +163,7 @@ public struct AppUpdater: AppUpdating, Sendable {
             throw AppUpdaterError.invalidResponse
         }
 
-        return try Self.parseReleaseResponse(data, currentVersion: currentVersion)
+        return try Self.parseReleaseResponse(data, currentVersion: currentVersion, parallelNext: SuyoiAppIdentity.isParallelNextBuild)
     }
 
     public func stageUpdate(_ release: AppReleaseInfo, currentBundleURL: URL) async throws -> StagedAppUpdate {
@@ -147,7 +171,9 @@ public struct AppUpdater: AppUpdating, Sendable {
         guard standardizedBundleURL.pathExtension == "app" else {
             throw AppUpdaterError.notRunningFromAppBundle
         }
-        guard release.downloadURL.absoluteString.hasPrefix(Self.allowedDownloadURLPrefix) else {
+        let isNext = SuyoiAppIdentity.isParallelNextBuild
+        let downloadPrefix = isNext ? Self.nextAllowedDownloadURLPrefix : Self.allowedDownloadURLPrefix
+        guard release.downloadURL.absoluteString.hasPrefix(downloadPrefix) else {
             throw AppUpdaterError.noDownloadAsset
         }
 
@@ -161,7 +187,7 @@ public struct AppUpdater: AppUpdating, Sendable {
         try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
 
         do {
-            let zipURL = stagingDir.appendingPathComponent(Self.expectedAssetName, isDirectory: false)
+            let zipURL = stagingDir.appendingPathComponent(Self.activeAssetName, isDirectory: false)
             let session = Self.makeEphemeralSession(timeout: 60)
             defer { session.invalidateAndCancel() }
             var request = URLRequest(url: release.downloadURL)
@@ -193,12 +219,12 @@ public struct AppUpdater: AppUpdating, Sendable {
 
             let expectedHash: String?
             if let suppliedHash = release.expectedSHA256 {
-                guard let hash = Self.parseSHA256File(suppliedHash) else {
+                guard let hash = Self.parseSHA256File(suppliedHash, assetName: Self.activeAssetName) else {
                     throw AppUpdaterError.bundleVerificationFailed("invalid SHA-256 checksum")
                 }
                 expectedHash = hash
             } else if let checksumURL = release.sha256AssetURL {
-                expectedHash = try await Self.fetchChecksum(at: checksumURL)
+                expectedHash = try await Self.fetchChecksum(at: checksumURL, downloadPrefix: downloadPrefix, assetName: Self.activeAssetName)
             } else {
                 expectedHash = nil
             }
@@ -218,7 +244,7 @@ public struct AppUpdater: AppUpdating, Sendable {
                 throw AppUpdaterError.extractionFailed
             }
 
-            let extractedAppURL = extractDir.appendingPathComponent("Suyoi.app", isDirectory: true)
+            let extractedAppURL = extractDir.appendingPathComponent(Self.activeExtractedAppName, isDirectory: true)
             try Self.verifyExtractedBundle(at: extractedAppURL, expectedVersion: release.version)
 
             return StagedAppUpdate(
@@ -306,11 +332,16 @@ public struct AppUpdater: AppUpdating, Sendable {
 
     // MARK: - Pure Parsing & Version Comparison
 
-    public static func parseReleaseResponse(_ data: Data, currentVersion: String) throws -> AppUpdateCheckResult {
+    public static func parseReleaseResponse(_ data: Data, currentVersion: String, parallelNext: Bool = false) throws -> AppUpdateCheckResult {
+        let releasePrefix = parallelNext ? nextAllowedReleaseURLPrefix : allowedReleaseURLPrefix
+        let downloadPrefix = parallelNext ? nextAllowedDownloadURLPrefix : allowedDownloadURLPrefix
+        let assetName = parallelNext ? nextExpectedAssetName : expectedAssetName
+        let checksumAssetName = parallelNext ? nextExpectedChecksumAssetName : expectedChecksumAssetName
+
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rawTag = root["tag_name"] as? String,
               let rawReleaseURL = root["html_url"] as? String,
-              rawReleaseURL.hasPrefix(allowedReleaseURLPrefix),
+              rawReleaseURL.hasPrefix(releasePrefix),
               let releaseURL = URL(string: rawReleaseURL) else {
             throw AppUpdaterError.invalidResponse
         }
@@ -335,15 +366,15 @@ public struct AppUpdater: AppUpdating, Sendable {
         for asset in assets {
             guard let name = asset["name"] as? String,
                   let rawURL = asset["browser_download_url"] as? String,
-                  rawURL.hasPrefix(allowedDownloadURLPrefix),
+                  rawURL.hasPrefix(downloadPrefix),
                   let url = URL(string: rawURL) else {
                 continue
             }
-            if name == expectedChecksumAssetName {
+            if name == checksumAssetName {
                 matchedChecksumURL = url
                 continue
             }
-            guard name == expectedAssetName, matchedDownloadURL == nil else { continue }
+            guard name == assetName, matchedDownloadURL == nil else { continue }
             let size = (asset["size"] as? NSNumber)?.int64Value ?? 0
             guard size > 0, size <= maxAssetBytes else {
                 continue
@@ -412,7 +443,7 @@ public struct AppUpdater: AppUpdating, Sendable {
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    public static func parseSHA256File(_ text: String) -> String? {
+    public static func parseSHA256File(_ text: String, assetName: String = expectedAssetName) -> String? {
         guard text.utf8.count <= 4096 else { return nil }
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let hash = String(value.prefix(64))
@@ -421,14 +452,18 @@ public struct AppUpdater: AppUpdating, Sendable {
             return nil
         }
         let suffix = value.dropFirst(64)
-        guard suffix.isEmpty || suffix == "  \(expectedAssetName)" || suffix == " *\(expectedAssetName)" else {
+        guard suffix.isEmpty || suffix == "  \(assetName)" || suffix == " *\(assetName)" else {
             return nil
         }
         return hash.lowercased()
     }
 
-    private static func fetchChecksum(at url: URL) async throws -> String {
-        guard url.absoluteString.hasPrefix(allowedDownloadURLPrefix) else {
+    private static func fetchChecksum(
+        at url: URL,
+        downloadPrefix: String = allowedDownloadURLPrefix,
+        assetName: String = expectedAssetName
+    ) async throws -> String {
+        guard url.absoluteString.hasPrefix(downloadPrefix) else {
             throw AppUpdaterError.bundleVerificationFailed("invalid SHA-256 checksum URL")
         }
         let session = makeEphemeralSession(timeout: 12)
@@ -448,7 +483,7 @@ public struct AppUpdater: AppUpdating, Sendable {
                 }
                 data.append(byte)
             }
-            guard let text = String(data: data, encoding: .utf8), let hash = parseSHA256File(text) else {
+            guard let text = String(data: data, encoding: .utf8), let hash = parseSHA256File(text, assetName: assetName) else {
                 throw AppUpdaterError.bundleVerificationFailed("invalid SHA-256 checksum")
             }
             return hash

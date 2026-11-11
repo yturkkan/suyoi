@@ -10,11 +10,51 @@ public struct NativeSessionTarget: Equatable, Identifiable, Sendable {
     public let projectPath: String
     public let title: String?
     public let updatedAt: Date?
+    public let isLikelyActiveInProcess: Bool
     let source: URL
     let fileIdentity: FileIdentity
     let projectIdentity: FileIdentity
     let rowIdentity: ProcessIdentity
     let table: String?
+
+    init(
+        sessionID: String,
+        mode: AgentSteerMode,
+        projectPath: String,
+        title: String?,
+        updatedAt: Date?,
+        source: URL,
+        fileIdentity: FileIdentity,
+        projectIdentity: FileIdentity,
+        rowIdentity: ProcessIdentity,
+        table: String?,
+        isLikelyActiveInProcess: Bool = false
+    ) {
+        self.sessionID = sessionID
+        self.mode = mode
+        self.projectPath = projectPath
+        self.title = title
+        self.updatedAt = updatedAt
+        self.source = source
+        self.fileIdentity = fileIdentity
+        self.projectIdentity = projectIdentity
+        self.rowIdentity = rowIdentity
+        self.table = table
+        self.isLikelyActiveInProcess = isLikelyActiveInProcess
+    }
+
+    public static func == (lhs: NativeSessionTarget, rhs: NativeSessionTarget) -> Bool {
+        lhs.sessionID == rhs.sessionID
+            && lhs.mode == rhs.mode
+            && lhs.projectPath == rhs.projectPath
+            && lhs.title == rhs.title
+            && lhs.updatedAt == rhs.updatedAt
+            && lhs.source == rhs.source
+            && lhs.fileIdentity == rhs.fileIdentity
+            && lhs.projectIdentity == rhs.projectIdentity
+            && lhs.rowIdentity == rhs.rowIdentity
+            && lhs.table == rhs.table
+    }
 }
 
 #if DEBUG
@@ -105,26 +145,52 @@ struct NativeSessionCatalog: Sendable {
     var codexHome: URL { homeDirectory.appendingPathComponent(".codex", isDirectory: true) }
     var codexRoot: URL { codexHome.appendingPathComponent("sessions", isDirectory: true) }
     var openCodeDB: URL { homeDirectory.appendingPathComponent(".local/share/opencode/opencode.db") }
+    var claudeHome: URL { homeDirectory.appendingPathComponent(".claude", isDirectory: true) }
+    var claudeProjectsRoot: URL { claudeHome.appendingPathComponent("projects", isDirectory: true) }
 
     func choices(for agent: AgentObservation) -> [NativeSessionTarget] {
         guard let mode = AgentSteerer.nativeMode(for: agent) else { return [] }
         let project = rowProject(agent)
         switch mode {
         case .codexResume:
+            let liveEvidence = SessionFileEvidence.live(for: agent.process, beneath: codexRoot)
             var entries: [NativeSessionTarget] = []
             for (url, date) in codexFiles() {
                 guard let metadata = codexMetadata(url, uid: agent.process.uid),
                       let projectIdentity = directoryIdentity(metadata.project),
                       project.map({ metadata.project == $0 || metadata.project.hasPrefix($0 + "/") }) ?? true else { continue }
+                let isLive = liveEvidence.map {
+                    SessionFileEvidence.filesystemPath($0.url) == SessionFileEvidence.filesystemPath(url)
+                        && $0.identity == metadata.identity
+                } ?? false
                 entries.append(NativeSessionTarget(sessionID: metadata.id, mode: mode, projectPath: metadata.project,
                     title: nil, updatedAt: date, source: url, fileIdentity: metadata.identity,
-                    projectIdentity: projectIdentity, rowIdentity: agent.process.identity, table: nil))
+                    projectIdentity: projectIdentity, rowIdentity: agent.process.identity, table: nil,
+                    isLikelyActiveInProcess: isLive))
             }
             let groups = Dictionary(grouping: entries, by: \.sessionID)
             return Array(entries.lazy.filter { groups[$0.sessionID]?.count == 1 }.prefix(24))
         case .openCodeSession:
             return openCodeTargets(for: agent, project: project)
-        case .terminalTTY:
+        case .claudeResume:
+            let liveEvidence = SessionFileEvidence.live(for: agent.process, beneath: claudeProjectsRoot)
+            var entries: [NativeSessionTarget] = []
+            for (url, date) in claudeFiles() {
+                guard let metadata = claudeMetadata(url, uid: agent.process.uid),
+                      let projectIdentity = directoryIdentity(metadata.project),
+                      project.map({ metadata.project == $0 || metadata.project.hasPrefix($0 + "/") }) ?? true else { continue }
+                let isLive = liveEvidence.map {
+                    SessionFileEvidence.filesystemPath($0.url) == SessionFileEvidence.filesystemPath(url)
+                        && $0.identity == metadata.identity
+                } ?? false
+                entries.append(NativeSessionTarget(sessionID: metadata.id, mode: mode, projectPath: metadata.project,
+                    title: metadata.title, updatedAt: date, source: url, fileIdentity: metadata.identity,
+                    projectIdentity: projectIdentity, rowIdentity: agent.process.identity, table: nil,
+                    isLikelyActiveInProcess: isLive))
+            }
+            let groups = Dictionary(grouping: entries, by: \.sessionID)
+            return Array(entries.lazy.filter { groups[$0.sessionID]?.count == 1 }.prefix(24))
+        case .terminalTTY, .tmuxPane:
             return []
         }
     }
@@ -138,7 +204,8 @@ struct NativeSessionCatalog: Sendable {
               let projectIdentity = directoryIdentity(cwd) else { return nil }
         return NativeSessionTarget(sessionID: metadata.id, mode: .codexResume, projectPath: metadata.project,
             title: nil, updatedAt: nil, source: evidence.url, fileIdentity: metadata.identity,
-            projectIdentity: projectIdentity, rowIdentity: agent.process.identity, table: nil)
+            projectIdentity: projectIdentity, rowIdentity: agent.process.identity, table: nil,
+            isLikelyActiveInProcess: true)
     }
 
     func validate(_ target: NativeSessionTarget, for agent: AgentObservation, live: ObservedProcess) -> Bool {
@@ -164,7 +231,19 @@ struct NativeSessionCatalog: Sendable {
                 $0.sessionID == target.sessionID && $0.source == target.source && $0.fileIdentity == target.fileIdentity
                     && $0.projectPath == target.projectPath && $0.table == target.table
             }
-        case .terminalTTY:
+        case .claudeResume:
+            guard SessionFileEvidence.filesystemPath(target.source).hasPrefix(claudeProjectsRoot.path + "/"),
+                  let metadata = claudeMetadata(target.source, uid: live.uid),
+                  metadata.id == target.sessionID,
+                  metadata.project == target.projectPath,
+                  metadata.identity == target.fileIdentity,
+                  let matches = exactClaudeSessions(sessionID: target.sessionID),
+                  matches.count == 1,
+                  SessionFileEvidence.filesystemPath(matches[0]) == SessionFileEvidence.filesystemPath(target.source) else {
+                return false
+            }
+            return true
+        case .terminalTTY, .tmuxPane:
             return false
         }
     }
@@ -426,5 +505,154 @@ struct NativeSessionCatalog: Sendable {
         if status == SQLITE_DONE { return true }
         return status == SQLITE_ROW && canonicalProject(Self.text(statement, column: 0)) == project
             && sqlite3_step(statement) == SQLITE_DONE
+    }
+
+    private func claudeFiles() -> [(URL, Date)] {
+        var entries: [(URL, Date)] = []
+        var remaining = 8_192
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.75
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]
+        func visit(_ directory: URL, depth: Int) {
+            guard remaining > 0, ProcessInfo.processInfo.systemUptime < deadline, QuotaParsing.safePath(directory),
+                  let children = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: Array(keys),
+                    options: [.skipsSubdirectoryDescendants]) else { return }
+            while remaining > 0, ProcessInfo.processInfo.systemUptime < deadline, let file = children.nextObject() as? URL {
+                remaining -= 1
+                guard let values = try? file.resourceValues(forKeys: keys), values.isSymbolicLink != true else { continue }
+                if depth == 1 {
+                    let stem = file.deletingPathExtension().lastPathComponent
+                    if values.isRegularFile == true, file.pathExtension == "jsonl", UUID(uuidString: stem) != nil {
+                        entries.append((file, values.contentModificationDate ?? .distantPast))
+                    }
+                } else if depth == 0, values.isDirectory == true {
+                    visit(file, depth: 1)
+                }
+            }
+        }
+        visit(claudeProjectsRoot, depth: 0)
+        return Array(entries.sorted { $0.1 == $1.1 ? $0.0.path < $1.0.path : $0.1 > $1.1 }.prefix(128))
+    }
+
+    private func claudeMetadata(_ url: URL, uid: Int) -> (id: String, project: String, title: String?, identity: FileIdentity)? {
+        guard url.pathExtension == "jsonl" else { return nil }
+        let stem = url.deletingPathExtension().lastPathComponent
+        guard let fileUUID = UUID(uuidString: stem) else { return nil }
+        let expectedID = fileUUID.uuidString.lowercased()
+        guard stem.lowercased() == expectedID else { return nil }
+
+        let fd = SessionFileEvidence.openRegular(url)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        guard let identity = SessionFileEvidence.readIdentity(fd, uid: uid) else { return nil }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size > 0 else { return nil }
+
+        func readChunk(_ count: Int, offset: off_t) -> Data? {
+            var data = Data(count: count)
+            let length = data.withUnsafeMutableBytes { pread(fd, $0.baseAddress, count, offset) }
+            guard length >= 0 else { return nil }
+            data.count = length
+            return data
+        }
+        func parseLines(_ data: Data) -> [[String: Any]] {
+            data.split(separator: 10).compactMap { (try? JSONSerialization.jsonObject(with: Data($0))) as? [String: Any] }
+        }
+
+        let records: [[String: Any]]
+        let budget = 64 * 1_024
+        if info.st_size <= budget {
+            guard let data = readChunk(Int(info.st_size), offset: 0) else { return nil }
+            records = parseLines(data)
+        } else {
+            let half = 32 * 1_024
+            guard var header = readChunk(half, offset: 0),
+                  var tail = readChunk(half, offset: info.st_size - off_t(half)) else { return nil }
+            if let end = header.lastIndex(of: 10) { header = Data(header.prefix(through: end)) } else { header = Data() }
+            if let start = tail.firstIndex(of: 10) { tail.removeSubrange(...start) } else { tail = Data() }
+            records = parseLines(header) + parseLines(tail)
+        }
+        guard !records.isEmpty else { return nil }
+
+        var sawSessionID = false
+        var resolvedProject: String?
+        var summaryTitle: String?
+        var firstUserPrompt: String?
+
+        for record in records {
+            if let rawID = record["sessionId"] {
+                guard let idString = rawID as? String,
+                      UUID(uuidString: idString)?.uuidString.lowercased() == expectedID else {
+                    return nil
+                }
+                sawSessionID = true
+            }
+            if let rawCwd = record["cwd"] {
+                guard let cwdString = rawCwd as? String,
+                      let canonical = canonicalProject(cwdString) else {
+                    return nil
+                }
+                if let existing = resolvedProject, existing != canonical {
+                    return nil
+                }
+                resolvedProject = canonical
+            }
+            if let customTitle = record["customTitle"] as? String,
+               let clean = SessionTurnPreviewInspector.sanitizeAndRedact(customTitle, maxLength: 80) {
+                summaryTitle = clean
+            } else if record["type"] as? String == "summary",
+                      let summary = record["summary"] as? String,
+                      let clean = SessionTurnPreviewInspector.sanitizeAndRedact(summary, maxLength: 80) {
+                summaryTitle = clean
+            } else if firstUserPrompt == nil,
+                      record["type"] as? String == "user",
+                      record["isMeta"] as? Bool != true,
+                      let text = Self.extractClaudeUserText(from: record["message"]),
+                      let clean = SessionTurnPreviewInspector.sanitizeAndRedact(text, maxLength: 80) {
+                firstUserPrompt = clean
+            }
+        }
+
+        guard sawSessionID, let project = resolvedProject else { return nil }
+        return (expectedID, project, summaryTitle ?? firstUserPrompt, identity)
+    }
+
+    private static func extractClaudeUserText(from rawMessage: Any?) -> String? {
+        guard let message = rawMessage as? [String: Any] else { return nil }
+        if let content = message["content"] as? String {
+            return content
+        }
+        if let blocks = message["content"] as? [[String: Any]] {
+            for block in blocks where (block["type"] as? String ?? "text") == "text" {
+                if let text = block["text"] as? String, !text.isEmpty {
+                    return text
+                }
+            }
+        }
+        return nil
+    }
+
+    private func exactClaudeSessions(sessionID: String) -> [URL]? {
+        guard let id = UUID(uuidString: sessionID) else { return nil }
+        var remaining = 8_192
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.75
+        var complete = true
+        let keys: Set<URLResourceKey> = [.isSymbolicLinkKey, .isRegularFileKey]
+        guard QuotaParsing.safePath(claudeProjectsRoot),
+              let files = FileManager.default.enumerator(at: claudeProjectsRoot,
+                includingPropertiesForKeys: Array(keys),
+                errorHandler: { _, _ in complete = false; return false }) else { return nil }
+        var matches: [URL] = []
+        while let url = files.nextObject() as? URL {
+            guard remaining > 0, ProcessInfo.processInfo.systemUptime < deadline, files.level <= 8,
+                  let values = try? url.resourceValues(forKeys: keys), values.isSymbolicLink != true else { return nil }
+            remaining -= 1
+            if values.isRegularFile == true, url.pathExtension == "jsonl",
+               UUID(uuidString: url.deletingPathExtension().lastPathComponent) == id {
+                matches.append(url)
+                if matches.count > 1 { return matches }
+            }
+        }
+        guard complete else { return nil }
+        return matches
     }
 }
