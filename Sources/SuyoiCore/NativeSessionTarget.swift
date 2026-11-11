@@ -190,7 +190,7 @@ struct NativeSessionCatalog: Sendable {
             }
             let groups = Dictionary(grouping: entries, by: \.sessionID)
             return Array(entries.lazy.filter { groups[$0.sessionID]?.count == 1 }.prefix(24))
-        case .terminalTTY, .tmuxPane:
+        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
             return []
         }
     }
@@ -243,7 +243,7 @@ struct NativeSessionCatalog: Sendable {
                 return false
             }
             return true
-        case .terminalTTY, .tmuxPane:
+        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
             return false
         }
     }
