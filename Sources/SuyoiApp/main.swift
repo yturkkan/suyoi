@@ -4,6 +4,10 @@ import SuyoiCore
 
 #if DEBUG
 let fixtureArguments = Array(CommandLine.arguments.dropFirst())
+if fixtureArguments.first == "--export-screenshots" {
+    let outputDir = fixtureArguments.dropFirst().first ?? "docs/screenshots"
+    MainActor.assumeIsolated { DashboardFixture.exportScreenshots(to: outputDir) }
+}
 if Bundle.main.bundleIdentifier == DashboardFixture.bundleIdentifier || fixtureArguments.first == "--dashboard-fixture" {
     MainActor.assumeIsolated { DashboardFixture.run(arguments: fixtureArguments) }
 }

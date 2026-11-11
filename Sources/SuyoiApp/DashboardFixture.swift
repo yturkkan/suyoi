@@ -7,7 +7,7 @@ enum DashboardFixture {
     static let bundleIdentifier = "local.suyoi.fixture"
 
     fileprivate enum Scenario: String {
-        case overview, approval, steering
+        case overview, approval, steering, showcase
     }
 
     @MainActor
@@ -43,6 +43,368 @@ enum DashboardFixture {
         app.delegate = delegate
         withExtendedLifetime(delegate) { app.run() }
         exit(0)
+    }
+
+    @MainActor
+    static func exportScreenshots(to outputDirectoryPath: String) -> Never {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        if let darkAppearance = NSAppearance(named: .darkAqua) {
+            app.appearance = darkAppearance
+        }
+
+        let outputURL = URL(fileURLWithPath: outputDirectoryPath, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+        } catch {
+            fputs("Failed to create screenshot directory \(outputURL.path): \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+
+        let showcaseSample = Sample(scenario: .showcase)
+
+        // 1. Agents Overview + Collisions + Approvals + Orphan MCP Helpers (Native Glass)
+        let agentsModel = DashboardModel(fixture: showcaseSample, tab: .agents, theme: .nativeGlass)
+        let shot1 = SequoiaWindowCanvas(canvasSize: CGSize(width: 760, height: 660), windowCornerRadius: 14) {
+            DashboardView(model: agentsModel)
+                .frame(width: 700, height: 600)
+                .background(Color(red: 0.10, green: 0.11, blue: 0.14))
+        }
+        writeScreenshot(
+            shot1,
+            size: CGSize(width: 760, height: 660),
+            to: outputURL.appendingPathComponent("01-agents-collisions-approvals.png")
+        )
+
+        // 2. Focused Inspector: Live WezTerm Steering + Slash Snippets + Continuation Jobs + Uncommitted Git Diff
+        if let primaryAgent = agentsModel.agentRows.first {
+            let inspectorView = SequoiaWindowCanvas(canvasSize: CGSize(width: 560, height: 780), windowCornerRadius: 14) {
+                ProcessDetailView(
+                    subject: .agent(primaryAgent),
+                    theme: .nativeGlass,
+                    isEmbedded: false,
+                    turnPreview: agentsModel.agentTurnPreviews[primaryAgent.id],
+                    steerMode: agentsModel.steerMode(for: primaryAgent),
+                    steerModeLabel: agentsModel.steerModeLabel(for: primaryAgent),
+                    steerSessionTargets: agentsModel.steerSessionTargets,
+                    selectedSteerSessionID: .constant(agentsModel.selectedSteerSessionID),
+                    isLoadingSteerSessions: false,
+                    canSendSteer: true,
+                    steerPromptText: .constant("/test --filter Phase5FeaturesTests"),
+                    isSteering: false,
+                    isPerformingAction: false,
+                    snippets: agentsModel.allSteeringSnippets,
+                    continuationJobs: agentsModel.continuationJobs(for: primaryAgent),
+                    collisionGroup: agentsModel.collisionGroup(for: primaryAgent),
+                    diffSummary: agentsModel.diffSummary(for: primaryAgent),
+                    stuckDiagnostic: agentsModel.stuckDiagnostic(for: primaryAgent),
+                    onFocusAgent: { _ in },
+                    onSteerAgent: { _ in },
+                    onStopAgent: { _, _ in },
+                    onApplySnippet: { _ in },
+                    onCancelContinuationJob: { _ in },
+                    onCreateIsolatedWorktree: { _ in },
+                    onDismiss: {}
+                )
+                .frame(width: 500, height: 720)
+                .background(Color(red: 0.10, green: 0.11, blue: 0.14))
+            }
+            writeScreenshot(
+                inspectorView,
+                size: CGSize(width: 560, height: 780),
+                to: outputURL.appendingPathComponent("02-steering-inspector-snippets-diff.png")
+            )
+        }
+
+        // 3. Notch Dynamic Island (Inline Reply + AskUserQuestion Chips) & Floating Companion
+        let inlineSteerNotchSnapshot = IslandSurfaceSnapshot(
+            activeAgentCount: 2,
+            waitingAgentCount: 1,
+            pendingApprovalCount: 0,
+            serverCount: 1,
+            primaryAgentName: "Codex",
+            primaryAgentTask: "Running: swift test --filter Phase5FeaturesTests",
+            isWaitingForInput: true,
+            canInlineSteerPrimary: true,
+            primarySteerModeSummary: "WezTerm (ttys004)",
+            theme: .nativeGlass
+        )
+        let questionNotchSnapshot = IslandSurfaceSnapshot(
+            activeAgentCount: 2,
+            waitingAgentCount: 1,
+            pendingApprovalCount: 1,
+            serverCount: 1,
+            primaryAgentName: "Claude Code",
+            primaryAgentTask: "Waiting for question answer",
+            isWaitingForInput: true,
+            firstApprovalID: "question-1",
+            firstApprovalToolName: "Claude Code · AskUserQuestion",
+            firstApprovalSummary: "Which verification target should run before packaging Suyoi Next?",
+            firstApprovalIsQuestion: true,
+            firstApprovalOptions: ["SuyoiCoreTests", "Full Suite + App", "Skip Tests", "Lint Only"],
+            canInlineSteerPrimary: true,
+            primarySteerModeSummary: "Terminal (ttys007)",
+            theme: .nativeGlass
+        )
+        let islandShowcase = ZStack {
+            LinearGradient(
+                colors: [
+                    Color(red: 0.06, green: 0.08, blue: 0.15),
+                    Color(red: 0.04, green: 0.05, blue: 0.10)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            VStack(spacing: 18) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("NOTCH DYNAMIC ISLAND · INLINE TERMINAL STEERING (WEZTERM / KITTY / TMUX / TTY)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(0.6)
+                        .foregroundStyle(.white.opacity(0.65))
+                    IslandWindowController.debugNotchPreview(
+                        snapshot: inlineSteerNotchSnapshot,
+                        isReplyingInline: true,
+                        replyDraft: "/test and summarize any failing assertions",
+                        isHovered: true
+                    )
+                    .frame(width: 460, height: 104)
+                    .shadow(color: .black.opacity(0.55), radius: 16, y: 8)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("NOTCH DYNAMIC ISLAND · INTERACTIVE ASKUSERQUESTION OPTION CHIPS")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(0.6)
+                        .foregroundStyle(.white.opacity(0.65))
+                    IslandWindowController.debugNotchPreview(
+                        snapshot: questionNotchSnapshot,
+                        isReplyingInline: false,
+                        replyDraft: "",
+                        isHovered: true
+                    )
+                    .frame(width: 460, height: 104)
+                    .shadow(color: .black.opacity(0.55), radius: 16, y: 8)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("FLOATING COMPANION · INLINE REPLY COMPOSER")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(0.6)
+                        .foregroundStyle(.white.opacity(0.65))
+                    IslandWindowController.debugBuddyPreview(
+                        snapshot: inlineSteerNotchSnapshot,
+                        isReplyingInline: true,
+                        replyDraft: "/diff"
+                    )
+                    .frame(width: 340, height: 78)
+                    .shadow(color: .black.opacity(0.55), radius: 16, y: 8)
+                }
+            }
+            .padding(28)
+        }
+        .frame(width: 760, height: 450)
+        .environment(\.colorScheme, .dark)
+
+        writeScreenshot(
+            islandShowcase,
+            size: CGSize(width: 760, height: 450),
+            to: outputURL.appendingPathComponent("03-notch-island-inline-steer-questions.png")
+        )
+
+        // 4. Quotas + Burn-Rate Depletion Forecast + Best Headroom Recommendation
+        let quotasModel = DashboardModel(fixture: showcaseSample, tab: .quotas, theme: .nativeGlass)
+        let shot4 = SequoiaWindowCanvas(canvasSize: CGSize(width: 760, height: 660), windowCornerRadius: 14) {
+            DashboardView(model: quotasModel)
+                .frame(width: 700, height: 600)
+                .background(Color(red: 0.10, green: 0.11, blue: 0.14))
+        }
+        writeScreenshot(
+            shot4,
+            size: CGSize(width: 760, height: 660),
+            to: outputURL.appendingPathComponent("04-quotas-burn-rate-forecast.png")
+        )
+
+        // 5. Settings: One-Click Claude Hook Installer + Read-Only Auto-Approve + Slash Snippets
+        let settingsModel = DashboardModel(fixture: showcaseSample, tab: .agents, theme: .nativeGlass)
+        let shot5 = SequoiaWindowCanvas(canvasSize: CGSize(width: 490, height: 800), windowCornerRadius: 14) {
+            SettingsView(model: settingsModel)
+                .frame(width: 410, height: 740)
+                .background(Color(red: 0.11, green: 0.12, blue: 0.15))
+        }
+        writeScreenshot(
+            shot5,
+            size: CGSize(width: 490, height: 800),
+            to: outputURL.appendingPathComponent("05-settings-hooks-readonly-snippets.png")
+        )
+
+        // 6. Pixel Arcade Theme Showcase
+        let pixelModel = DashboardModel(fixture: showcaseSample, tab: .agents, theme: .pixelArcade)
+        let shot6 = SequoiaWindowCanvas(canvasSize: CGSize(width: 760, height: 660), windowCornerRadius: 14) {
+            DashboardView(model: pixelModel)
+                .frame(width: 700, height: 600)
+                .background(Color(red: 0.07, green: 0.08, blue: 0.11))
+        }
+        writeScreenshot(
+            shot6,
+            size: CGSize(width: 760, height: 660),
+            to: outputURL.appendingPathComponent("06-pixel-arcade-theme.png")
+        )
+
+        print("Exported 6 Retina screenshots to \(outputURL.path)")
+        exit(0)
+    }
+
+    @MainActor
+    private static func writeScreenshot<Content: View>(
+        _ content: Content,
+        size: CGSize,
+        to destinationURL: URL
+    ) {
+        let darkContent = content
+            .frame(width: size.width, height: size.height)
+            .environment(\.colorScheme, .dark)
+
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.hasShadow = false
+        window.isOpaque = true
+        window.backgroundColor = NSColor(calibratedRed: 0.05, green: 0.06, blue: 0.10, alpha: 1.0)
+        if let darkAqua = NSAppearance(named: .darkAqua) {
+            window.appearance = darkAqua
+        }
+
+        let hostingView = NSHostingView(rootView: darkContent)
+        hostingView.frame = NSRect(origin: .zero, size: size)
+        if let darkAqua = NSAppearance(named: .darkAqua) {
+            hostingView.appearance = darkAqua
+        }
+        window.contentView = hostingView
+        window.setFrameOrigin(NSPoint(x: 80, y: 80))
+        window.makeKeyAndOrderFront(nil)
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.28))
+        activateVisualEffectsRecursively(in: hostingView)
+        hostingView.needsLayout = true
+        hostingView.layoutSubtreeIfNeeded()
+        hostingView.needsDisplay = true
+        RunLoop.main.run(until: Date().addingTimeInterval(0.12))
+
+        let pixelWidth = Int(size.width * 2.0)
+        let pixelHeight = Int(size.height * 2.0)
+        var pngData: Data?
+
+        if let bitmapRep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) {
+            bitmapRep.size = size
+            hostingView.cacheDisplay(in: hostingView.bounds, to: bitmapRep)
+            if bitmapHasVisibleContent(bitmapRep) {
+                pngData = bitmapRep.representation(using: .png, properties: [:])
+            }
+        }
+
+        if pngData == nil {
+            let renderer = ImageRenderer(content: darkContent)
+            renderer.scale = 2.0
+            if let nsImage = renderer.nsImage,
+               let tiff = nsImage.tiffRepresentation,
+               let rep = NSBitmapImageRep(data: tiff) {
+                pngData = rep.representation(using: .png, properties: [:])
+            }
+        }
+
+        window.orderOut(nil)
+
+        guard let finalPNG = pngData, finalPNG.count > 2_048 else {
+            fputs("Failed to rasterize non-empty PNG for \(destinationURL.lastPathComponent)\n", stderr)
+            exit(1)
+        }
+        do {
+            try finalPNG.write(to: destinationURL, options: .atomic)
+            print("Saved \(destinationURL.lastPathComponent) (\(finalPNG.count) bytes, \(pixelWidth)x\(pixelHeight) px)")
+        } catch {
+            fputs("Failed to write \(destinationURL.path): \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+    }
+
+    @MainActor
+    private static func activateVisualEffectsRecursively(in view: NSView) {
+        if let darkAqua = NSAppearance(named: .darkAqua) {
+            view.appearance = darkAqua
+        }
+        if let effectView = view as? NSVisualEffectView {
+            effectView.state = .active
+            effectView.material = .hudWindow
+        }
+        for subview in view.subviews {
+            activateVisualEffectsRecursively(in: subview)
+        }
+    }
+
+    private static func bitmapHasVisibleContent(_ rep: NSBitmapImageRep) -> Bool {
+        let w = rep.pixelsWide
+        let h = rep.pixelsHigh
+        guard w > 20, h > 20 else { return false }
+        var distinctShades = Set<Int>()
+        for yStep in stride(from: h / 8, to: h, by: max(1, h / 8)) {
+            for xStep in stride(from: w / 8, to: w, by: max(1, w / 8)) {
+                if let color = rep.colorAt(x: xStep, y: yStep)?.usingColorSpace(.deviceRGB) {
+                    let bucket = Int(color.redComponent * 255) * 65_536
+                        + Int(color.greenComponent * 255) * 256
+                        + Int(color.blueComponent * 255)
+                    distinctShades.insert(bucket)
+                    if distinctShades.count >= 4 {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    @MainActor
+    private struct SequoiaWindowCanvas<Content: View>: View {
+        let canvasSize: CGSize
+        let windowCornerRadius: CGFloat
+        @ViewBuilder let content: () -> Content
+
+        var body: some View {
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.07, green: 0.09, blue: 0.16),
+                        Color(red: 0.04, green: 0.05, blue: 0.09)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+
+                content()
+                    .clipShape(RoundedRectangle(cornerRadius: windowCornerRadius, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: windowCornerRadius, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.14), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.6), radius: 22, y: 10)
+            }
+            .frame(width: canvasSize.width, height: canvasSize.height)
+            .environment(\.colorScheme, .dark)
+        }
     }
 
     @MainActor
@@ -85,69 +447,151 @@ enum DashboardFixture {
         let cleanup: CleanupReport
         let staleSessionLogs: [StaleSessionLogSummary]
         let sessionTargets: [NativeSessionTarget]
+        let selectedSteerSessionID: String?
+        let steeringAgentID: Int?
         let instruction: String
         let approvals: [PendingApprovalRequest]
         let turnPreviews: [Int: SessionTurnPreview]
+        let surfaceMode: SuyoiSurfaceMode
+        let worktreeCollisions: [WorktreeCollisionGroup]
+        let worktreeDiffs: [String: WorktreeDiffSummary]
+        let orphanToolProcesses: [OrphanToolProcess]
+        let stuckAgents: [Int: StuckAgentDiagnostic]
+        let continuationJobs: [NativeContinuationJob]
+        let claudeHookStatus: ClaudeHookInstallStatus
+        let includePreToolUseHook: Bool
+        let scopedApprovalPolicy: ScopedApprovalPolicy
+        let autoApprovedToolHistory: [AutoApprovedToolRecord]
+        let customSnippets: [SteeringSnippet]
+        let burnRateTracker: QuotaBurnRateTracker
 
         fileprivate init(scenario: Scenario) {
             let now = Date()
             let web = ProjectContext(rootPath: root.path + "/customer-dashboard",
-                name: "Customer dashboard and reporting workspace", framework: "Next.js",
+                name: "customer-dashboard", framework: "Next.js",
                 gitBranch: "feature/account-usage-and-reset-windows", gitCommit: "e8bc410", isWorktree: true)
             let service = ProjectContext(rootPath: root.path + "/notification-service",
-                name: "Notification service", framework: "SwiftPM", gitBranch: "main", gitCommit: "c7ab391", isWorktree: false)
-            let codex = ObservedProcess(pid: 90_101, parentPID: 1, uid: 501, cpuPercent: 8.6,
+                name: "notification-service", framework: "SwiftPM", gitBranch: "main", gitCommit: "c7ab391", isWorktree: false)
+            let codex = ObservedProcess(pid: 90_101, parentPID: 1, uid: 501, cpuPercent: 14.2,
                 residentBytes: 436_000_000, executable: "/fixture/bin/codex", startTimeMicroseconds: 101,
-                cwd: scenario == .steering ? "/" : web.rootPath)
-            let claude = ObservedProcess(pid: 90_102, parentPID: 1, uid: 501, cpuPercent: 0,
+                cwd: scenario == .steering ? "/" : web.rootPath, tty: scenario == .showcase ? "ttys004" : nil)
+            let claude = ObservedProcess(pid: 90_102, parentPID: 1, uid: 501, cpuPercent: 0.4,
                 residentBytes: 324_000_000, executable: "/fixture/bin/claude", startTimeMicroseconds: 102,
                 cwd: service.rootPath, tty: "ttys007")
-            let openCode = ObservedProcess(pid: 90_103, parentPID: 1, uid: 501, cpuPercent: 0,
+            let openCode = ObservedProcess(pid: 90_103, parentPID: 1, uid: 501, cpuPercent: 92.4,
                 residentBytes: 170_000_000, executable: "/fixture/bin/opencode", startTimeMicroseconds: 103,
-                cwd: web.rootPath)
+                cwd: web.rootPath, tty: scenario == .showcase ? "ttys009" : nil)
             let server = ObservedProcess(pid: 90_104, parentPID: codex.pid, uid: 501, cpuPercent: 2.8,
                 residentBytes: 592_000_000, executable: "/fixture/bin/node", startTimeMicroseconds: 104, cwd: web.rootPath)
-            let ports = [3000, 3001, 3002, 3003, 4000, 4173, 5173, 8080]
+            let orphanMCP1 = ObservedProcess(pid: 90_210, parentPID: 1, uid: 501, cpuPercent: 0.1,
+                residentBytes: 84_000_000, executable: "/fixture/bin/node", startTimeMicroseconds: 210, cwd: web.rootPath)
+            let orphanMCP2 = ObservedProcess(pid: 90_211, parentPID: 1, uid: 501, cpuPercent: 0.0,
+                residentBytes: 62_000_000, executable: "/fixture/bin/npx", startTimeMicroseconds: 211, cwd: service.rootPath)
+
+            let ports = [3000, 3001, 5173]
             let listeners = ports.map { Listener(pid: server.pid, processName: "node", address: "127.0.0.1", port: $0) }
             let codexSession = "205926f6-c738-4b6a-8204-e032447c1303"
             let agents = [
                 AgentObservation(id: codex.pid, agentName: "Codex", process: codex,
-                    project: scenario == .steering ? nil : web, terminalApp: nil, statusSource: .processOnly,
+                    project: scenario == .steering ? nil : web,
+                    terminalApp: scenario == .showcase ? "WezTerm" : nil,
+                    statusSource: .processOnly,
                     childServerPorts: ports, activityState: .active, activityDetail: "Active CPU / running child command",
                     lastActivityAt: now, sessionID: scenario == .steering ? nil : codexSession,
-                    currentTask: scenario == .steering ? nil : "Running: swift test"),
+                    currentTask: scenario == .steering ? nil : "Running: swift test --filter Phase5FeaturesTests"),
                 AgentObservation(id: claude.pid, agentName: "Claude Code", process: claude, project: service,
                     terminalApp: "Terminal", statusSource: .processOnly, childServerPorts: [],
-                    activityState: .idle, activityDetail: "No process activity detected"),
+                    activityState: .waitingForInput, activityDetail: "Waiting for tool approval",
+                    lastActivityAt: now.addingTimeInterval(-25),
+                    sessionID: "06eb0a11-b8aa-464e-834b-eb7eced111e4",
+                    currentTask: "Pending Bash approval: swift test"),
                 AgentObservation(id: openCode.pid, agentName: "OpenCode", process: openCode, project: web,
-                    terminalApp: nil, statusSource: .processOnly, childServerPorts: [],
-                    activityState: .idle, activityDetail: "No process activity detected")
+                    terminalApp: scenario == .showcase ? "kitty" : nil,
+                    statusSource: .processOnly, childServerPorts: [],
+                    activityState: scenario == .showcase ? .active : .idle,
+                    activityDetail: scenario == .showcase ? "Sustained CPU in shared worktree" : "No process activity detected",
+                    lastActivityAt: now.addingTimeInterval(-190),
+                    currentTask: scenario == .showcase ? "Refactoring customer-dashboard routes" : nil)
             ]
             let group = ServerGroup(id: "fixture-web", rootPID: server.pid, name: "Customer dashboard",
                 memberPIDs: [server.pid], memberIdentities: [server.identity], listeners: listeners, project: web,
                 cpuPercent: 2.8, residentBytes: server.residentBytes, footprintBytes: nil,
                 startedAt: now.addingTimeInterval(-9_500), stoppedByAgentBoundary: true)
-            inventory = InventorySnapshot(processes: [codex, claude, openCode, server], listeners: listeners,
-                warnings: [], capturedAt: now, agentObservations: agents, serverGroups: [group],
-                projectsByPath: [web.rootPath: web, service.rootPath: service])
-            let usage = TokenUsageSummary(windowMinutes: 300, startedAt: now.addingTimeInterval(-18_000),
+            inventory = InventorySnapshot(
+                processes: [codex, claude, openCode, server, orphanMCP1, orphanMCP2],
+                listeners: listeners,
+                warnings: [],
+                capturedAt: now,
+                agentObservations: agents,
+                serverGroups: [group],
+                projectsByPath: [web.rootPath: web, service.rootPath: service]
+            )
+            let codexUsage = TokenUsageSummary(windowMinutes: 300, startedAt: now.addingTimeInterval(-18_000),
                 endedAt: now, inputTokens: 23_456, outputTokens: 8_028, cacheReadTokens: 184_000,
                 totalTokens: 215_484, status: .complete)
+            let claudeUsage = TokenUsageSummary(windowMinutes: 300, startedAt: now.addingTimeInterval(-18_000),
+                endedAt: now, inputTokens: 61_200, outputTokens: 19_410, cacheReadTokens: 412_000,
+                totalTokens: 492_610, status: .complete)
             quotas = QuotaSnapshot(capturedAt: now, providers: [
+                ProviderQuotaStatus(provider: .claude, source: .localTelemetry, observedAt: now,
+                    status: .complete, tokenUsage: [claudeUsage]),
                 ProviderQuotaStatus(provider: .codex, source: .localTelemetry, observedAt: now,
-                    status: .complete, tokenUsage: [usage]),
+                    status: .complete, tokenUsage: [codexUsage]),
                 ProviderQuotaStatus(provider: .openCode, source: .localTelemetry, observedAt: now, status: .partial,
                     warnings: ["Seven-day usage is unavailable"])
             ])
+
+            let claudeFiveHour = QuotaWindow(kind: .fiveHour, windowMinutes: 300, usedPercent: 56, resetsAt: now.addingTimeInterval(6_900))
+            let claudeSevenDay = QuotaWindow(kind: .sevenDay, windowMinutes: 10_080, usedPercent: 48, resetsAt: now.addingTimeInterval(312_000))
+            let codexFiveHour = QuotaWindow(kind: .fiveHour, windowMinutes: 300, usedPercent: 17, resetsAt: now.addingTimeInterval(5_400))
+            let codexSevenDay = QuotaWindow(kind: .sevenDay, windowMinutes: 10_080, usedPercent: 31, resetsAt: now.addingTimeInterval(274_500))
+
             liveQuotas = [
-                .codex: ProviderQuotaStatus(provider: .codex, source: .liveAPI, observedAt: now,
-                    status: .complete, planType: "Pro", windows: [
-                        QuotaWindow(kind: .fiveHour, windowMinutes: 300, usedPercent: 17, resetsAt: now.addingTimeInterval(5_400)),
-                        QuotaWindow(kind: .sevenDay, windowMinutes: 10_080, usedPercent: 64, resetsAt: now.addingTimeInterval(274_500))
-                    ]),
-                .claude: ProviderQuotaStatus(provider: .claude, source: .liveAPI, observedAt: now,
-                    status: .unavailable, warnings: ["Local OAuth credential unavailable"])
+                .claude: ProviderQuotaStatus(
+                    provider: .claude,
+                    source: .liveAPI,
+                    observedAt: now,
+                    status: scenario == .showcase ? .complete : .unavailable,
+                    planType: scenario == .showcase ? "Max 5x" : nil,
+                    windows: scenario == .showcase ? [claudeFiveHour, claudeSevenDay] : [],
+                    warnings: scenario == .showcase ? [] : ["Local OAuth credential unavailable"]
+                ),
+                .codex: ProviderQuotaStatus(
+                    provider: .codex,
+                    source: .liveAPI,
+                    observedAt: now,
+                    status: .complete,
+                    planType: "Pro",
+                    windows: [codexFiveHour, codexSevenDay]
+                )
             ]
+
+            var tracker = QuotaBurnRateTracker()
+            if scenario == .showcase {
+                let earlier = now.addingTimeInterval(-1_800)
+                tracker.record(
+                    windowsByProvider: [
+                        .claude: [
+                            QuotaWindow(kind: .fiveHour, windowMinutes: 300, usedPercent: 37, resetsAt: claudeFiveHour.resetsAt),
+                            claudeSevenDay
+                        ],
+                        .codex: [
+                            QuotaWindow(kind: .fiveHour, windowMinutes: 300, usedPercent: 14, resetsAt: codexFiveHour.resetsAt),
+                            codexSevenDay
+                        ]
+                    ],
+                    at: earlier
+                )
+                tracker.record(
+                    windowsByProvider: [
+                        .claude: [claudeFiveHour, claudeSevenDay],
+                        .codex: [codexFiveHour, codexSevenDay]
+                    ],
+                    at: now
+                )
+            }
+            burnRateTracker = tracker
+
             let identity = FileIdentity(device: -1, inode: 0)
             let artifacts = [
                 CleanupCandidate(path: service.rootPath + "/.build", category: "Swift build", bytes: 8_800_000_000,
@@ -174,17 +618,159 @@ enum DashboardFixture {
                 .dashboardFixture(sessionID: "e23f271e-13af-457c-af96-8743db93761b", projectPath: service.rootPath,
                     title: "Notification delivery tests", updatedAt: now.addingTimeInterval(-2_700), rowIdentity: codex.identity)
             ] : []
-            instruction = scenario == .steering ? "Check the failing browser fixture." : ""
-            approvals = scenario == .approval ? [
-                PendingApprovalRequest(id: "fixture-approval", sessionID: "06eb0a11-b8aa-464e-834b-eb7eced111e4",
-                    agentName: "Claude Code", pid: claude.pid, projectPath: service.rootPath, toolName: "Bash",
-                    summary: "swift test --filter NotificationDeliveryTests", questionOptions: [], requestedAt: now)
+            selectedSteerSessionID = nil
+            steeringAgentID = scenario == .showcase ? codex.pid : nil
+            instruction = scenario == .steering
+                ? "Check the failing browser fixture."
+                : (scenario == .showcase ? "/test --filter Phase5FeaturesTests" : "")
+            approvals = (scenario == .approval || scenario == .showcase) ? [
+                PendingApprovalRequest(
+                    id: "fixture-approval",
+                    sessionID: "06eb0a11-b8aa-464e-834b-eb7eced111e4",
+                    agentName: "Claude Code",
+                    pid: claude.pid,
+                    projectPath: service.rootPath,
+                    toolName: "Bash",
+                    summary: "swift test --filter NotificationDeliveryTests",
+                    questionOptions: [],
+                    requestedAt: now
+                )
             ] : []
             turnPreviews = scenario == .steering ? [:] : [
-                codex.pid: SessionTurnPreview(sessionID: codexSession, lastUserPromptPreview: "Check the account reset labels.",
-                    lastAssistantReplyPreview: "I found the quota source and am running the dashboard checks.",
-                    recentTools: [SessionToolCallSummary(toolName: "swift", targetSummary: "swift test", status: "running")], updatedAt: now)
+                codex.pid: SessionTurnPreview(
+                    sessionID: codexSession,
+                    lastUserPromptPreview: "Verify WezTerm steering and slash snippet expansion.",
+                    lastAssistantReplyPreview: "Updated AgentSteerer and running Phase5FeaturesTests now.",
+                    recentTools: [SessionToolCallSummary(toolName: "swift", targetSummary: "swift test", status: "running")],
+                    updatedAt: now
+                )
             ]
+            surfaceMode = scenario == .showcase ? .notchIsland : .menuBarPopover
+
+            if scenario == .showcase {
+                worktreeCollisions = [
+                    WorktreeCollisionGroup(
+                        projectPath: web.rootPath,
+                        projectName: "customer-dashboard",
+                        gitBranch: web.gitBranch,
+                        agentIDs: [codex.pid, openCode.pid],
+                        agentNames: ["Codex", "OpenCode"],
+                        activeCount: 2
+                    )
+                ]
+                worktreeDiffs = [
+                    web.rootPath: WorktreeDiffSummary(
+                        projectPath: web.rootPath,
+                        changedFiles: 4,
+                        untrackedFiles: 1,
+                        addedLines: 142,
+                        deletedLines: 38,
+                        sampleFiles: [
+                            "Sources/SuyoiCore/AgentSteerer.swift",
+                            "Sources/SuyoiApp/IslandWindowController.swift",
+                            "Tests/SuyoiCoreTests/Phase5FeaturesTests.swift"
+                        ]
+                    ),
+                    service.rootPath: WorktreeDiffSummary(
+                        projectPath: service.rootPath,
+                        changedFiles: 2,
+                        untrackedFiles: 0,
+                        addedLines: 49,
+                        deletedLines: 11,
+                        sampleFiles: ["Sources/NotificationService/Dispatcher.swift"]
+                    )
+                ]
+                orphanToolProcesses = [
+                    OrphanToolProcess(process: orphanMCP1, kindLabel: "filesystem-mcp"),
+                    OrphanToolProcess(process: orphanMCP2, kindLabel: "playwright-mcp")
+                ]
+                stuckAgents = [
+                    openCode.pid: StuckAgentDiagnostic(
+                        agentID: openCode.pid,
+                        consecutiveHighCPUSamples: 7,
+                        cpuPercent: 92.4,
+                        summary: "92% CPU across 7 samples without session progress"
+                    )
+                ]
+                continuationJobs = [
+                    NativeContinuationJob(
+                        id: UUID(),
+                        agentID: codex.pid,
+                        agentName: "Codex",
+                        sessionID: codexSession,
+                        projectPath: web.rootPath,
+                        executableName: "codex",
+                        pid: 90_412,
+                        startedAt: now.addingTimeInterval(-18),
+                        state: .running
+                    ),
+                    NativeContinuationJob(
+                        id: UUID(),
+                        agentID: codex.pid,
+                        agentName: "Codex",
+                        sessionID: codexSession,
+                        projectPath: web.rootPath,
+                        executableName: "codex",
+                        pid: 90_388,
+                        startedAt: now.addingTimeInterval(-420),
+                        endedAt: now.addingTimeInterval(-395),
+                        state: .completed
+                    )
+                ]
+                claudeHookStatus = .installed(
+                    command: "\"/Applications/Suyoi Next.app/Contents/MacOS/Suyoi\" --hook-bridge",
+                    includesPreToolUse: true
+                )
+                includePreToolUseHook = true
+                scopedApprovalPolicy = ScopedApprovalPolicy(
+                    autoApproveReadOnlyTools: true,
+                    applyToAllVerifiedProjects: false,
+                    allowedProjectPaths: [web.rootPath]
+                )
+                autoApprovedToolHistory = [
+                    AutoApprovedToolRecord(
+                        agentName: "Codex",
+                        toolName: "Read",
+                        projectPath: web.rootPath,
+                        summary: "Sources/SuyoiCore/AgentSteerer.swift",
+                        approvedAt: now.addingTimeInterval(-45)
+                    ),
+                    AutoApprovedToolRecord(
+                        agentName: "Codex",
+                        toolName: "Grep",
+                        projectPath: web.rootPath,
+                        summary: "preferredMode",
+                        approvedAt: now.addingTimeInterval(-30)
+                    ),
+                    AutoApprovedToolRecord(
+                        agentName: "Claude Code",
+                        toolName: "Bash",
+                        projectPath: web.rootPath,
+                        summary: "git status --porcelain",
+                        approvedAt: now.addingTimeInterval(-12)
+                    )
+                ]
+                customSnippets = [
+                    SteeringSnippet(
+                        id: "custom-lint",
+                        trigger: "/lint",
+                        title: "SwiftLint Strict",
+                        prompt: "Run SwiftLint and fix all strict warnings without changing public APIs.",
+                        isBuiltIn: false
+                    )
+                ]
+            } else {
+                worktreeCollisions = []
+                worktreeDiffs = [:]
+                orphanToolProcesses = []
+                stuckAgents = [:]
+                continuationJobs = []
+                claudeHookStatus = .notInstalled
+                includePreToolUseHook = false
+                scopedApprovalPolicy = ScopedApprovalPolicy()
+                autoApprovedToolHistory = []
+                customSnippets = []
+            }
         }
     }
 }

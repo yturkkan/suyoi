@@ -380,6 +380,58 @@ final class IslandWindowController: NSObject {
               let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first else { return }
         keepBuddyOnScreen(panel, fallback: screen)
     }
+
+#if DEBUG
+    static func debugNotchPreview(
+        snapshot: IslandSurfaceSnapshot,
+        isReplyingInline: Bool = false,
+        replyDraft: String = "",
+        isHovered: Bool = true
+    ) -> AnyView {
+        let previewState = IslandSurfaceState()
+        previewState.snapshot = snapshot
+        previewState.showsNotch = true
+        previewState.isNotchHovered = isHovered
+        previewState.isReplyingInline = isReplyingInline
+        previewState.inlineReplyDraft = replyDraft
+        return AnyView(
+            NotchIslandView(
+                state: previewState,
+                onOpen: {},
+                onHover: { _ in },
+                onApprove: { _ in },
+                onDeny: { _ in },
+                onAnswerQuestion: { _, _ in },
+                onToggleReply: { _ in },
+                onSubmitReply: {}
+            )
+        )
+    }
+
+    static func debugBuddyPreview(
+        snapshot: IslandSurfaceSnapshot,
+        isReplyingInline: Bool = false,
+        replyDraft: String = ""
+    ) -> AnyView {
+        let previewState = IslandSurfaceState()
+        previewState.snapshot = snapshot
+        previewState.showsBuddy = true
+        previewState.isReplyingInline = isReplyingInline
+        previewState.inlineReplyDraft = replyDraft
+        return AnyView(
+            FloatingBuddyView(
+                state: previewState,
+                onFocus: {},
+                onOpen: {},
+                onApprove: { _ in },
+                onDeny: { _ in },
+                onAnswerQuestion: { _, _ in },
+                onToggleReply: { _ in },
+                onSubmitReply: {}
+            )
+        )
+    }
+#endif
 }
 
 @MainActor

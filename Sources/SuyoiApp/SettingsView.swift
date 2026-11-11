@@ -48,7 +48,7 @@ struct SettingsView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
         }
-        .frame(width: 410, height: 500)
+        .frame(minWidth: 410, idealWidth: 410, maxWidth: 410, minHeight: 500, idealHeight: 500)
         .onAppear {
             model.refreshClaudeHookStatus()
         }

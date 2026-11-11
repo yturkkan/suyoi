@@ -298,11 +298,11 @@ final class DashboardModel: ObservableObject {
         scanAllWorkspaces = false
         providerOrder = QuotaProvider.allCases
         hiddenProviders = []
-        areNotificationsEnabled = false
-        isLaunchAtLoginEnabled = false
-        surfaceMode = .menuBarPopover
+        areNotificationsEnabled = true
+        isLaunchAtLoginEnabled = true
+        surfaceMode = fixture.surfaceMode
         experienceTheme = theme
-        soundMode = .muted
+        soundMode = .themeSynthesized
         statusBarStyle = .agentsAndServers
 
         self.tab = tab
@@ -315,10 +315,23 @@ final class DashboardModel: ObservableObject {
         staleSessionLogs = fixture.staleSessionLogs
         selectedAgent = fixture.inventory.agentObservations.first
         steerContext = selectedAgent?.process.identity
+        steeringAgentID = fixture.steeringAgentID
         steerSessionTargets = fixture.sessionTargets
+        selectedSteerSessionID = fixture.selectedSteerSessionID
         steerPromptText = fixture.instruction
         pendingApprovals = fixture.approvals
         agentTurnPreviews = fixture.turnPreviews
+        worktreeCollisions = fixture.worktreeCollisions
+        worktreeDiffs = fixture.worktreeDiffs
+        orphanToolProcesses = fixture.orphanToolProcesses
+        stuckAgents = fixture.stuckAgents
+        continuationJobs = fixture.continuationJobs
+        claudeHookStatus = fixture.claudeHookStatus
+        includePreToolUseHook = fixture.includePreToolUseHook
+        scopedApprovalPolicy = fixture.scopedApprovalPolicy
+        autoApprovedToolHistory = fixture.autoApprovedToolHistory
+        customSnippets = fixture.customSnippets
+        burnRateTracker = fixture.burnRateTracker
     }
 #endif
 
@@ -1293,6 +1306,7 @@ final class DashboardModel: ObservableObject {
     }
 
     func refreshClaudeHookStatus() {
+        guard inspector != nil else { return }
         claudeHookStatus = ClaudeHookInstaller(homeDirectory: homeDirectory).inspectStatus(
             bridgeExecutablePath: bridgeExecutablePath
         )
@@ -1682,6 +1696,7 @@ final class DashboardModel: ObservableObject {
     }
 
     func reloadSteerSessions(for obs: AgentObservation) {
+        guard inspector != nil else { return }
         steerContext = obs.process.identity
         selectedSteerSessionID = nil
         let generation = UUID()
