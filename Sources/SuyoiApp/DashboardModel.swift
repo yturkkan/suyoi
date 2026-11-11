@@ -101,6 +101,16 @@ final class DashboardModel: ObservableObject {
     @Published var selectedCleanupCandidateIDs: Set<String> = []
     @Published var staleSessionLogs: [StaleSessionLogSummary] = []
     @Published var sessionLogRetentionDays: Int = 14
+    @Published private(set) var continuationJobs: [NativeContinuationJob] = []
+    @Published var customSnippets: [SteeringSnippet] = []
+    @Published var claudeHookStatus: ClaudeHookInstallStatus = .notInstalled
+    @Published var includePreToolUseHook: Bool = false
+    @Published var scopedApprovalPolicy = ScopedApprovalPolicy()
+    @Published private(set) var autoApprovedToolHistory: [AutoApprovedToolRecord] = []
+    @Published private(set) var worktreeCollisions: [WorktreeCollisionGroup] = []
+    @Published private(set) var worktreeDiffs: [String: WorktreeDiffSummary] = [:]
+    @Published private(set) var orphanToolProcesses: [OrphanToolProcess] = []
+    @Published private(set) var stuckAgents: [Int: StuckAgentDiagnostic] = [:]
 
     private static let providerOrderKey = "suyoi.quotaProviderOrder"
     private static let hiddenProvidersKey = "suyoi.hiddenQuotaProviders"
@@ -113,6 +123,16 @@ final class DashboardModel: ObservableObject {
     private static let soundModeKey = "suyoi.soundMode"
     private static let selectedSoundPackIDKey = "suyoi.selectedSoundPackID"
     private static let statusBarStyleKey = "suyoi.statusBarStyle"
+    private static let scopedApprovalPolicyKey = "suyoi.scopedApprovalPolicy"
+    private static let includePreToolUseHookKey = "suyoi.includePreToolUseHook"
+
+    static let waitingAgentCategoryID = "SUYOI_WAITING_AGENT"
+    static let hookApprovalCategoryID = "SUYOI_HOOK_APPROVAL"
+    static let actionSteerReplyID = "STEER_REPLY"
+    static let actionFocusAgentID = "FOCUS_AGENT"
+    static let actionApproveOnceID = "APPROVE_ONCE"
+    static let actionDenyOnceID = "DENY_ONCE"
+    static let actionAnswerFirstID = "ANSWER_FIRST"
 
     let homeDirectory: URL
     private let inspector: SystemInspector?
@@ -120,6 +140,8 @@ final class DashboardModel: ObservableObject {
     private let quotaInspector: any QuotaInspecting
     private let liveQuotaPoller: any LiveQuotaPolling
     private let agentSteerer: any AgentSteering
+    private let nativeJobLauncher: NativeAgentJobLauncher?
+    private let worktreeDiffInspector = WorktreeDiffInspector()
     private var steerSessionGeneration = UUID()
     private var steerContext: ProcessIdentity?
     private let appUpdater: any AppUpdating
@@ -131,8 +153,11 @@ final class DashboardModel: ObservableObject {
     private let soundPlayer = SoundEffectPlayer()
     private var approvalInboxWatcher: ApprovalInboxWatcher?
     private var previousAgentStates: [Int: AgentActivityState] = [:]
+    private var notifiedApprovalIDs = Set<String>()
     private var hasCompletedInitialRefresh = false
     private var alertTracker = AlertStateTracker()
+    private var burnRateTracker = QuotaBurnRateTracker()
+    private var stuckAgentTracker = StuckAgentTracker()
     private var livePollTask: Task<Void, Never>?
     private var livePollGeneration: UInt64 = 0
     private var cleanupScanTask: Task<Void, Never>?
@@ -142,17 +167,19 @@ final class DashboardModel: ObservableObject {
         actionExecutor: any ActionExecuting = ActionExecutor(),
         quotaInspector: any QuotaInspecting = LocalQuotaInspector(),
         liveQuotaPoller: any LiveQuotaPolling = LiveQuotaPoller(),
-        agentSteerer: any AgentSteering = AgentSteerer(),
+        agentSteerer: (any AgentSteering)? = nil,
         appUpdater: any AppUpdating = AppUpdater()
     ) {
         self.inspector = SystemInspector()
         self.actionExecutor = actionExecutor
         self.quotaInspector = quotaInspector
         self.liveQuotaPoller = liveQuotaPoller
-        self.agentSteerer = agentSteerer
-        self.appUpdater = appUpdater
         let home = FileManager.default.homeDirectoryForCurrentUser
         self.homeDirectory = home
+        let sharedLauncher = NativeAgentJobLauncher(homeDirectory: home)
+        self.nativeJobLauncher = sharedLauncher
+        self.agentSteerer = agentSteerer ?? AgentSteerer(homeDirectory: home, nativeJobLauncher: sharedLauncher)
+        self.appUpdater = appUpdater
         let resolvedRoot: URL
         if let savedRoot = UserDefaults.standard.string(forKey: Self.cleanupRootPathKey),
            savedRoot.hasPrefix("/"),
@@ -227,6 +254,23 @@ final class DashboardModel: ObservableObject {
         } else {
             self.statusBarStyle = .agentsAndServers
         }
+        self.customSnippets = SteeringSnippetCatalog.loadCustomSnippets()
+        self.includePreToolUseHook = UserDefaults.standard.bool(forKey: Self.includePreToolUseHookKey)
+        if let policyData = UserDefaults.standard.data(forKey: Self.scopedApprovalPolicyKey),
+           let savedPolicy = try? JSONDecoder().decode(ScopedApprovalPolicy.self, from: policyData) {
+            self.scopedApprovalPolicy = savedPolicy
+            self.approvalController.setScopedPolicy(savedPolicy)
+        }
+        let bridgePath = Bundle.main.executableURL?.path ?? "/Applications/Suyoi.app/Contents/MacOS/Suyoi"
+        self.claudeHookStatus = ClaudeHookInstaller(homeDirectory: home).inspectStatus(bridgeExecutablePath: bridgePath)
+
+        sharedLauncher.setStateObserver { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, let launcher = self.nativeJobLauncher else { return }
+                self.continuationJobs = launcher.recentJobs()
+            }
+        }
+
         let watcher = ApprovalInboxWatcher(
             inboxDirectory: HookBridgeClient.defaultInboxDirectory(homeDirectory: home)
         ) { [weak self] in
@@ -247,6 +291,7 @@ final class DashboardModel: ObservableObject {
         quotaInspector = services
         liveQuotaPoller = services
         agentSteerer = services
+        nativeJobLauncher = nil
         appUpdater = services
         cleanupRoot = fixture.root
         isLiveQuotaEnabled = true
@@ -574,8 +619,11 @@ final class DashboardModel: ObservableObject {
         isRefreshing = true
         let currentQuotaInspector = quotaInspector
         let previewInspector = turnPreviewInspector
+        let diffInspector = worktreeDiffInspector
+        let currentUID = Int(getuid())
         Task {
-            async let invResult = Task.detached(priority: .utility) { () -> (InventorySnapshot, [Int: SessionTurnPreview]) in
+            async let invResult = Task.detached(priority: .utility) {
+                () -> (InventorySnapshot, [Int: SessionTurnPreview], [String: WorktreeDiffSummary], [OrphanToolProcess]) in
                 let snap = currentInspector.snapshot()
                 var previews: [Int: SessionTurnPreview] = [:]
                 for obs in snap.agentObservations {
@@ -583,16 +631,27 @@ final class DashboardModel: ObservableObject {
                         previews[obs.id] = preview
                     }
                 }
-                return (snap, previews)
+                let diffs = diffInspector.inspectActiveProjects(for: snap.agentObservations)
+                let orphans = ProcessHealthAdvisor.detectOrphanToolProcesses(in: snap, uid: currentUID)
+                return (snap, previews, diffs, orphans)
             }.value
             async let quotaResult = Task.detached(priority: .utility) { currentQuotaInspector.inspectQuotas(at: Date()) }.value
-            let ((newSnapshot, newPreviews), newQuotas) = await (invResult, quotaResult)
+            let ((newSnapshot, newPreviews, newDiffs, newOrphans), newQuotas) = await (invResult, quotaResult)
             snapshot = newSnapshot
             agentTurnPreviews = newPreviews
+            worktreeDiffs = newDiffs
+            orphanToolProcesses = newOrphans
+            let currentAgents = agentRows
+            worktreeCollisions = AgentCollisionDetector.detectCollisions(in: currentAgents)
+            stuckAgents = stuckAgentTracker.evaluate(agents: currentAgents, turnPreviews: newPreviews)
+            if let launcher = nativeJobLauncher {
+                continuationJobs = launcher.recentJobs()
+            }
             quotaSnapshot = newQuotas
+            recordCurrentQuotaBurnSamples()
             isRefreshing = false
             pollApprovalInboxSpool()
-            evaluateAgentStateAudioTransitions(currentAgents: agentRows)
+            evaluateAgentStateAudioTransitions(currentAgents: currentAgents)
             evaluateAndDeliverAlerts()
             if isLiveQuotaEnabled {
                 pollLiveQuotas(trigger: .automatic)
@@ -640,6 +699,7 @@ final class DashboardModel: ObservableObject {
             liveQuotas[.claude] = claudeStatus
             liveQuotas[.gemini] = geminiStatus
             isPollingLiveQuotas = false
+            recordCurrentQuotaBurnSamples(at: now)
             evaluateAndDeliverAlerts()
         }
     }
@@ -652,10 +712,12 @@ final class DashboardModel: ObservableObject {
         isPollingLiveQuotas = true
         let poller = liveQuotaPoller
         livePollTask = Task {
-            let status = await poller.pollQuota(for: provider, permission: .userInitiated, at: Date())
+            let now = Date()
+            let status = await poller.pollQuota(for: provider, permission: .userInitiated, at: now)
             guard !Task.isCancelled, isLiveQuotaEnabled, livePollGeneration == gen else { return }
             liveQuotas[provider] = status
             isPollingLiveQuotas = false
+            recordCurrentQuotaBurnSamples(at: now)
             evaluateAndDeliverAlerts()
         }
     }
@@ -751,6 +813,51 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    func registerNotificationCategories() {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
+        let replyAction = UNTextInputNotificationAction(
+            identifier: Self.actionSteerReplyID,
+            title: "Reply / Steer",
+            options: [],
+            textInputButtonTitle: "Send",
+            textInputPlaceholder: "Send instruction to terminal…"
+        )
+        let focusAction = UNNotificationAction(
+            identifier: Self.actionFocusAgentID,
+            title: "Focus Terminal",
+            options: [.foreground]
+        )
+        let waitingCategory = UNNotificationCategory(
+            identifier: Self.waitingAgentCategoryID,
+            actions: [replyAction, focusAction],
+            intentIdentifiers: [],
+            options: []
+        )
+
+        let approveAction = UNNotificationAction(
+            identifier: Self.actionApproveOnceID,
+            title: "Approve Once",
+            options: []
+        )
+        let answerFirstAction = UNNotificationAction(
+            identifier: Self.actionAnswerFirstID,
+            title: "Select Top Option",
+            options: []
+        )
+        let denyAction = UNNotificationAction(
+            identifier: Self.actionDenyOnceID,
+            title: "Deny",
+            options: [.destructive]
+        )
+        let approvalCategory = UNNotificationCategory(
+            identifier: Self.hookApprovalCategoryID,
+            actions: [approveAction, answerFirstAction, denyAction, focusAction],
+            intentIdentifiers: [],
+            options: []
+        )
+        UNUserNotificationCenter.current().setNotificationCategories([waitingCategory, approvalCategory])
+    }
+
     func setNotificationsEnabled(_ enabled: Bool) {
         areNotificationsEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: Self.notificationsEnabledKey)
@@ -759,11 +866,12 @@ final class DashboardModel: ObservableObject {
                 showBanner("Alert notifications enabled")
                 return
             }
+            registerNotificationCategories()
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     if granted {
-                        self.showBanner("Agent waiting & quota notifications enabled")
+                        self.showBanner("Actionable agent, approval & quota notifications enabled")
                         self.evaluateAndDeliverAlerts()
                     } else {
                         self.showBanner("Enable Suyoi notifications in macOS System Settings", isError: true)
@@ -800,7 +908,8 @@ final class DashboardModel: ObservableObject {
                 combinedQuotaMap[provider] = local
             }
         }
-        let events = alertTracker.evaluate(agents: agentRows, quotas: combinedQuotaMap)
+        let currentAgents = agentRows
+        let events = alertTracker.evaluate(agents: currentAgents, quotas: combinedQuotaMap)
         for event in events {
             switch event.kind {
             case .agentWaiting:
@@ -819,8 +928,75 @@ final class DashboardModel: ObservableObject {
             content.title = event.title
             content.body = event.body
             content.sound = .default
+            if event.kind == .agentWaiting {
+                content.categoryIdentifier = Self.waitingAgentCategoryID
+                if let waitingAgent = currentAgents.first(where: { $0.activityState == .waiting }) {
+                    content.userInfo = ["agentPID": waitingAgent.process.pid]
+                }
+            }
             let request = UNNotificationRequest(identifier: event.id, content: content, trigger: nil)
             UNUserNotificationCenter.current().add(request)
+        }
+    }
+
+    private func deliverPendingApprovalNotificationsIfNeeded() {
+        let currentIDs = Set(pendingApprovals.map(\.id))
+        notifiedApprovalIDs = notifiedApprovalIDs.intersection(currentIDs)
+        guard areNotificationsEnabled, Bundle.main.bundleURL.pathExtension == "app" else { return }
+        for req in pendingApprovals where notifiedApprovalIDs.insert(req.id).inserted {
+            let content = UNMutableNotificationContent()
+            content.title = req.questionOptions.isEmpty
+                ? "\(req.agentName) needs tool approval (\(req.toolName))"
+                : "\(req.agentName) asked a question"
+            content.body = req.summary
+            content.sound = .default
+            content.categoryIdentifier = Self.hookApprovalCategoryID
+            var info: [String: Any] = ["requestID": req.id]
+            if let pid = req.pid {
+                info["agentPID"] = pid
+            }
+            content.userInfo = info
+            let notifReq = UNNotificationRequest(identifier: "approval-\(req.id)", content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(notifReq)
+        }
+    }
+
+    func handleNotificationAction(
+        actionIdentifier: String,
+        requestID: String?,
+        agentPID: Int?,
+        userText: String?
+    ) {
+        switch actionIdentifier {
+        case Self.actionApproveOnceID:
+            if let requestID {
+                approvePendingRequest(id: requestID)
+            }
+        case Self.actionDenyOnceID:
+            if let requestID {
+                denyPendingRequest(id: requestID)
+            }
+        case Self.actionAnswerFirstID:
+            if let requestID,
+               let req = pendingApprovals.first(where: { $0.id == requestID }),
+               let firstOpt = req.questionOptions.first {
+                answerPendingQuestion(id: requestID, option: firstOpt)
+            }
+        case Self.actionSteerReplyID:
+            guard let text = userText?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return }
+            if let agentPID, let targetAgent = agentRows.first(where: { $0.process.pid == agentPID }) {
+                sendInlineSteerPrompt(text, to: targetAgent)
+            } else {
+                quickSteerPrimaryAgent(text)
+            }
+        case Self.actionFocusAgentID:
+            if let agentPID, let targetAgent = agentRows.first(where: { $0.process.pid == agentPID }) {
+                focusTerminalOrIDE(for: targetAgent)
+            } else {
+                focusPrimaryAgent()
+            }
+        default:
+            break
         }
     }
 
@@ -854,16 +1030,22 @@ final class DashboardModel: ObservableObject {
         return highest
     }
 
+    private var primaryAttentionOrActiveAgent: AgentObservation? {
+        let agents = agentRows
+        return agents.first(where: { $0.activityState == .waiting })
+            ?? agents.first(where: { $0.activityState == .active })
+            ?? agents.first
+    }
+
     var islandSurfaceSnapshot: IslandSurfaceSnapshot {
         let agents = agentRows
         let activeCount = agents.filter { $0.activityState == .active }.count
         let waitingCount = agents.filter { $0.activityState == .waiting }.count
-        let primaryAgent = agents.first(where: { $0.activityState == .waiting })
-            ?? agents.first(where: { $0.activityState == .active })
-            ?? agents.first
+        let primaryAgent = primaryAttentionOrActiveAgent
         let primaryTask = primaryAgent.flatMap { obs in
             obs.currentTask ?? agentTurnPreviews[obs.id]?.lastAssistantReplyPreview ?? obs.sessionTitle
         }
+        let liveSteerMode = primaryAgent.flatMap { AgentSteerer.preferredMode(for: $0) }
         let firstApproval = pendingApprovals.first
         return IslandSurfaceSnapshot(
             activeAgentCount: activeCount,
@@ -877,6 +1059,9 @@ final class DashboardModel: ObservableObject {
             firstApprovalToolName: firstApproval.map { "\($0.agentName) · \($0.toolName)" },
             firstApprovalSummary: firstApproval?.summary,
             firstApprovalIsQuestion: !(firstApproval?.questionOptions.isEmpty ?? true),
+            firstApprovalOptions: firstApproval?.questionOptions ?? [],
+            canInlineSteerPrimary: liveSteerMode?.isLiveTerminalDelivery == true,
+            primarySteerModeSummary: primaryAgent.flatMap { steerModeLabel(for: $0) },
             theme: experienceTheme
         )
     }
@@ -889,7 +1074,49 @@ final class DashboardModel: ObservableObject {
 
     func denyPendingRequest(id: String) {
         guard let request = pendingApprovals.first(where: { $0.id == id }) else { return }
-        submitApprovalDecision(.deny(reason: "Denied from Notch Dynamic Island"), for: request)
+        submitApprovalDecision(.deny(reason: "Denied from Suyoi"), for: request)
+    }
+
+    func answerPendingQuestion(id: String, option: String) {
+        guard let request = pendingApprovals.first(where: { $0.id == id }),
+              request.questionOptions.contains(option) else { return }
+        submitApprovalDecision(.answerQuestion(selectedOption: option), for: request)
+    }
+
+    func quickSteerPrimaryAgent(_ rawPrompt: String) {
+        guard let target = primaryAttentionOrActiveAgent else {
+            showBanner("No active coding agent available to steer", isError: true)
+            return
+        }
+        sendInlineSteerPrompt(rawPrompt, to: target)
+    }
+
+    func sendInlineSteerPrompt(_ rawPrompt: String, to obs: AgentObservation) {
+        guard !isSteering,
+              let mode = AgentSteerer.preferredMode(for: obs),
+              mode.isLiveTerminalDelivery else {
+            showBanner("Live terminal steering is unavailable for \(obs.agentName)", isError: true)
+            return
+        }
+        let expanded = SteeringSnippetCatalog.expand(rawPrompt, snippets: allSteeringSnippets)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !expanded.isEmpty else { return }
+        isSteering = true
+        let steerer = agentSteerer
+        let uid = Int(getuid())
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) {
+                steerer.steer(agent: obs, prompt: expanded, uid: uid)
+            }.value
+            isSteering = false
+            if outcome.succeeded {
+                showBanner(outcome.detail ?? "Sent instruction to \(obs.agentName)")
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                refresh()
+            } else {
+                showBanner(outcome.error ?? "Could not steer \(obs.agentName)", isError: true)
+            }
+        }
     }
 
     func setStatusBarStyle(_ style: StatusBarDisplayStyle) {
@@ -934,19 +1161,16 @@ final class DashboardModel: ObservableObject {
         }
         if let created = approvalController.ingestHookEvent(payload) {
             pendingApprovals = approvalController.pendingRequests()
+            autoApprovedToolHistory = approvalController.recentAutoApprovedRecords()
             let effectiveMode = soundMode == .muted ? .systemSounds : soundMode
             soundPlayer.play(.attentionRequired, mode: effectiveMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+            deliverPendingApprovalNotificationsIfNeeded()
             showBanner("Simulated \(created.toolName) request — switch to Agents tab or Notch Island")
         }
     }
 
     func focusPrimaryAgent() {
-        let agents = agentRows
-        guard let primary = agents.first(where: { $0.activityState == .waiting })
-                ?? agents.first(where: { $0.activityState == .active })
-                ?? agents.first else {
-            return
-        }
+        guard let primary = primaryAttentionOrActiveAgent else { return }
         focusTerminalOrIDE(for: primary)
     }
 
@@ -1028,6 +1252,7 @@ final class DashboardModel: ObservableObject {
         let resolved = approvalController.submitDecision(decision, forRequestID: request.id)
         pendingApprovals = approvalController.pendingRequests()
         autoApprovedSessions = approvalController.activeAutoApproveRequests()
+        autoApprovedToolHistory = approvalController.recentAutoApprovedRecords()
         guard resolved else {
             showBanner("Approval request is no longer available", isError: true)
             return
@@ -1054,6 +1279,262 @@ final class DashboardModel: ObservableObject {
         showBanner("Copied \(agentName) hook integration snippet")
     }
 
+    // MARK: - Claude Hook Installer & Scoped Read-Only Policy
+
+    var bridgeExecutablePath: String {
+        Bundle.main.executableURL?.path ?? "/Applications/Suyoi.app/Contents/MacOS/Suyoi"
+    }
+
+    var claudeHookPreview: ClaudeHookPreview? {
+        ClaudeHookInstaller(homeDirectory: homeDirectory).preview(
+            bridgeExecutablePath: bridgeExecutablePath,
+            includePreToolUse: includePreToolUseHook
+        )
+    }
+
+    func refreshClaudeHookStatus() {
+        claudeHookStatus = ClaudeHookInstaller(homeDirectory: homeDirectory).inspectStatus(
+            bridgeExecutablePath: bridgeExecutablePath
+        )
+    }
+
+    func setIncludePreToolUseHook(_ include: Bool) {
+        includePreToolUseHook = include
+        UserDefaults.standard.set(include, forKey: Self.includePreToolUseHookKey)
+    }
+
+    func installClaudeHooks() {
+        let installer = ClaudeHookInstaller(homeDirectory: homeDirectory)
+        do {
+            claudeHookStatus = try installer.install(
+                bridgeExecutablePath: bridgeExecutablePath,
+                includePreToolUse: includePreToolUseHook
+            )
+            showBanner("Installed \(appDisplayName) hooks into ~/.claude/settings.json (backup saved)")
+        } catch {
+            refreshClaudeHookStatus()
+            showBanner(error.localizedDescription, isError: true)
+        }
+    }
+
+    func uninstallClaudeHooks() {
+        let installer = ClaudeHookInstaller(homeDirectory: homeDirectory)
+        do {
+            claudeHookStatus = try installer.uninstall()
+            showBanner("Removed \(appDisplayName) hooks from ~/.claude/settings.json")
+        } catch {
+            refreshClaudeHookStatus()
+            showBanner(error.localizedDescription, isError: true)
+        }
+    }
+
+    private func persistScopedApprovalPolicy(_ updated: ScopedApprovalPolicy) {
+        scopedApprovalPolicy = updated
+        approvalController.setScopedPolicy(updated)
+        pendingApprovals = approvalController.pendingRequests()
+        autoApprovedToolHistory = approvalController.recentAutoApprovedRecords()
+        if let encoded = try? JSONEncoder().encode(updated) {
+            UserDefaults.standard.set(encoded, forKey: Self.scopedApprovalPolicyKey)
+        }
+    }
+
+    func setAutoApproveReadOnlyTools(_ enabled: Bool) {
+        var next = scopedApprovalPolicy
+        next.autoApproveReadOnlyTools = enabled
+        persistScopedApprovalPolicy(next)
+        showBanner(enabled ? "Auto-approve enabled for verified read-only tools" : "Read-only auto-approve disabled")
+    }
+
+    func setApplyReadOnlyToAllProjects(_ allProjects: Bool) {
+        var next = scopedApprovalPolicy
+        next.applyToAllVerifiedProjects = allProjects
+        persistScopedApprovalPolicy(next)
+    }
+
+    func enableReadOnlyAutoApproveForProject(_ projectPath: String) {
+        guard projectPath.hasPrefix("/") else { return }
+        let normalized = URL(fileURLWithPath: projectPath).resolvingSymlinksInPath().standardizedFileURL.path
+        var next = scopedApprovalPolicy
+        next.autoApproveReadOnlyTools = true
+        next.allowedProjectPaths.insert(normalized)
+        persistScopedApprovalPolicy(next)
+        let name = URL(fileURLWithPath: normalized).lastPathComponent
+        showBanner("Auto-approving verified read-only tools in \(name)")
+    }
+
+    func removeReadOnlyProject(_ projectPath: String) {
+        var next = scopedApprovalPolicy
+        next.allowedProjectPaths.remove(projectPath)
+        persistScopedApprovalPolicy(next)
+    }
+
+    // MARK: - Slash Snippets, Continuation Jobs, Collisions, Git Diffs, Burn Rate & Health
+
+    var allSteeringSnippets: [SteeringSnippet] {
+        SteeringSnippetCatalog.mergedSnippets(custom: customSnippets)
+    }
+
+    func applySteeringSnippet(_ snippet: SteeringSnippet) {
+        steerPromptText = snippet.prompt
+    }
+
+    func addCustomSnippet(trigger: String, title: String, prompt: String) -> Bool {
+        guard let sanitized = SteeringSnippetCatalog.sanitizeCustomSnippet(
+            trigger: trigger,
+            title: title,
+            prompt: prompt
+        ) else {
+            showBanner("Slash trigger must be /letters-or-digits and prompt 1–2000 chars", isError: true)
+            return false
+        }
+        var updated = customSnippets.filter { $0.trigger.lowercased() != sanitized.trigger.lowercased() }
+        updated.append(sanitized)
+        customSnippets = updated
+        SteeringSnippetCatalog.saveCustomSnippets(updated)
+        showBanner("Saved \(sanitized.trigger) snippet")
+        return true
+    }
+
+    func removeCustomSnippet(_ snippet: SteeringSnippet) {
+        customSnippets.removeAll { $0.id == snippet.id || $0.trigger == snippet.trigger }
+        SteeringSnippetCatalog.saveCustomSnippets(customSnippets)
+        showBanner("Removed \(snippet.trigger) snippet")
+    }
+
+    func continuationJobs(for obs: AgentObservation) -> [NativeContinuationJob] {
+        let canonical = AgentCollisionDetector.canonicalProjectPath(for: obs)
+        return continuationJobs.filter { job in
+            job.agentID == obs.id || (canonical != nil && job.projectPath == canonical && job.agentName == obs.agentName)
+        }
+    }
+
+    func cancelContinuationJob(_ job: NativeContinuationJob) {
+        guard let launcher = nativeJobLauncher, launcher.cancelJob(id: job.id) else {
+            showBanner("Continuation job already finished", isError: true)
+            return
+        }
+        continuationJobs = launcher.recentJobs()
+        showBanner("Cancelled \(job.agentName) continuation job (PID \(job.pid))")
+    }
+
+    func collisionGroup(for obs: AgentObservation) -> WorktreeCollisionGroup? {
+        worktreeCollisions.first { $0.agentIDs.contains(obs.id) }
+    }
+
+    func createIsolatedWorktree(for obs: AgentObservation, branchSlug: String = "") {
+        guard !isPerformingAction else { return }
+        guard let repoPath = obs.project?.rootPath ?? obs.process.cwd,
+              repoPath.hasPrefix("/"), repoPath != "/" else {
+            showBanner("Agent does not have a valid Git project path", isError: true)
+            return
+        }
+        let defaultSlug = "\(obs.agentName.lowercased().replacingOccurrences(of: " ", with: "-"))-\(obs.process.pid)"
+        let chosenSlug = branchSlug.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? defaultSlug : branchSlug
+        isPerformingAction = true
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) {
+                AgentCollisionDetector.createIsolatedWorktree(from: repoPath, branchSlug: chosenSlug)
+            }.value
+            isPerformingAction = false
+            if outcome.succeeded, let createdPath = outcome.worktreePath {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(createdPath, forType: .string)
+                let folderName = URL(fileURLWithPath: createdPath).lastPathComponent
+                showBanner("Created worktree \(folderName) (\(outcome.branchName ?? "branch")) · path copied")
+                refresh()
+            } else {
+                showBanner(outcome.error ?? "Could not create isolated worktree", isError: true)
+            }
+        }
+    }
+
+    func diffSummary(for obs: AgentObservation) -> WorktreeDiffSummary? {
+        guard let path = AgentCollisionDetector.canonicalProjectPath(for: obs) else { return nil }
+        return worktreeDiffs[path]
+    }
+
+    private func currentEffectiveWindowsMap() -> [QuotaProvider: [QuotaWindow]] {
+        var map: [QuotaProvider: [QuotaWindow]] = [:]
+        guard let snap = quotaSnapshot else { return map }
+        for item in displayQuotaItems(from: snap) {
+            let wins = item.effectiveWindows
+            if !wins.isEmpty {
+                map[item.provider] = wins
+            }
+        }
+        return map
+    }
+
+    private func recordCurrentQuotaBurnSamples(at now: Date = Date()) {
+        let map = currentEffectiveWindowsMap()
+        guard !map.isEmpty else { return }
+        burnRateTracker.record(windowsByProvider: map, at: now)
+    }
+
+    func burnEstimate(for provider: QuotaProvider, window: QuotaWindow) -> QuotaBurnEstimate? {
+        burnRateTracker.estimate(for: provider, window: window)
+    }
+
+    var recommendedProvider: ProviderRecommendation? {
+        let visible = providerOrder.filter { !hiddenProviders.contains($0) }
+        return burnRateTracker.recommendProvider(
+            windowsByProvider: currentEffectiveWindowsMap(),
+            visibleProviders: visible
+        )
+    }
+
+    func stuckDiagnostic(for obs: AgentObservation) -> StuckAgentDiagnostic? {
+        stuckAgents[obs.id]
+    }
+
+    func stopOrphanProcess(_ orphan: OrphanToolProcess) {
+        guard !isPerformingAction else { return }
+        isPerformingAction = true
+        let identity = orphan.process.identity
+        let executor = actionExecutor
+        let uid = Int(getuid())
+        let kind = orphan.kindLabel
+        Task {
+            let report = await Task.detached(priority: .userInitiated) {
+                executor.stopProcess(identity: identity, force: false, uid: uid)
+            }.value
+            isPerformingAction = false
+            if report.succeededCount > 0 {
+                showBanner("Stopped orphan \(kind) (PID \(identity.pid))")
+            } else {
+                showBanner(report.outcomes.first?.error ?? "Could not stop orphan helper", isError: true)
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            refresh()
+        }
+    }
+
+    func stopAllOrphanProcesses() {
+        let targets = orphanToolProcesses
+        guard !isPerformingAction, !targets.isEmpty else { return }
+        isPerformingAction = true
+        let executor = actionExecutor
+        let uid = Int(getuid())
+        Task {
+            let stoppedTotal = await Task.detached(priority: .userInitiated) { () -> Int in
+                var count = 0
+                for item in targets {
+                    let rep = executor.stopProcess(identity: item.process.identity, force: false, uid: uid)
+                    count += rep.succeededCount
+                }
+                return count
+            }.value
+            isPerformingAction = false
+            if stoppedTotal > 0 {
+                showBanner("Stopped \(stoppedTotal) orphan MCP helper\(stoppedTotal == 1 ? "" : "s")")
+            } else {
+                showBanner("Could not stop orphan MCP helpers", isError: true)
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            refresh()
+        }
+    }
+
     private func pollApprovalInboxSpool() {
         let client = HookBridgeClient(
             inboxDirectory: HookBridgeClient.defaultInboxDirectory(homeDirectory: homeDirectory),
@@ -1062,8 +1543,10 @@ final class DashboardModel: ObservableObject {
         let addedCount = client.drainInbox(into: approvalController)
         pendingApprovals = approvalController.pendingRequests()
         autoApprovedSessions = approvalController.activeAutoApproveRequests()
+        autoApprovedToolHistory = approvalController.recentAutoApprovedRecords()
         if addedCount > 0 {
             soundPlayer.play(.attentionRequired, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+            deliverPendingApprovalNotificationsIfNeeded()
         }
     }
 
@@ -1166,6 +1649,10 @@ final class DashboardModel: ObservableObject {
             return "\(obs.terminalApp ?? "Terminal") (\(obs.process.tty ?? "TTY"))"
         case .tmuxPane:
             return "tmux (\(obs.process.tty ?? "TTY"))"
+        case .weztermPane:
+            return "WezTerm (\(obs.process.tty ?? "TTY"))"
+        case .kittyWindow:
+            return "kitty (\(obs.process.tty ?? "TTY"))"
         case .openCodeSession:
             return "Continue an OpenCode session"
         case .codexResume:
@@ -1235,7 +1722,9 @@ final class DashboardModel: ObservableObject {
 
     func sendSteerPrompt(to obs: AgentObservation) {
         guard canSendSteerPrompt(to: obs), let mode = steerMode(for: obs) else { return }
-        let trimmed = steerPromptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let expanded = SteeringSnippetCatalog.expand(steerPromptText, snippets: allSteeringSnippets)
+        let trimmed = expanded.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
         let target = steerSessionTargets.first { $0.sessionID == selectedSteerSessionID }
         isSteering = true
         let steerer = agentSteerer
@@ -1249,6 +1738,9 @@ final class DashboardModel: ObservableObject {
                 return steerer.steer(agent: obs, prompt: trimmed, uid: uid)
             }.value
             isSteering = false
+            if let launcher = nativeJobLauncher {
+                continuationJobs = launcher.recentJobs()
+            }
             if outcome.succeeded {
                 if steerSessionGeneration == generation {
                     steerPromptText = ""

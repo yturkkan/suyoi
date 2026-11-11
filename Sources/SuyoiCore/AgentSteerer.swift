@@ -64,6 +64,10 @@ public struct AgentSteerer: AgentSteering, Sendable {
             return .terminalTTY
         case "tmux":
             return .tmuxPane
+        case "WezTerm":
+            return .weztermPane
+        case "kitty":
+            return .kittyWindow
         default:
             return nil
         }
@@ -97,7 +101,7 @@ public struct AgentSteerer: AgentSteering, Sendable {
         case .openCodeSession: name = "opencode"
         case .codexResume: name = "codex"
         case .claudeResume: name = "claude"
-        case .terminalTTY, .tmuxPane:
+        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
             return failure("Native session target is invalid")
         }
         guard let executable = resolve(name, agent: agent) else { return failure("Agent executable is unavailable") }
@@ -126,7 +130,7 @@ public struct AgentSteerer: AgentSteering, Sendable {
             arguments = ["exec", "-c", "sqlite_home=" + path, "resume", target.sessionID, "--", clean]
         case .claudeResume:
             arguments = ["--print", "--resume", target.sessionID, "--", clean]
-        case .terminalTTY, .tmuxPane:
+        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
             return failure("Native session target is invalid")
         }
         guard catalog.validate(target, for: agent, live: live) else {
@@ -139,9 +143,19 @@ public struct AgentSteerer: AgentSteering, Sendable {
         if requireLiveFile, catalog.verifiedCodexTarget(for: agent) != target {
             return failure("Live process ownership of this session could not be verified")
         }
+        let metadata = NativeContinuationMetadata(
+            agentID: agent.id,
+            agentName: agent.agentName,
+            sessionID: target.sessionID,
+            projectPath: target.projectPath
+        )
         do {
-            try nativeJobLauncher.launch(executable: executable, arguments: arguments,
-                workingDirectory: directory)
+            try nativeJobLauncher.launch(
+                executable: executable,
+                arguments: arguments,
+                workingDirectory: directory,
+                metadata: metadata
+            )
             return AgentSteerOutcome(agentID: agent.id, mode: target.mode, succeeded: true,
                 detail: "Started continuation of the selected \(agent.agentName) session")
         } catch let NativeAgentJobLauncher.Error.startupExited(code) {
@@ -206,8 +220,17 @@ public struct AgentSteerer: AgentSteering, Sendable {
             return failure("Terminal association changed or is unavailable")
         }
         let device = tty.hasPrefix("/dev/") ? tty : "/dev/" + tty
-        if terminalMode == .tmuxPane {
+        switch terminalMode {
+        case .tmuxPane:
             return steerTmux(agent: agent, pid: pid, uid: uid, live: live, tty: tty, device: device, clean: clean)
+        case .weztermPane:
+            return steerWezTerm(agent: agent, pid: pid, uid: uid, live: live, tty: tty, device: device, clean: clean)
+        case .kittyWindow:
+            return steerKitty(agent: agent, pid: pid, uid: uid, live: live, tty: tty, device: device, clean: clean)
+        case .terminalTTY:
+            break
+        case .openCodeSession, .codexResume, .claudeResume:
+            return failure("Terminal association changed or is unavailable")
         }
         guard let terminal = agent.terminalApp, ["Terminal", "iTerm2"].contains(terminal) else {
             return failure("Terminal association changed or is unavailable")
@@ -314,9 +337,223 @@ public struct AgentSteerer: AgentSteering, Sendable {
         }
     }
 
+    private struct WezTermPaneRow: Decodable {
+        let pane_id: Int
+        let tty_name: String?
+    }
+
+    private func steerWezTerm(
+        agent: AgentObservation,
+        pid: Int32,
+        uid: Int,
+        live: ObservedProcess,
+        tty: String,
+        device: String,
+        clean: String
+    ) -> AgentSteerOutcome {
+        func failure(_ error: String) -> AgentSteerOutcome {
+            AgentSteerOutcome(agentID: agent.id, mode: .weztermPane, succeeded: false, error: error)
+        }
+        guard agent.terminalApp == "WezTerm" else {
+            return failure("Terminal association changed or is unavailable")
+        }
+        guard terminalForegroundVerifier.verify(agent: agent, live: live, device: device) else {
+            return failure("Selected agent is not the verified foreground receiver of this terminal")
+        }
+        guard let executable = resolveTerminalCLI("wezterm") else {
+            return failure("WezTerm CLI executable is unavailable")
+        }
+        let listRequest = CommandRequest(
+            executable: executable,
+            arguments: ["cli", "list", "--format", "json"],
+            timeout: 3,
+            maximumOutputBytes: 128 * 1_024,
+            includeStandardUserPaths: true
+        )
+        let listResult: CommandResult
+        do {
+            listResult = try runner.run(listRequest)
+        } catch {
+            return failure("Unable to inspect WezTerm panes")
+        }
+        guard listResult.exitCode == 0, !listResult.timedOut, !listResult.truncated,
+              let panes = try? JSONDecoder().decode([WezTermPaneRow].self, from: listResult.stdout) else {
+            return failure(listResult.timedOut ? "WezTerm pane lookup timed out" : "WezTerm CLI or pane list is unavailable")
+        }
+        let matches = panes.filter { row in
+            guard row.pane_id >= 0, let rawTTY = row.tty_name, !rawTTY.isEmpty else { return false }
+            let normalized = rawTTY.hasPrefix("/dev/") ? rawTTY : "/dev/" + rawTTY
+            return normalized == device
+        }
+        guard matches.count == 1, let pane = matches.first else {
+            return failure("WezTerm pane target is unavailable or ambiguous")
+        }
+        guard let current = processLookup(pid, uid), current.identity == agent.process.identity,
+              !current.isStopped, current.tty == tty,
+              terminalForegroundVerifier.verify(agent: agent, live: current, device: device) else {
+            return failure("Selected agent is not the verified foreground receiver of this terminal")
+        }
+        let paneIDText = String(pane.pane_id)
+        let sendText = CommandRequest(
+            executable: executable,
+            arguments: ["cli", "send-text", "--pane-id", paneIDText, "--no-paste", "--", clean],
+            timeout: 5,
+            maximumOutputBytes: 16 * 1_024,
+            includeStandardUserPaths: true
+        )
+        let sendEnter = CommandRequest(
+            executable: executable,
+            arguments: ["cli", "send-text", "--pane-id", paneIDText, "--no-paste", "--", "\r"],
+            timeout: 5,
+            maximumOutputBytes: 16 * 1_024,
+            includeStandardUserPaths: true
+        )
+        do {
+            let textResult = try runner.run(sendText)
+            guard textResult.exitCode == 0, !textResult.timedOut, !textResult.truncated else {
+                return failure(textResult.timedOut ? "Steering command timed out; delivery is unconfirmed" : "Steering command did not confirm delivery")
+            }
+            let enterResult = try runner.run(sendEnter)
+            guard enterResult.exitCode == 0, !enterResult.timedOut, !enterResult.truncated else {
+                return failure(enterResult.timedOut ? "Steering command timed out; delivery is unconfirmed" : "Steering command did not confirm delivery")
+            }
+            return AgentSteerOutcome(agentID: agent.id, mode: .weztermPane, succeeded: true, detail: "Sent instruction to WezTerm (\(tty))")
+        } catch {
+            return failure("Unable to execute steering command")
+        }
+    }
+
+    private struct KittyOSWindowRow: Decodable {
+        struct TabRow: Decodable {
+            struct WindowRow: Decodable {
+                struct ForegroundProcessRow: Decodable {
+                    let pid: Int?
+                }
+                let id: Int
+                let is_self: Bool?
+                let foreground_processes: [ForegroundProcessRow]?
+            }
+            let windows: [WindowRow]
+        }
+        let tabs: [TabRow]
+    }
+
+    private func steerKitty(
+        agent: AgentObservation,
+        pid: Int32,
+        uid: Int,
+        live: ObservedProcess,
+        tty: String,
+        device: String,
+        clean: String
+    ) -> AgentSteerOutcome {
+        func failure(_ error: String) -> AgentSteerOutcome {
+            AgentSteerOutcome(agentID: agent.id, mode: .kittyWindow, succeeded: false, error: error)
+        }
+        guard agent.terminalApp == "kitty" else {
+            return failure("Terminal association changed or is unavailable")
+        }
+        guard terminalForegroundVerifier.verify(agent: agent, live: live, device: device) else {
+            return failure("Selected agent is not the verified foreground receiver of this terminal")
+        }
+        guard let executable = resolveTerminalCLI("kitty") else {
+            return failure("kitty CLI executable is unavailable")
+        }
+        let listRequest = CommandRequest(
+            executable: executable,
+            arguments: ["@", "ls"],
+            timeout: 3,
+            maximumOutputBytes: 256 * 1_024,
+            includeStandardUserPaths: true
+        )
+        let listResult: CommandResult
+        do {
+            listResult = try runner.run(listRequest)
+        } catch {
+            return failure("Unable to inspect kitty windows")
+        }
+        guard listResult.exitCode == 0, !listResult.timedOut, !listResult.truncated,
+              let osWindows = try? JSONDecoder().decode([KittyOSWindowRow].self, from: listResult.stdout) else {
+            return failure(
+                listResult.timedOut
+                    ? "kitty window lookup timed out"
+                    : "kitty remote control is unavailable; enable allow_remote_control in kitty.conf"
+            )
+        }
+        let targetPID = Int(pid)
+        var matchingWindowIDs: [Int] = []
+        for osWindow in osWindows {
+            for tab in osWindow.tabs {
+                for window in tab.windows where window.id >= 0 && window.is_self != true {
+                    let fgPIDs = (window.foreground_processes ?? []).compactMap(\.pid)
+                    if fgPIDs.contains(targetPID) {
+                        matchingWindowIDs.append(window.id)
+                    }
+                }
+            }
+        }
+        guard matchingWindowIDs.count == 1, let windowID = matchingWindowIDs.first else {
+            return failure("kitty window target is unavailable or ambiguous")
+        }
+        guard let current = processLookup(pid, uid), current.identity == agent.process.identity,
+              !current.isStopped, current.tty == tty,
+              terminalForegroundVerifier.verify(agent: agent, live: current, device: device) else {
+            return failure("Selected agent is not the verified foreground receiver of this terminal")
+        }
+        let escapedClean = clean.replacingOccurrences(of: "\\", with: "\\\\")
+        let matchSpec = "id:\(windowID)"
+        let sendText = CommandRequest(
+            executable: executable,
+            arguments: ["@", "send-text", "--match", matchSpec, "--", escapedClean],
+            timeout: 5,
+            maximumOutputBytes: 16 * 1_024,
+            includeStandardUserPaths: true
+        )
+        let sendEnter = CommandRequest(
+            executable: executable,
+            arguments: ["@", "send-text", "--match", matchSpec, "\\r"],
+            timeout: 5,
+            maximumOutputBytes: 16 * 1_024,
+            includeStandardUserPaths: true
+        )
+        do {
+            let textResult = try runner.run(sendText)
+            guard textResult.exitCode == 0, !textResult.timedOut, !textResult.truncated else {
+                return failure(textResult.timedOut ? "Steering command timed out; delivery is unconfirmed" : "Steering command did not confirm delivery")
+            }
+            let enterResult = try runner.run(sendEnter)
+            guard enterResult.exitCode == 0, !enterResult.timedOut, !enterResult.truncated else {
+                return failure(enterResult.timedOut ? "Steering command timed out; delivery is unconfirmed" : "Steering command did not confirm delivery")
+            }
+            return AgentSteerOutcome(agentID: agent.id, mode: .kittyWindow, succeeded: true, detail: "Sent instruction to kitty (\(tty))")
+        } catch {
+            return failure("Unable to execute steering command")
+        }
+    }
+
     private static func isValidTmuxPaneID(_ value: String) -> Bool {
         guard value.hasPrefix("%"), (2...16).contains(value.utf8.count) else { return false }
         return value.dropFirst().utf8.allSatisfy { (48...57).contains($0) }
+    }
+
+    private func resolveTerminalCLI(_ name: String) -> String? {
+        if let executableResolver {
+            guard let path = executableResolver(name), path.hasPrefix("/"), URL(fileURLWithPath: path).lastPathComponent == name else { return nil }
+            return path
+        }
+        var candidates: [String] = []
+        if name == "wezterm" {
+            candidates.append("/Applications/WezTerm.app/Contents/MacOS/wezterm")
+            candidates.append(homeDirectory.appendingPathComponent("Applications/WezTerm.app/Contents/MacOS/wezterm").path)
+        } else if name == "kitty" {
+            candidates.append("/Applications/kitty.app/Contents/MacOS/kitty")
+            candidates.append(homeDirectory.appendingPathComponent("Applications/kitty.app/Contents/MacOS/kitty").path)
+        }
+        candidates += ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
+        for dir in (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":") where dir.hasPrefix("/") && dir != "/" {
+            candidates.append(URL(fileURLWithPath: String(dir)).appendingPathComponent(name).path)
+        }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     private func resolve(_ name: String, agent: AgentObservation) -> String? {

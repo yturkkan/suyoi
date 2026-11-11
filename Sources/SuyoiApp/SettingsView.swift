@@ -6,6 +6,9 @@ private let settingsAccent = Color.accentColor
 
 struct SettingsView: View {
     @ObservedObject var model: DashboardModel
+    @State private var newSnippetTrigger = ""
+    @State private var newSnippetTitle = ""
+    @State private var newSnippetPrompt = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -45,7 +48,10 @@ struct SettingsView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
         }
-        .frame(width: 410, height: 480)
+        .frame(width: 410, height: 500)
+        .onAppear {
+            model.refreshClaudeHookStatus()
+        }
     }
 
     // MARK: - Header & Footer
@@ -264,43 +270,204 @@ struct SettingsView: View {
                     Divider()
                         .padding(.leading, 12)
 
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 7) {
                         HStack(alignment: .center, spacing: 8) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("In-Panel Tool Approval Hook")
-                                    .font(.system(size: 11.5, weight: .medium))
-                                Text("Copy hook command (`SuyoiApp --hook-bridge`) or test approval cards.")
+                                HStack(spacing: 6) {
+                                    Text("Claude Code Hook Installer")
+                                        .font(.system(size: 11.5, weight: .medium))
+                                    claudeHookBadge
+                                }
+                                Text("Safely merges `--hook-bridge` into `~/.claude/settings.json` with automatic `.suyoi-backup`.")
                                     .font(.system(size: 10))
                                     .foregroundStyle(.secondary)
                             }
                             Spacer(minLength: 6)
-                            Button("Copy Hook Snippet") {
+                            Button(hookPrimaryButtonTitle) {
+                                model.installClaudeHooks()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+
+                        Toggle(isOn: Binding(
+                            get: { model.includePreToolUseHook },
+                            set: { model.setIncludePreToolUseHook($0) }
+                        )) {
+                            Text("Also register PreToolUse hook (review tool calls before execution)")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                        }
+                        .toggleStyle(.checkbox)
+                        .controlSize(.small)
+
+                        HStack(spacing: 6) {
+                            if case .installed = model.claudeHookStatus {
+                                Button("Uninstall Hooks") {
+                                    model.uninstallClaudeHooks()
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                            } else if case .outdated = model.claudeHookStatus {
+                                Button("Uninstall Hooks") {
+                                    model.uninstallClaudeHooks()
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                            }
+
+                            Button("Copy Snippet") {
                                 model.copyHookSnippet()
                             }
                             .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
-                        HStack(spacing: 6) {
+                            .controlSize(.mini)
+
                             Button("Simulate Approval") {
                                 model.simulateApprovalRequest(isQuestion: false)
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.mini)
-                            .help("Queue a simulated tool permission card in the Agents tab and Notch Island")
 
                             Button("Simulate Question") {
                                 model.simulateApprovalRequest(isQuestion: true)
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.mini)
-                            .help("Queue a simulated interactive multi-option question card")
 
                             Spacer()
+                        }
+
+                        Divider()
+
+                        HStack(alignment: .center, spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Auto-Approve Verified Read-Only Tools")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                Text("Auto-approves Read/Glob/Grep/LS & pure `git status`/`diff`/`log` on verified live sessions.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 6)
+                            Toggle("", isOn: Binding(
+                                get: { model.scopedApprovalPolicy.autoApproveReadOnlyTools },
+                                set: { model.setAutoApproveReadOnlyTools($0) }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                        }
+
+                        if model.scopedApprovalPolicy.autoApproveReadOnlyTools {
+                            Toggle(isOn: Binding(
+                                get: { model.scopedApprovalPolicy.applyToAllVerifiedProjects },
+                                set: { model.setApplyReadOnlyToAllProjects($0) }
+                            )) {
+                                Text("Apply to all verified workspaces (otherwise only selected projects)")
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .toggleStyle(.checkbox)
+                            .controlSize(.small)
+
+                            let scopedPaths = model.scopedApprovalPolicy.allowedProjectPaths.sorted()
+                            if !model.scopedApprovalPolicy.applyToAllVerifiedProjects && !scopedPaths.isEmpty {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    ForEach(scopedPaths, id: \.self) { path in
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "folder.fill")
+                                                .font(.system(size: 9.5))
+                                                .foregroundStyle(settingsAccent)
+                                            Text(URL(fileURLWithPath: path).lastPathComponent)
+                                                .font(.system(size: 10.5, weight: .medium))
+                                                .lineLimit(1)
+                                            Spacer()
+                                            Button("Remove") {
+                                                model.removeReadOnlyProject(path)
+                                            }
+                                            .buttonStyle(.borderless)
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !model.autoApprovedToolHistory.isEmpty {
+                                Text("Auto-approved \(model.autoApprovedToolHistory.count) verified read-only call(s) this session.")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
                 }
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.5)
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("STEERING SLASH SNIPPETS")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.4)
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Built-in triggers (`/test`, `/diff`, `/review`, `/commit`, `/continue`) expand automatically when steering any agent.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+
+                    if !model.customSnippets.isEmpty {
+                        ForEach(model.customSnippets) { snippet in
+                            HStack(spacing: 6) {
+                                Text(snippet.trigger)
+                                    .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(settingsAccent)
+                                Text(snippet.title)
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .lineLimit(1)
+                                Spacer()
+                                Button {
+                                    model.removeCustomSnippet(snippet)
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Remove \(snippet.trigger)")
+                            }
+                        }
+                    }
+
+                    HStack(spacing: 6) {
+                        TextField("/lint", text: $newSnippetTrigger)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11, design: .monospaced))
+                            .frame(width: 72)
+                        TextField("Title", text: $newSnippetTitle)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11))
+                            .frame(width: 92)
+                        TextField("Expanded instruction…", text: $newSnippetPrompt)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11))
+                        Button("Add") {
+                            if model.addCustomSnippet(trigger: newSnippetTrigger, title: newSnippetTitle, prompt: newSnippetPrompt) {
+                                newSnippetTrigger = ""
+                                newSnippetTitle = ""
+                                newSnippetPrompt = ""
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(newSnippetTrigger.trimmingCharacters(in: .whitespaces).isEmpty || newSnippetPrompt.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                }
+                .padding(12)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -785,6 +952,53 @@ struct SettingsView: View {
         case .gemini: return "Gemini CLI"
         case .openCode: return "OpenCode"
         case .cursor: return "Cursor"
+        }
+    }
+
+    private var hookPrimaryButtonTitle: String {
+        switch model.claudeHookStatus {
+        case .notInstalled:
+            return "Install Hooks"
+        case .installed(_, let includesPreToolUse):
+            return includesPreToolUse == model.includePreToolUseHook ? "Reinstall" : "Update Hooks"
+        case .outdated:
+            return "Update Hooks"
+        case .blocked:
+            return "Retry Install"
+        }
+    }
+
+    @ViewBuilder
+    private var claudeHookBadge: some View {
+        switch model.claudeHookStatus {
+        case .installed(_, let includesPreToolUse):
+            Text(includesPreToolUse ? "Installed (+PreToolUse)" : "Installed")
+                .font(.system(size: 9.5, weight: .bold))
+                .foregroundStyle(Color(nsColor: .systemGreen))
+                .padding(.horizontal, 5.5)
+                .padding(.vertical, 1.5)
+                .background(Color(nsColor: .systemGreen).opacity(0.14), in: Capsule())
+        case .outdated:
+            Text("Update Needed")
+                .font(.system(size: 9.5, weight: .bold))
+                .foregroundStyle(Color(nsColor: .systemOrange))
+                .padding(.horizontal, 5.5)
+                .padding(.vertical, 1.5)
+                .background(Color(nsColor: .systemOrange).opacity(0.14), in: Capsule())
+        case .blocked:
+            Text("Blocked")
+                .font(.system(size: 9.5, weight: .bold))
+                .foregroundStyle(Color(nsColor: .systemRed))
+                .padding(.horizontal, 5.5)
+                .padding(.vertical, 1.5)
+                .background(Color(nsColor: .systemRed).opacity(0.14), in: Capsule())
+        case .notInstalled:
+            Text("Not Installed")
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5.5)
+                .padding(.vertical, 1.5)
+                .background(Color.primary.opacity(0.06), in: Capsule())
         }
     }
 

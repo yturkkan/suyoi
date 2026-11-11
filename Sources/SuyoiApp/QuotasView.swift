@@ -13,6 +13,10 @@ struct QuotasSectionView: View {
         VStack(alignment: .leading, spacing: 10) {
             liveHeaderCard
 
+            if let recommendation = model.recommendedProvider {
+                recommendedProviderCard(recommendation)
+            }
+
             if let snapshot = model.quotaSnapshot {
                 let items = model.displayQuotaItems(from: snapshot)
                 if items.isEmpty {
@@ -40,6 +44,9 @@ struct QuotasSectionView: View {
                             theme: model.experienceTheme,
                             isHovered: model.hoveredRowID == rowID,
                             isPollingLive: model.isPollingLiveQuotas && model.isLiveQuotaEnabled,
+                            burnEstimateProvider: { window in
+                                model.burnEstimate(for: item.provider, window: window)
+                            },
                             onHover: { hovering in
                                 model.hoveredRowID = hovering ? rowID : (model.hoveredRowID == rowID ? nil : model.hoveredRowID)
                             },
@@ -61,6 +68,37 @@ struct QuotasSectionView: View {
                 .padding(.vertical, 32)
             }
         }
+    }
+
+    private func recommendedProviderCard(_ rec: ProviderRecommendation) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "bolt.badge.clock.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(accent)
+                .frame(width: 26, height: 26)
+                .background(accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("Best Headroom Right Now: \(rec.displayName)")
+                        .font(.system(size: 12, weight: .bold))
+                    Text(String(format: "%.0f%% free", rec.remainingPercent))
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(accent)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(accent.opacity(0.14), in: Capsule())
+                }
+                Text(rec.reason)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .themedSurfaceCard(theme: model.experienceTheme, isHovered: false)
     }
 
     private var liveHeaderCard: some View {
@@ -244,6 +282,7 @@ private struct QuotaProviderCard: View {
     let theme: SuyoiExperienceTheme
     let isHovered: Bool
     let isPollingLive: Bool
+    var burnEstimateProvider: ((QuotaWindow) -> QuotaBurnEstimate?)? = nil
     let onHover: (Bool) -> Void
     let onRefreshLive: () -> Void
     let isLiveEnabled: Bool
@@ -260,7 +299,11 @@ private struct QuotaProviderCard: View {
             if !windows.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(windows.enumerated()), id: \.offset) { _, window in
-                        QuotaWindowProgressRow(window: window, accent: accent)
+                        QuotaWindowProgressRow(
+                            window: window,
+                            accent: accent,
+                            burnEstimate: burnEstimateProvider?(window)
+                        )
                     }
                 }
             }
@@ -418,6 +461,7 @@ private struct QuotaProviderCard: View {
 private struct QuotaWindowProgressRow: View {
     let window: QuotaWindow
     let accent: Color
+    var burnEstimate: QuotaBurnEstimate? = nil
 
     private var label: String {
         switch window.kind {
@@ -480,6 +524,19 @@ private struct QuotaWindowProgressRow: View {
                 }
             }
             .frame(height: 6)
+
+            if let burnEstimate {
+                HStack(spacing: 5) {
+                    Image(systemName: burnEstimate.willDepleteBeforeReset ? "flame.fill" : "gauge.with.dots.needle.33percent")
+                        .font(.system(size: 10))
+                        .foregroundStyle(burnEstimate.willDepleteBeforeReset ? Color(nsColor: .systemOrange) : .secondary)
+                    Text(burnEstimate.summaryText)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(burnEstimate.willDepleteBeforeReset ? Color(nsColor: .systemOrange) : .secondary)
+                        .lineLimit(1)
+                }
+                .padding(.top, 1)
+            }
         }
     }
 }

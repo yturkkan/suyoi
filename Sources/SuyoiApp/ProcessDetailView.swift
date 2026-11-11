@@ -21,11 +21,19 @@ struct ProcessDetailView: View {
     @Binding var steerPromptText: String
     let isSteering: Bool
     let isPerformingAction: Bool
+    var snippets: [SteeringSnippet] = []
+    var continuationJobs: [NativeContinuationJob] = []
+    var collisionGroup: WorktreeCollisionGroup? = nil
+    var diffSummary: WorktreeDiffSummary? = nil
+    var stuckDiagnostic: StuckAgentDiagnostic? = nil
     let onPrepareSteerSessions: ((AgentObservation) -> Void)?
     let onRefreshSteerSessions: ((AgentObservation) -> Void)?
     let onFocusAgent: ((AgentObservation) -> Void)?
     let onSteerAgent: ((AgentObservation) -> Void)?
     let onStopAgent: ((AgentObservation, Bool) -> Void)?
+    var onApplySnippet: ((SteeringSnippet) -> Void)? = nil
+    var onCancelContinuationJob: ((NativeContinuationJob) -> Void)? = nil
+    var onCreateIsolatedWorktree: ((AgentObservation) -> Void)? = nil
     let onOpenServer: ((ServerGroup) -> Void)?
     let onCopyServerURL: ((ServerGroup) -> Void)?
     let onStopServer: ((ServerGroup, Bool) -> Void)?
@@ -52,11 +60,19 @@ struct ProcessDetailView: View {
         steerPromptText: Binding<String> = .constant(""),
         isSteering: Bool = false,
         isPerformingAction: Bool = false,
+        snippets: [SteeringSnippet] = [],
+        continuationJobs: [NativeContinuationJob] = [],
+        collisionGroup: WorktreeCollisionGroup? = nil,
+        diffSummary: WorktreeDiffSummary? = nil,
+        stuckDiagnostic: StuckAgentDiagnostic? = nil,
         onPrepareSteerSessions: ((AgentObservation) -> Void)? = nil,
         onRefreshSteerSessions: ((AgentObservation) -> Void)? = nil,
         onFocusAgent: ((AgentObservation) -> Void)? = nil,
         onSteerAgent: ((AgentObservation) -> Void)? = nil,
         onStopAgent: ((AgentObservation, Bool) -> Void)? = nil,
+        onApplySnippet: ((SteeringSnippet) -> Void)? = nil,
+        onCancelContinuationJob: ((NativeContinuationJob) -> Void)? = nil,
+        onCreateIsolatedWorktree: ((AgentObservation) -> Void)? = nil,
         onOpenServer: ((ServerGroup) -> Void)? = nil,
         onCopyServerURL: ((ServerGroup) -> Void)? = nil,
         onStopServer: ((ServerGroup, Bool) -> Void)? = nil,
@@ -75,11 +91,19 @@ struct ProcessDetailView: View {
         self._steerPromptText = steerPromptText
         self.isSteering = isSteering
         self.isPerformingAction = isPerformingAction
+        self.snippets = snippets
+        self.continuationJobs = continuationJobs
+        self.collisionGroup = collisionGroup
+        self.diffSummary = diffSummary
+        self.stuckDiagnostic = stuckDiagnostic
         self.onPrepareSteerSessions = onPrepareSteerSessions
         self.onRefreshSteerSessions = onRefreshSteerSessions
         self.onFocusAgent = onFocusAgent
         self.onSteerAgent = onSteerAgent
         self.onStopAgent = onStopAgent
+        self.onApplySnippet = onApplySnippet
+        self.onCancelContinuationJob = onCancelContinuationJob
+        self.onCreateIsolatedWorktree = onCreateIsolatedWorktree
         self.onOpenServer = onOpenServer
         self.onCopyServerURL = onCopyServerURL
         self.onStopServer = onStopServer
@@ -333,7 +357,76 @@ struct ProcessDetailView: View {
 
     @ViewBuilder
     private func agentContent(_ obs: AgentObservation) -> some View {
+        if let stuck = stuckDiagnostic {
+            detailSection("Stuck Loop Warning") {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "flame.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color(nsColor: .systemRed))
+                    Text(stuck.summary)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+
+        if let collision = collisionGroup {
+            detailSection("Shared Worktree Collision") {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color(nsColor: .systemOrange))
+                    Text("\(collision.agentIDs.count) coding agents (\(collision.agentNames.joined(separator: ", "))) are sharing \(collision.projectName)\(collision.gitBranch.map { " (\($0))" } ?? "").")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let onCreateIsolatedWorktree {
+                    Button {
+                        onCreateIsolatedWorktree(obs)
+                    } label: {
+                        Label("Create Isolated Git Worktree", systemImage: "arrow.triangle.branch")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(Color(nsColor: .systemOrange))
+                    .disabled(isPerformingAction)
+                    .help("Create a clean sibling git worktree branch and copy its path")
+                }
+            }
+        }
+
         steeringSection(obs)
+
+        if let diff = diffSummary, !diff.isClean {
+            detailSection("Live Uncommitted Git Diff") {
+                HStack(spacing: 8) {
+                    Text("+\(diff.addedLines)")
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Color(nsColor: .systemGreen))
+                    Text("-\(diff.deletedLines)")
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Color(nsColor: .systemRed))
+                    Text("· \(diff.changedFiles) modified\(diff.untrackedFiles > 0 ? ", \(diff.untrackedFiles) untracked" : "")")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                if !diff.sampleFiles.isEmpty {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(diff.sampleFiles, id: \.self) { relPath in
+                            Text(relPath)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                }
+            }
+        }
 
         detailSection("Identity, Project & Session") {
             detailRow("Provider", value: obs.agentName)
@@ -420,6 +513,20 @@ struct ProcessDetailView: View {
                 detailRow("Listening Ports", value: obs.childServerPorts.map { ":\(String($0))" }.joined(separator: ", "), monospaced: true)
             }
             detailRow("Executable", value: shortenPath(obs.process.executable), monospaced: true)
+        }
+    }
+
+    private func liveDeliveryDescription(mode: AgentSteerMode, obs: AgentObservation) -> String {
+        let tty = obs.process.tty ?? "TTY"
+        switch mode {
+        case .tmuxPane:
+            return "Sends literal keys directly to the verified foreground tmux pane (\(tty))."
+        case .weztermPane:
+            return "Sends literal text via `wezterm cli send-text` to the verified WezTerm pane (\(tty))."
+        case .kittyWindow:
+            return "Sends text via `kitty @ send-text` to the verified foreground kitty window (\(tty))."
+        default:
+            return "Sends instruction to \(obs.terminalApp ?? "Terminal") (\(tty))."
         }
     }
 
@@ -539,20 +646,47 @@ struct ProcessDetailView: View {
                         }
                     }
                 } else {
-                    Text(
-                        mode == .tmuxPane
-                            ? "Sends literal keys directly to the verified foreground tmux pane (\(obs.process.tty ?? "TTY"))."
-                            : "Sends instruction to \(obs.terminalApp ?? "Terminal") (\(obs.process.tty ?? "TTY"))."
-                    )
+                    Text(liveDeliveryDescription(mode: mode, obs: obs))
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
+                let matchedSnippets = SteeringSnippetCatalog.matchingSnippets(for: steerPromptText, snippets: snippets)
+                if !matchedSnippets.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 5) {
+                            ForEach(matchedSnippets.prefix(6)) { snippet in
+                                Button {
+                                    if let onApplySnippet {
+                                        onApplySnippet(snippet)
+                                    } else {
+                                        steerPromptText = snippet.prompt
+                                    }
+                                } label: {
+                                    HStack(spacing: 3) {
+                                        Text(snippet.trigger)
+                                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                            .foregroundStyle(accent)
+                                        Text(snippet.title)
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3)
+                                    .background(accent.opacity(0.10), in: Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .help(snippet.prompt)
+                            }
+                        }
+                    }
+                }
+
                 HStack(spacing: 6) {
                     TextField(
                         mode.isLiveTerminalDelivery
-                            ? "Send instruction to \(obs.agentName)…"
+                            ? "Send instruction or /test, /diff, /review…"
                             : (selectedSteerSessionID == nil ? "Select a session above first…" : "Continue selected \(obs.agentName) session…"),
                         text: $steerPromptText
                     )
@@ -581,6 +715,68 @@ struct ProcessDetailView: View {
                     .disabled(!canSendSteer)
                 }
                 .padding(.top, 2)
+
+                if !continuationJobs.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Continuation Jobs")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.secondary)
+                        ForEach(continuationJobs.prefix(4)) { job in
+                            HStack(spacing: 6) {
+                                switch job.state {
+                                case .running:
+                                    ProgressView().controlSize(.mini)
+                                case .completed:
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(Color(nsColor: .systemGreen))
+                                case .failed:
+                                    Image(systemName: "exclamationmark.circle.fill")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(Color(nsColor: .systemRed))
+                                case .cancelled:
+                                    Image(systemName: "slash.circle")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Text("\(job.executableName) · PID \(String(job.pid))")
+                                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                switch job.state {
+                                case .running:
+                                    if let onCancelContinuationJob {
+                                        Button("Cancel") {
+                                            onCancelContinuationJob(job)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.mini)
+                                    } else {
+                                        Text("Running")
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(accent)
+                                    }
+                                case .completed:
+                                    Text("Done")
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                case .failed(let code):
+                                    Text("Exit \(code)")
+                                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                        .foregroundStyle(Color(nsColor: .systemRed))
+                                case .cancelled:
+                                    Text("Cancelled")
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4)
+                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                    }
+                    .padding(.top, 4)
+                }
             } else {
                 let diag = SafetyDiagnostics.explainSteeringUnavailable(for: obs)
                 detailRow("Status", value: diag.headline)

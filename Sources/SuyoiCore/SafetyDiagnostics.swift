@@ -69,7 +69,7 @@ public enum SafetyDiagnostics {
         }
         guard AgentSteerer.preferredMode(for: agent)?.isLiveTerminalDelivery == true else {
             return SafetyDiagnosticDetail(headline: "No supported terminal target is available", checkName: "Terminal association",
-                remediationHint: "Use the agent in Terminal, iTerm2, or tmux and refresh. A session identifier alone does not prove live process ownership.", canRecheck: true)
+                remediationHint: "Use the agent in Terminal, iTerm2, tmux, WezTerm, or kitty and refresh. A session identifier alone does not prove live process ownership.", canRecheck: true)
         }
         return SafetyDiagnosticDetail(headline: "The steering target needs live verification", checkName: "Live steering verification",
             remediationHint: "Bring the agent to the foreground in its terminal and recheck. Sending requires a fresh identity, unique terminal association and foreground ownership check.", canRecheck: true)

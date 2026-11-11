@@ -106,6 +106,67 @@ struct ProcessArgumentsReader {
         return Self.parseInvocation(from: data, executablePath: executablePath)
     }
 
+    static func parseMCPHelperKind(from data: Data, executablePath: String) -> String? {
+        let execName = URL(fileURLWithPath: executablePath).lastPathComponent.lowercased()
+        if isMCPBinaryToken(execName) {
+            return "MCP Server"
+        }
+        let mcpRunners: Set<String> = ["node", "bun", "deno", "npx", "uvx", "uv", "python", "python3"]
+        guard mcpRunners.contains(execName) || execName.hasPrefix("python3."), data.count >= 4 else {
+            return nil
+        }
+        let raw = UInt32(data[0]) | UInt32(data[1]) << 8 | UInt32(data[2]) << 16 | UInt32(data[3]) << 24
+        let argc = Int32(bitPattern: raw)
+        guard argc > 1 else { return nil }
+        var index = 4
+        guard let execEnd = data[index...].firstIndex(of: 0) else { return nil }
+        index = execEnd + 1
+        while index < data.count && data[index] == 0 { index += 1 }
+        var tokens: [String] = []
+        for _ in 0..<min(Int(argc), 6) {
+            guard index < data.count, let end = data[index...].firstIndex(of: 0),
+                  let token = String(bytes: data[index..<end], encoding: .utf8) else { break }
+            tokens.append(token.lowercased())
+            index = end + 1
+        }
+        guard tokens.count > 1 else { return nil }
+        for token in tokens.dropFirst() where !token.hasPrefix("-") {
+            if token.contains("@modelcontextprotocol/")
+                || token.contains("/mcp-server")
+                || token.contains("mcp-server-")
+                || token.hasSuffix("-mcp-server")
+                || token.hasSuffix("/fastmcp")
+                || token == "fastmcp"
+                || isMCPBinaryToken(URL(fileURLWithPath: token).lastPathComponent) {
+                if execName.hasPrefix("python") || execName == "uvx" || execName == "uv" {
+                    return "MCP Server (Python)"
+                }
+                return "MCP Server (Node)"
+            }
+        }
+        return nil
+    }
+
+    private static func isMCPBinaryToken(_ lowerName: String) -> Bool {
+        lowerName.hasPrefix("mcp-server-")
+            || lowerName.hasSuffix("-mcp-server")
+            || lowerName == "mcp-inspector"
+            || lowerName == "fastmcp"
+    }
+
+    func mcpHelperKind(pid: Int32, executablePath: String) -> String? {
+        let execName = URL(fileURLWithPath: executablePath).lastPathComponent.lowercased()
+        if Self.isMCPBinaryToken(execName) {
+            return "MCP Server"
+        }
+        let mcpRunners: Set<String> = ["node", "bun", "deno", "npx", "uvx", "uv", "python", "python3"]
+        guard mcpRunners.contains(execName) || execName.hasPrefix("python3."),
+              let data = readProcArgsData(pid: pid) else {
+            return nil
+        }
+        return Self.parseMCPHelperKind(from: data, executablePath: executablePath)
+    }
+
     private func readProcArgsData(pid: Int32) -> Data? {
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0

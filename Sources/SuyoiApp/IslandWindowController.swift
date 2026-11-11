@@ -14,6 +14,9 @@ struct IslandSurfaceSnapshot: Equatable {
     var firstApprovalToolName: String? = nil
     var firstApprovalSummary: String? = nil
     var firstApprovalIsQuestion: Bool = false
+    var firstApprovalOptions: [String] = []
+    var canInlineSteerPrimary: Bool = false
+    var primarySteerModeSummary: String? = nil
     var theme: SuyoiExperienceTheme = .nativeGlass
 
     fileprivate var needsAttention: Bool {
@@ -68,6 +71,8 @@ final class IslandWindowController: NSObject {
     var onFocusPrimaryAgent: () -> Void
     var onApprovePending: ((String) -> Void)?
     var onDenyPending: ((String) -> Void)?
+    var onAnswerQuestion: ((String, String) -> Void)?
+    var onQuickSteerPrimary: ((String) -> Void)?
 
     private let state = IslandSurfaceState()
     private var mode: SuyoiSurfaceMode = .menuBarPopover
@@ -100,6 +105,9 @@ final class IslandWindowController: NSObject {
 
     func setMode(_ mode: SuyoiSurfaceMode, snapshot: IslandSurfaceSnapshot) {
         self.mode = mode
+        if !snapshot.canInlineSteerPrimary && state.isReplyingInline {
+            setInlineReplyEditing(false)
+        }
         let animate = notchPanel?.isVisible == true
             && mode == .notchIsland
             && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -129,7 +137,7 @@ final class IslandWindowController: NSObject {
                 return
             }
             let panel = makeBuddyPanelIfNeeded(on: screen)
-            keepBuddyOnScreen(panel, fallback: screen)
+            resizeAndKeepBuddyOnScreen(panel, fallback: screen)
             if !panel.isVisible { panel.orderFrontRegardless() }
         }
     }
@@ -144,8 +152,39 @@ final class IslandWindowController: NSObject {
         state.showsNotch = false
         state.showsBuddy = false
         state.isNotchHovered = false
+        setInlineReplyEditing(false)
         notchPanel?.orderOut(nil)
         buddyPanel?.orderOut(nil)
+    }
+
+    private func setInlineReplyEditing(_ editing: Bool) {
+        state.isReplyingInline = editing
+        if !editing {
+            state.inlineReplyDraft = ""
+        }
+        let activePanel: IslandPanel? = (mode == .notchIsland) ? notchPanel : ((mode == .floatingBuddy) ? buddyPanel : nil)
+        notchPanel?.allowsKeyInput = editing && mode == .notchIsland
+        buddyPanel?.allowsKeyInput = editing && mode == .floatingBuddy
+        if editing, let activePanel {
+            NSApp.activate(ignoringOtherApps: true)
+            activePanel.makeKeyAndOrderFront(nil)
+        }
+        if mode == .notchIsland,
+           let panel = notchPanel,
+           let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first {
+            positionNotch(panel, on: screen, animated: true)
+        } else if mode == .floatingBuddy,
+                  let panel = buddyPanel,
+                  let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first {
+            resizeAndKeepBuddyOnScreen(panel, fallback: screen)
+        }
+    }
+
+    private func submitInlineReply() {
+        let trimmed = state.inlineReplyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, state.snapshot.canInlineSteerPrimary else { return }
+        setInlineReplyEditing(false)
+        onQuickSteerPrimary?(trimmed)
     }
 
     private func makeNotchPanelIfNeeded() -> IslandPanel {
@@ -162,6 +201,16 @@ final class IslandWindowController: NSObject {
             onDeny: { [weak self] id in
                 guard let self, self.state.snapshot.firstApprovalID == id else { return }
                 self.onDenyPending?(id)
+            },
+            onAnswerQuestion: { [weak self] id, option in
+                guard let self, self.state.snapshot.firstApprovalID == id else { return }
+                self.onAnswerQuestion?(id, option)
+            },
+            onToggleReply: { [weak self] editing in
+                self?.setInlineReplyEditing(editing)
+            },
+            onSubmitReply: { [weak self] in
+                self?.submitInlineReply()
             }
         ))
         host.sizingOptions = []
@@ -173,19 +222,37 @@ final class IslandWindowController: NSObject {
 
     private func makeBuddyPanelIfNeeded(on screen: NSScreen) -> IslandPanel {
         if let buddyPanel { return buddyPanel }
-        let panel = IslandPanel(size: NSSize(width: 190, height: 56))
+        let panel = IslandPanel(size: NSSize(width: 210, height: 56))
         panel.isMovable = true
         panel.isMovableByWindowBackground = true
         let host = IslandHostingView(rootView: FloatingBuddyView(
             state: state,
             onFocus: { [weak self] in self?.onFocusPrimaryAgent() },
-            onOpen: { [weak self] in self?.onOpenDashboard() }
+            onOpen: { [weak self] in self?.onOpenDashboard() },
+            onApprove: { [weak self] id in
+                guard let self, self.state.snapshot.firstApprovalID == id else { return }
+                self.onApprovePending?(id)
+            },
+            onDeny: { [weak self] id in
+                guard let self, self.state.snapshot.firstApprovalID == id else { return }
+                self.onDenyPending?(id)
+            },
+            onAnswerQuestion: { [weak self] id, option in
+                guard let self, self.state.snapshot.firstApprovalID == id else { return }
+                self.onAnswerQuestion?(id, option)
+            },
+            onToggleReply: { [weak self] editing in
+                self?.setInlineReplyEditing(editing)
+            },
+            onSubmitReply: { [weak self] in
+                self?.submitInlineReply()
+            }
         ))
         host.sizingOptions = []
         panel.contentView = host
         panel.setAccessibilityLabel("Suyoi floating companion")
         var origin = NSPoint(
-            x: screen.visibleFrame.maxX - 190 - 16,
+            x: screen.visibleFrame.maxX - 210 - 16,
             y: screen.visibleFrame.maxY - 56 - 16
         )
         let defaults = UserDefaults.standard
@@ -195,7 +262,7 @@ final class IslandWindowController: NSObject {
             origin = NSPoint(x: x.doubleValue, y: y.doubleValue)
         }
         panel.setFrameOrigin(origin)
-        keepBuddyOnScreen(panel, fallback: screen)
+        resizeAndKeepBuddyOnScreen(panel, fallback: screen)
         buddyPanel = panel
         NotificationCenter.default.addObserver(
             self, selector: #selector(buddyPanelDidMove),
@@ -205,7 +272,11 @@ final class IslandWindowController: NSObject {
     }
 
     private func setNotchHovered(_ hovered: Bool) {
-        guard mode == .notchIsland, state.isNotchHovered != hovered else { return }
+        guard mode == .notchIsland else { return }
+        if !hovered && state.isReplyingInline {
+            return
+        }
+        guard state.isNotchHovered != hovered else { return }
         let animate = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         withAnimation(animate ? .easeInOut(duration: 0.24) : nil) {
             state.isNotchHovered = hovered
@@ -229,9 +300,12 @@ final class IslandWindowController: NSObject {
         )
         let size: NSSize
         if state.snapshot.firstApprovalID != nil {
-            size = NSSize(width: 420, height: 112)
+            size = NSSize(width: 440, height: state.snapshot.firstApprovalIsQuestion ? 124 : 114)
+        } else if state.isReplyingInline {
+            size = NSSize(width: max(baseFrame.width, 420), height: 132)
         } else if state.isNotchExpanded {
-            size = NSSize(width: baseFrame.width, height: max(baseFrame.height, 96))
+            let extraHeight: CGFloat = state.snapshot.canInlineSteerPrimary ? 120 : max(baseFrame.height, 96)
+            size = NSSize(width: max(baseFrame.width, 360), height: extraHeight)
         } else {
             size = baseFrame.size
         }
@@ -249,6 +323,28 @@ final class IslandWindowController: NSObject {
         } else {
             panel.setFrame(frame, display: true)
         }
+    }
+
+    private func resizeAndKeepBuddyOnScreen(_ panel: NSPanel, fallback: NSScreen) {
+        let desiredSize: NSSize
+        if state.snapshot.firstApprovalID != nil {
+            desiredSize = NSSize(width: 310, height: 96)
+        } else if state.isReplyingInline {
+            desiredSize = NSSize(width: 310, height: 94)
+        } else {
+            desiredSize = NSSize(width: 220, height: 56)
+        }
+        if panel.frame.size != desiredSize {
+            let topY = panel.frame.maxY
+            let updatedFrame = NSRect(
+                x: panel.frame.origin.x,
+                y: topY - desiredSize.height,
+                width: desiredSize.width,
+                height: desiredSize.height
+            )
+            panel.setFrame(updatedFrame, display: true)
+        }
+        keepBuddyOnScreen(panel, fallback: fallback)
     }
 
     private func keepBuddyOnScreen(_ panel: NSPanel, fallback: NSScreen) {
@@ -296,8 +392,10 @@ private final class IslandSurfaceState: ObservableObject {
     @Published var showsNotch = false
     @Published var showsBuddy = false
     @Published var isNotchHovered = false
+    @Published var isReplyingInline = false
+    @Published var inlineReplyDraft = ""
 
-    var isNotchExpanded: Bool { isNotchHovered || snapshot.needsAttention }
+    var isNotchExpanded: Bool { isNotchHovered || isReplyingInline || snapshot.needsAttention }
 
     var accentColor: Color {
         let tokens = ExperienceThemeCatalog.tokens(for: snapshot.theme)
@@ -307,6 +405,8 @@ private final class IslandSurfaceState: ObservableObject {
 
 @MainActor
 private final class IslandPanel: NSPanel {
+    var allowsKeyInput = false
+
     init(size: NSSize) {
         super.init(
             contentRect: NSRect(origin: .zero, size: size),
@@ -325,7 +425,7 @@ private final class IslandPanel: NSPanel {
         animationBehavior = .none
     }
 
-    override var canBecomeKey: Bool { false }
+    override var canBecomeKey: Bool { allowsKeyInput }
     override var canBecomeMain: Bool { false }
 }
 
@@ -342,11 +442,14 @@ private struct NotchIslandView: View {
     let onHover: (Bool) -> Void
     let onApprove: (String) -> Void
     let onDeny: (String) -> Void
+    let onAnswerQuestion: (String, String) -> Void
+    let onToggleReply: (Bool) -> Void
+    let onSubmitReply: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 7) {
             Button(action: onOpen) {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 7) {
                     HStack(spacing: 6) {
                         IslandActivityGlyph(
                             attention: state.snapshot.needsAttention,
@@ -389,7 +492,7 @@ private struct NotchIslandView: View {
                                 .foregroundStyle(.white.opacity(0.6))
                                 .padding(.top, 4)
                         }
-                        .frame(minHeight: 34)
+                        .frame(minHeight: 32)
                         .transition(.opacity)
                     }
                 }
@@ -402,39 +505,131 @@ private struct NotchIslandView: View {
             .accessibilityValue("\(max(0, state.snapshot.activeAgentCount)) active agents, \(max(0, state.snapshot.waitingAgentCount)) waiting, \(max(0, state.snapshot.pendingApprovalCount)) pending approvals, \(max(0, state.snapshot.serverCount)) servers")
 
             if let approvalID = state.snapshot.firstApprovalID {
-                HStack(spacing: 8) {
-                    Spacer(minLength: 0)
-                    Button { onDeny(approvalID) } label: {
-                        Label("Deny", systemImage: "xmark")
-                            .padding(.horizontal, 12)
-                            .frame(height: 24)
-                            .background(Color.red.opacity(0.22), in: Capsule())
-                    }
-                    .foregroundStyle(Color.red)
-                    .accessibilityLabel("Deny pending approval")
-                    if state.snapshot.firstApprovalIsQuestion {
-                        Button(action: onOpen) {
-                            Label("Choose Option…", systemImage: "list.bullet")
-                                .padding(.horizontal, 12)
-                                .frame(height: 24)
-                                .background(state.accentColor, in: Capsule())
+                HStack(spacing: 6) {
+                    if state.snapshot.firstApprovalIsQuestion && !state.snapshot.firstApprovalOptions.isEmpty {
+                        ForEach(state.snapshot.firstApprovalOptions.prefix(3), id: \.self) { option in
+                            Button {
+                                onAnswerQuestion(approvalID, option)
+                            } label: {
+                                Text(option)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 24)
+                                    .background(state.accentColor, in: Capsule())
+                            }
+                            .foregroundStyle(Color.black)
                         }
-                        .foregroundStyle(Color.black)
-                        .accessibilityLabel("Choose question option in dashboard")
+                        if state.snapshot.firstApprovalOptions.count > 3 {
+                            Button(action: onOpen) {
+                                Text("More…")
+                                    .padding(.horizontal, 9)
+                                    .frame(height: 24)
+                                    .background(Color.white.opacity(0.16), in: Capsule())
+                            }
+                            .foregroundStyle(Color.white)
+                        }
+                        Spacer(minLength: 0)
+                        Button { onDeny(approvalID) } label: {
+                            Image(systemName: "xmark")
+                                .frame(width: 24, height: 24)
+                                .background(Color.red.opacity(0.22), in: Circle())
+                        }
+                        .foregroundStyle(Color.red)
                     } else {
-                        Button { onApprove(approvalID) } label: {
-                            Label("Approve", systemImage: "checkmark")
+                        Spacer(minLength: 0)
+                        Button { onDeny(approvalID) } label: {
+                            Label("Deny", systemImage: "xmark")
                                 .padding(.horizontal, 12)
                                 .frame(height: 24)
-                                .background(Color.green, in: Capsule())
+                                .background(Color.red.opacity(0.22), in: Capsule())
                         }
-                        .foregroundStyle(Color.black)
-                        .accessibilityLabel("Approve pending approval")
+                        .foregroundStyle(Color.red)
+                        .accessibilityLabel("Deny pending approval")
+                        if state.snapshot.firstApprovalIsQuestion {
+                            Button(action: onOpen) {
+                                Label("Choose Option…", systemImage: "list.bullet")
+                                    .padding(.horizontal, 12)
+                                    .frame(height: 24)
+                                    .background(state.accentColor, in: Capsule())
+                            }
+                            .foregroundStyle(Color.black)
+                            .accessibilityLabel("Choose question option in dashboard")
+                        } else {
+                            Button { onApprove(approvalID) } label: {
+                                Label("Approve", systemImage: "checkmark")
+                                    .padding(.horizontal, 12)
+                                    .frame(height: 24)
+                                    .background(Color.green, in: Capsule())
+                            }
+                            .foregroundStyle(Color.black)
+                            .accessibilityLabel("Approve pending approval")
+                        }
                     }
                 }
                 .font(.system(size: 11, weight: .semibold))
                 .buttonStyle(.plain)
                 .transition(.opacity)
+            } else if state.isNotchExpanded && state.snapshot.canInlineSteerPrimary {
+                if state.isReplyingInline {
+                    HStack(spacing: 6) {
+                        TextField(
+                            "Reply to \(state.snapshot.agentName) (or /test, /continue)…",
+                            text: $state.inlineReplyDraft
+                        )
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11.5))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        .onSubmit {
+                            onSubmitReply()
+                        }
+
+                        Button {
+                            onSubmitReply()
+                        } label: {
+                            Image(systemName: "paperplane.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(Color.black)
+                                .frame(width: 26, height: 24)
+                                .background(state.accentColor, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(state.inlineReplyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        Button {
+                            onToggleReply(false)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.75))
+                                .frame(width: 24, height: 24)
+                                .background(Color.white.opacity(0.12), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else {
+                    HStack(spacing: 6) {
+                        if let modeText = state.snapshot.primarySteerModeSummary {
+                            Text(modeText)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.white.opacity(0.55))
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                        Button {
+                            onToggleReply(true)
+                        } label: {
+                            Label("Inline Reply…", systemImage: "paperplane.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(Color.black)
+                                .padding(.horizontal, 11)
+                                .frame(height: 23)
+                                .background(state.accentColor, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
             }
         }
         .padding(.horizontal, 14)
@@ -459,45 +654,131 @@ private struct FloatingBuddyView: View {
     @ObservedObject var state: IslandSurfaceState
     let onFocus: () -> Void
     let onOpen: () -> Void
+    let onApprove: (String) -> Void
+    let onDeny: (String) -> Void
+    let onAnswerQuestion: (String, String) -> Void
+    let onToggleReply: (Bool) -> Void
+    let onSubmitReply: () -> Void
 
     var body: some View {
-        HStack(spacing: 7) {
-            IslandActivityGlyph(
-                attention: state.snapshot.needsAttention,
-                animating: state.showsBuddy && (state.snapshot.activeAgentCount > 0 || state.snapshot.needsAttention),
-                accent: state.accentColor,
-                mascot: true
-            )
-            VStack(alignment: .leading, spacing: 3) {
-                Text(state.snapshot.agentName)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white)
-                Text(state.snapshot.taskSummary)
-                    .font(.system(size: 10))
-                    .foregroundStyle(state.snapshot.needsAttention ? Color.orange : Color.white.opacity(0.65))
-            }
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                IslandActivityGlyph(
+                    attention: state.snapshot.needsAttention,
+                    animating: state.showsBuddy && (state.snapshot.activeAgentCount > 0 || state.snapshot.needsAttention),
+                    accent: state.accentColor,
+                    mascot: true
+                )
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(state.snapshot.firstApprovalID != nil ? state.snapshot.approvalToolName : state.snapshot.agentName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Text(state.snapshot.firstApprovalID != nil ? state.snapshot.approvalSummary : state.snapshot.taskSummary)
+                        .font(.system(size: 10))
+                        .foregroundStyle(state.snapshot.needsAttention ? Color.orange : Color.white.opacity(0.65))
+                }
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack(spacing: 3) {
-                Button(action: onFocus) {
-                    Image(systemName: "scope").frame(width: 20, height: 28)
+                HStack(spacing: 3) {
+                    if state.snapshot.canInlineSteerPrimary && state.snapshot.firstApprovalID == nil {
+                        Button {
+                            onToggleReply(!state.isReplyingInline)
+                        } label: {
+                            Image(systemName: "paperplane.fill").frame(width: 20, height: 28)
+                        }
+                        .help("Send inline instruction to primary agent")
+                        .accessibilityLabel("Inline reply to primary agent")
+                    }
+                    Button(action: onFocus) {
+                        Image(systemName: "scope").frame(width: 20, height: 28)
+                    }
+                    .disabled(!state.snapshot.canFocusAgent)
+                    .help("Focus primary agent")
+                    .accessibilityLabel("Focus primary agent")
+                    Button(action: onOpen) {
+                        Image(systemName: "menubar.rectangle").frame(width: 20, height: 28)
+                    }
+                    .help("Open Suyoi popover")
+                    .accessibilityLabel("Open Suyoi popover")
                 }
-                .disabled(!state.snapshot.canFocusAgent)
-                .help("Focus primary agent")
-                .accessibilityLabel("Focus primary agent")
-                Button(action: onOpen) {
-                    Image(systemName: "menubar.rectangle").frame(width: 20, height: 28)
-                }
-                .help("Open Suyoi popover")
-                .accessibilityLabel("Open Suyoi popover")
+                .font(.system(size: 12, weight: .medium))
+                .buttonStyle(.borderless)
+                .tint(state.accentColor)
             }
-            .font(.system(size: 12, weight: .medium))
-            .buttonStyle(.borderless)
-            .tint(state.accentColor)
+
+            if let approvalID = state.snapshot.firstApprovalID {
+                HStack(spacing: 5) {
+                    if state.snapshot.firstApprovalIsQuestion,
+                       let firstOpt = state.snapshot.firstApprovalOptions.first {
+                        ForEach(state.snapshot.firstApprovalOptions.prefix(2), id: \.self) { opt in
+                            Button {
+                                onAnswerQuestion(approvalID, opt)
+                            } label: {
+                                Text(opt)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 8)
+                                    .frame(height: 22)
+                                    .background(state.accentColor, in: Capsule())
+                            }
+                            .foregroundStyle(Color.black)
+                        }
+                        let _ = firstOpt
+                        if state.snapshot.firstApprovalOptions.count > 2 {
+                            Button(action: onOpen) {
+                                Text("…")
+                                    .padding(.horizontal, 7)
+                                    .frame(height: 22)
+                                    .background(Color.white.opacity(0.15), in: Capsule())
+                            }
+                            .foregroundStyle(Color.white)
+                        }
+                    } else {
+                        Button { onApprove(approvalID) } label: {
+                            Label("Approve", systemImage: "checkmark")
+                                .padding(.horizontal, 9)
+                                .frame(height: 22)
+                                .background(Color.green, in: Capsule())
+                        }
+                        .foregroundStyle(Color.black)
+                    }
+                    Spacer(minLength: 0)
+                    Button { onDeny(approvalID) } label: {
+                        Image(systemName: "xmark")
+                            .frame(width: 22, height: 22)
+                            .background(Color.red.opacity(0.24), in: Circle())
+                    }
+                    .foregroundStyle(Color.red)
+                }
+                .font(.system(size: 10.5, weight: .semibold))
+                .buttonStyle(.plain)
+            } else if state.isReplyingInline {
+                HStack(spacing: 5) {
+                    TextField("Reply…", text: $state.inlineReplyDraft)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3.5)
+                        .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .onSubmit {
+                            onSubmitReply()
+                        }
+
+                    Button {
+                        onSubmitReply()
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 16))
+                            .foregroundStyle(state.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(state.inlineReplyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
         }
         .padding(.horizontal, 10)
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(white: 0.06), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {

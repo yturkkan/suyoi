@@ -65,7 +65,7 @@ struct SafetyDiagnosticsTests {
         #expect(SafetyDiagnostics.explainSteeringUnavailable(for: agent(tty: "ttys001", terminal: "Other")).checkName == "Terminal association")
         #expect(SafetyDiagnostics.explainSteeringUnavailable(for: agent(tty: "ttys001", terminal: "Terminal", stopped: true)).checkName == "Process activity")
         #expect(SafetyDiagnostics.explainSteeringUnavailable(for: agent(tty: "ttys001", terminal: "tmux", stopped: true)).checkName == "Process activity")
-        for terminal in ["Terminal", "tmux"] {
+        for terminal in ["Terminal", "tmux", "WezTerm", "kitty"] {
             let detail = SafetyDiagnostics.explainSteeringUnavailable(for: agent(tty: "ttys001", terminal: terminal))
             #expect(detail.checkName == "Live steering verification")
             #expect(detail.canRecheck)

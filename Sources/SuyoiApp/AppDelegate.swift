@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import SwiftUI
 import SuyoiCore
+import UserNotifications
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
@@ -23,6 +24,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         controller.onDenyPending = { [weak self] id in
             self?.model.denyPendingRequest(id: id)
         }
+        controller.onAnswerQuestion = { [weak self] id, option in
+            self?.model.answerPendingQuestion(id: id, option: option)
+        }
+        controller.onQuickSteerPrimary = { [weak self] prompt in
+            self?.model.quickSteerPrimaryAgent(prompt)
+        }
         return controller
     }()
     private var refreshTimer: Timer?
@@ -32,6 +39,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     static let popoverSize = NSSize(width: 700, height: 600)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if Bundle.main.bundleURL.pathExtension == "app" {
+            let center = UNUserNotificationCenter.current()
+            center.delegate = self
+            model.registerNotificationCategories()
+        }
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let symbolName = model.isParallelBuild ? "leaf.circle.fill" : "leaf.fill"
         let appName = model.appDisplayName
@@ -117,7 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         islandController.setMode(model.surfaceMode, snapshot: model.islandSurfaceSnapshot)
     }
 
-    private func showPopoverIfNeeded() {
+    func showPopoverIfNeeded() {
         guard let button = statusItem.button, !popover.isShown else { return }
         popover.behavior = model.isPopoverPinned ? .applicationDefined : .transient
         NSApp.activate(ignoringOtherApps: true)
@@ -234,5 +247,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         removeGlobalClickMonitor()
         refreshTimer?.invalidate()
+    }
+}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let actionID = response.actionIdentifier
+        let userText = (response as? UNTextInputNotificationResponse)?.userText
+        let userInfo = response.notification.request.content.userInfo
+        let requestID = userInfo["requestID"] as? String
+        let agentPID = userInfo["agentPID"] as? Int
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if actionID == UNNotificationDefaultActionIdentifier {
+                self.showPopoverIfNeeded()
+            } else {
+                self.model.handleNotificationAction(
+                    actionIdentifier: actionID,
+                    requestID: requestID,
+                    agentPID: agentPID,
+                    userText: userText
+                )
+            }
+        }
+        completionHandler()
     }
 }

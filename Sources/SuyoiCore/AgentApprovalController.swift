@@ -43,6 +43,47 @@ public enum ApprovalDecision: Codable, Equatable, Sendable {
     case answerQuestion(selectedOption: String)
 }
 
+public struct ScopedApprovalPolicy: Codable, Equatable, Sendable {
+    public var autoApproveReadOnlyTools: Bool
+    public var applyToAllVerifiedProjects: Bool
+    public var allowedProjectPaths: Set<String>
+
+    public init(
+        autoApproveReadOnlyTools: Bool = false,
+        applyToAllVerifiedProjects: Bool = true,
+        allowedProjectPaths: Set<String> = []
+    ) {
+        self.autoApproveReadOnlyTools = autoApproveReadOnlyTools
+        self.applyToAllVerifiedProjects = applyToAllVerifiedProjects
+        self.allowedProjectPaths = allowedProjectPaths
+    }
+}
+
+public struct AutoApprovedToolRecord: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let agentName: String
+    public let toolName: String
+    public let projectPath: String
+    public let summary: String
+    public let approvedAt: Date
+
+    public init(
+        id: String = UUID().uuidString,
+        agentName: String,
+        toolName: String,
+        projectPath: String,
+        summary: String,
+        approvedAt: Date
+    ) {
+        self.id = id
+        self.agentName = agentName
+        self.toolName = toolName
+        self.projectPath = projectPath
+        self.summary = summary
+        self.approvedAt = approvedAt
+    }
+}
+
 struct ApprovalScope: Codable, Equatable, Sendable {
     let process: ProcessIdentity
     let sessionID: String
@@ -119,11 +160,104 @@ public final class AgentApprovalController: @unchecked Sendable {
         }
     }
 
+    private static let directReadOnlyToolNames: Set<String> = [
+        "read", "view", "glob", "grep", "ls", "readfile", "listdir", "findfiles"
+    ]
+
+    private static let forbiddenShellScalars: Set<Unicode.Scalar> = [
+        ";", "|", "&", "`", "$", ">", "<", "(", ")", "\n", "\r", "\\"
+    ]
+
+    private static let forbiddenGitFlags: Set<String> = [
+        "-c", "--exec", "--output", "--ext-diff", "--textconv",
+        "-f", "--force", "-d", "-D", "-m", "-M", "--delete", "--unset"
+    ]
+
     private let lock = NSLock()
     private var entries: [Entry] = []
     private var grants: [Entry] = []
+    private var policy = ScopedApprovalPolicy()
+    private var autoApprovedHistory: [AutoApprovedToolRecord] = []
 
     public init() {}
+
+    public func scopedPolicy() -> ScopedApprovalPolicy {
+        lock.withLock { policy }
+    }
+
+    public func setScopedPolicy(_ newPolicy: ScopedApprovalPolicy) {
+        let normalizedPaths = Set(newPolicy.allowedProjectPaths.compactMap { raw -> String? in
+            guard raw.hasPrefix("/") else { return nil }
+            return URL(fileURLWithPath: raw).resolvingSymlinksInPath().standardizedFileURL.path
+        })
+        let sanitized = ScopedApprovalPolicy(
+            autoApproveReadOnlyTools: newPolicy.autoApproveReadOnlyTools,
+            applyToAllVerifiedProjects: newPolicy.applyToAllVerifiedProjects,
+            allowedProjectPaths: normalizedPaths
+        )
+        let newlyApproved: [Entry] = lock.withLock {
+            policy = sanitized
+            guard sanitized.autoApproveReadOnlyTools else { return [] }
+            return removeEntries { entry in
+                guard !entry.isQuestion, let scope = entry.currentScope else { return false }
+                let matchesProject = sanitized.applyToAllVerifiedProjects
+                    || sanitized.allowedProjectPaths.contains(scope.projectPath)
+                guard matchesProject,
+                      Self.isSafeReadOnlyTool(toolName: entry.request.toolName, command: entry.request.toolName.caseInsensitiveCompare("Bash") == .orderedSame ? entry.request.summary : nil) else {
+                    return false
+                }
+                recordAutoApprovalLocked(request: entry.request, projectPath: scope.projectPath, now: Date())
+                return true
+            }
+        }
+        if !newlyApproved.isEmpty {
+            respond(to: newlyApproved, with: Reply(decision: "approve"))
+        }
+    }
+
+    public func recentAutoApprovedRecords() -> [AutoApprovedToolRecord] {
+        lock.withLock { autoApprovedHistory }
+    }
+
+    public static func isSafeReadOnlyTool(toolName: String, command: String?) -> Bool {
+        let lowerTool = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if directReadOnlyToolNames.contains(lowerTool) {
+            return command == nil
+        }
+        guard lowerTool == "bash", let rawCommand = command else {
+            return false
+        }
+        let trimmed = rawCommand.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, trimmed.utf8.count <= 512 else { return false }
+        for scalar in trimmed.unicodeScalars {
+            if forbiddenShellScalars.contains(scalar) || unsafeScalar(scalar) {
+                return false
+            }
+        }
+        let tokens = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard tokens.count >= 2, tokens[0] == "git" else { return false }
+        for token in tokens.dropFirst() {
+            if forbiddenGitFlags.contains(token)
+                || token.hasPrefix("-c")
+                || token.hasPrefix("--output=")
+                || token.hasPrefix("--exec=") {
+                return false
+            }
+        }
+        let subcommand = tokens[1]
+        switch subcommand {
+        case "status", "diff", "log", "show":
+            return true
+        case "rev-parse":
+            return tokens.dropFirst(2).allSatisfy {
+                ["--abbrev-ref", "--short", "--show-toplevel", "--git-dir", "HEAD"].contains($0)
+            }
+        case "branch":
+            return tokens.dropFirst(2) == ["--show-current"]
+        default:
+            return false
+        }
+    }
 
     public func pendingRequests() -> [PendingApprovalRequest] {
         lock.withLock { entries.map(\.request) }
@@ -287,11 +421,20 @@ public final class AgentApprovalController: @unchecked Sendable {
             projectPath: Self.clean(hook.cwd, limit: 4_096), toolName: toolName,
             summary: summary, questionOptions: labels, requestedAt: now
         )
+        let rawCommand = input?.command
         let immediate: Reply? = lock.withLock {
             if let scope {
                 guard isScopeCurrent() else { return Reply(decision: "block", reason: "Hook session ended") }
                 if !isQuestion && grants.contains(where: { $0.currentScope == scope }) {
                     return Reply(decision: "approve")
+                }
+                if !isQuestion, policy.autoApproveReadOnlyTools {
+                    let projectAllowed = policy.applyToAllVerifiedProjects
+                        || policy.allowedProjectPaths.contains(scope.projectPath)
+                    if projectAllowed && Self.isSafeReadOnlyTool(toolName: toolName, command: rawCommand) {
+                        recordAutoApprovalLocked(request: request, projectPath: scope.projectPath, now: now)
+                        return Reply(decision: "approve")
+                    }
                 }
             }
             guard entries.count < 50 else {
@@ -306,6 +449,21 @@ public final class AgentApprovalController: @unchecked Sendable {
             return nil
         }
         return request
+    }
+
+    private func recordAutoApprovalLocked(request: PendingApprovalRequest, projectPath: String, now: Date) {
+        let record = AutoApprovedToolRecord(
+            id: request.id,
+            agentName: request.agentName,
+            toolName: request.toolName,
+            projectPath: projectPath,
+            summary: request.summary,
+            approvedAt: now
+        )
+        autoApprovedHistory.insert(record, at: 0)
+        if autoApprovedHistory.count > 30 {
+            autoApprovedHistory.removeLast(autoApprovedHistory.count - 30)
+        }
     }
 
     /// Returns a POSIX-shell command for a bridge that reads hook JSON from stdin.

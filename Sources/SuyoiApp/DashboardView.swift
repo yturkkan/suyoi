@@ -320,12 +320,22 @@ struct DashboardView: View {
                             trailing: "Approve · session · deny"
                         )
                         ForEach(model.pendingApprovals) { req in
+                            let isSafeReadOnly = req.questionOptions.isEmpty && AgentApprovalController.isSafeReadOnlyTool(
+                                toolName: req.toolName,
+                                command: req.toolName.caseInsensitiveCompare("Bash") == .orderedSame ? req.summary : nil
+                            )
                             PendingApprovalCardView(
                                 request: req,
                                 canAutoApprove: model.canAutoApprove(req),
+                                canAutoApproveProjectReadOnly: model.canAutoApprove(req) && isSafeReadOnly && (req.projectPath?.hasPrefix("/") == true),
                                 accent: accent,
                                 onDecision: { decision in
                                     model.submitApprovalDecision(decision, for: req)
+                                },
+                                onEnableProjectReadOnly: {
+                                    if let path = req.projectPath {
+                                        model.enableReadOnlyAutoApproveForProject(path)
+                                    }
                                 }
                             )
                         }
@@ -338,6 +348,26 @@ struct DashboardView: View {
                             onRevoke: { req in
                                 model.revokeAutoApproval(req)
                             }
+                        )
+                    }
+
+                    if !model.worktreeCollisions.isEmpty {
+                        WorktreeCollisionWarningBar(
+                            collisions: model.worktreeCollisions,
+                            onIsolateFirst: { group in
+                                if let target = model.agentRows.first(where: { group.agentIDs.contains($0.id) }) {
+                                    model.createIsolatedWorktree(for: target)
+                                }
+                            }
+                        )
+                    }
+
+                    if !model.orphanToolProcesses.isEmpty {
+                        OrphanMCPHelpersBar(
+                            orphans: model.orphanToolProcesses,
+                            isPerformingAction: model.isPerformingAction,
+                            onStopOne: { model.stopOrphanProcess($0) },
+                            onStopAll: { model.stopAllOrphanProcesses() }
                         )
                     }
 
@@ -367,6 +397,9 @@ struct DashboardView: View {
                                     isAutoApproved: model.isSessionAutoApproved(for: row),
                                     quotaItem: model.combinedQuotaItem(forAgentName: row.agentName),
                                     steerModeLabel: model.steerModeLabel(for: row),
+                                    collision: model.collisionGroup(for: row),
+                                    diffSummary: model.diffSummary(for: row),
+                                    stuckDiagnostic: model.stuckDiagnostic(for: row),
                                     isSelected: selectedID == row.id,
                                     isHovered: model.hoveredRowID == rowID,
                                     onHover: { model.hoveredRowID = $0 ? rowID : (model.hoveredRowID == rowID ? nil : model.hoveredRowID) },
@@ -413,11 +446,19 @@ struct DashboardView: View {
                         steerPromptText: $model.steerPromptText,
                         isSteering: model.isSteering,
                         isPerformingAction: model.isPerformingAction,
+                        snippets: model.allSteeringSnippets,
+                        continuationJobs: model.continuationJobs(for: agent),
+                        collisionGroup: model.collisionGroup(for: agent),
+                        diffSummary: model.diffSummary(for: agent),
+                        stuckDiagnostic: model.stuckDiagnostic(for: agent),
                         onPrepareSteerSessions: { model.prepareSteerSessions(for: $0) },
                         onRefreshSteerSessions: { model.reloadSteerSessions(for: $0) },
                         onFocusAgent: { model.focusTerminalOrIDE(for: $0) },
                         onSteerAgent: { model.sendSteerPrompt(to: $0) },
                         onStopAgent: { model.stopAgent($0, force: $1) },
+                        onApplySnippet: { model.applySteeringSnippet($0) },
+                        onCancelContinuationJob: { model.cancelContinuationJob($0) },
+                        onCreateIsolatedWorktree: { model.createIsolatedWorktree(for: $0) },
                         onDismiss: {
                             model.selectedAgent = nil
                             model.resetSteerComposer()
@@ -998,8 +1039,10 @@ struct DashboardView: View {
 private struct PendingApprovalCardView: View {
     let request: PendingApprovalRequest
     let canAutoApprove: Bool
+    var canAutoApproveProjectReadOnly: Bool = false
     let accent: Color
     let onDecision: (ApprovalDecision) -> Void
+    var onEnableProjectReadOnly: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1071,12 +1114,24 @@ private struct PendingApprovalCardView: View {
                         Button {
                             onDecision(.allowForSession)
                         } label: {
-                            Text("Auto-Approve Session")
+                            Text("Session")
                                 .font(.system(size: 11, weight: .medium))
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .help("Allow tools for this verified Claude Code session")
+                    }
+
+                    if canAutoApproveProjectReadOnly, let onEnableProjectReadOnly {
+                        Button {
+                            onEnableProjectReadOnly()
+                        } label: {
+                            Text("Read-Only OK")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Auto-approve verified read-only tools in this project")
                     }
 
                     Spacer()
@@ -1102,6 +1157,96 @@ private struct PendingApprovalCardView: View {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .strokeBorder(Color(nsColor: .systemOrange).opacity(0.45), lineWidth: 0.8)
         )
+    }
+}
+
+private struct WorktreeCollisionWarningBar: View {
+    let collisions: [WorktreeCollisionGroup]
+    let onIsolateFirst: (WorktreeCollisionGroup) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("SHARED WORKTREE COLLISIONS (\(collisions.count))")
+                .font(.system(size: 9.5, weight: .bold))
+                .tracking(0.5)
+                .foregroundStyle(Color(nsColor: .systemOrange))
+            ForEach(collisions) { group in
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color(nsColor: .systemOrange))
+                    Text("\(group.projectName) · \(group.agentIDs.count) agents")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .lineLimit(1)
+                    if let branch = group.gitBranch {
+                        Text("(\(branch))")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button("Isolate Worktree") {
+                        onIsolateFirst(group)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .help("Create a clean sibling git worktree branch and copy its path")
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+                .background(Color(nsColor: .systemOrange).opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            }
+        }
+    }
+}
+
+private struct OrphanMCPHelpersBar: View {
+    let orphans: [OrphanToolProcess]
+    let isPerformingAction: Bool
+    let onStopOne: (OrphanToolProcess) -> Void
+    let onStopAll: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("ORPHAN MCP HELPERS (\(orphans.count))")
+                    .font(.system(size: 9.5, weight: .bold))
+                    .tracking(0.5)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if orphans.count > 1 {
+                    Button("Stop All") {
+                        onStopAll()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(isPerformingAction)
+                }
+            }
+            ForEach(orphans.prefix(4)) { orphan in
+                HStack(spacing: 6) {
+                    Image(systemName: "puzzlepiece.extension.fill")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                    Text(orphan.kindLabel)
+                        .font(.system(size: 11.5, weight: .semibold))
+                    Text("· PID \(String(orphan.process.pid)) · \(formatBytes(orphan.process.footprintBytes ?? orphan.process.residentBytes))")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                    Button("Stop") {
+                        onStopOne(orphan)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(isPerformingAction)
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            }
+        }
     }
 }
 
@@ -1160,6 +1305,9 @@ private struct AgentCardRow: View {
     let isAutoApproved: Bool
     let quotaItem: CombinedProviderQuotaItem?
     let steerModeLabel: String?
+    var collision: WorktreeCollisionGroup? = nil
+    var diffSummary: WorktreeDiffSummary? = nil
+    var stuckDiagnostic: StuckAgentDiagnostic? = nil
     let isSelected: Bool
     let isHovered: Bool
     let onHover: (Bool) -> Void
@@ -1264,6 +1412,21 @@ private struct AgentCardRow: View {
 
                                 if isAutoApproved {
                                     statusBadge("Auto-OK", tint: accent)
+                                }
+
+                                if let collision {
+                                    statusBadge("\(collision.agentIDs.count) agents", tint: Color(nsColor: .systemOrange))
+                                        .help("Shared worktree collision in \(collision.projectName)")
+                                }
+
+                                if stuckDiagnostic != nil {
+                                    statusBadge("High CPU", tint: Color(nsColor: .systemRed))
+                                        .help("Sustained high CPU without turn progress")
+                                }
+
+                                if let diff = diffSummary, !diff.isClean {
+                                    statusBadge("+\(diff.addedLines) -\(diff.deletedLines)", tint: Color(nsColor: .systemGreen))
+                                        .help("\(diff.totalTouchedFiles) uncommitted file(s)")
                                 }
 
                                 if portCount == 1, let firstPort = obs.childServerPorts.first {

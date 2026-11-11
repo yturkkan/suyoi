@@ -26,7 +26,7 @@ struct ContractTests {
     }
 
     @Test func steeringContractsRoundTripAndSupportIndependentImplementations() throws {
-        for mode in [AgentSteerMode.terminalTTY, .tmuxPane, .openCodeSession, .codexResume, .claudeResume] {
+        for mode in [AgentSteerMode.terminalTTY, .tmuxPane, .weztermPane, .kittyWindow, .openCodeSession, .codexResume, .claudeResume] {
             try roundTrip(mode)
             try roundTrip(AgentSteerOutcome(agentID: 42, mode: mode, succeeded: true, detail: "Submitted"))
             try roundTrip(AgentSteerOutcome(agentID: 42, mode: mode, succeeded: false, error: "Identity mismatch"))
@@ -34,6 +34,8 @@ struct ContractTests {
         }
         #expect(AgentSteerMode.terminalTTY.isLiveTerminalDelivery)
         #expect(AgentSteerMode.tmuxPane.isLiveTerminalDelivery)
+        #expect(AgentSteerMode.weztermPane.isLiveTerminalDelivery)
+        #expect(AgentSteerMode.kittyWindow.isLiveTerminalDelivery)
         #expect(!AgentSteerMode.openCodeSession.isLiveTerminalDelivery)
         #expect(!AgentSteerMode.codexResume.isLiveTerminalDelivery)
         #expect(!AgentSteerMode.claudeResume.isLiveTerminalDelivery)
