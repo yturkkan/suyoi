@@ -517,7 +517,7 @@ struct AgentSteererTests {
     }
 
     @Test func tmuxLiveSteeringVerifiesPaneStateAndSendsLiteralKeys() throws {
-        let p = process(tty: "ttys001")
+        let p = process(tty: "ttys001", executable: "/bin/claude")
         let row = agent("Claude Code", process: p, terminal: "tmux")
         #expect(AgentSteerer.preferredMode(for: row) == .tmuxPane)
         #expect(AgentSteerer.canSteer(row))
@@ -529,7 +529,7 @@ struct AgentSteererTests {
         #expect(outcome.succeeded)
         #expect(outcome.mode == .tmuxPane)
         #expect(outcome.detail == "Sent instruction to tmux (ttys001)")
-        #expect(runner.requests.count == 3)
+        try #require(runner.requests.count == 3)
         #expect(runner.requests[0].executable == "/usr/bin/env")
         #expect(runner.requests[0].arguments == ["tmux", "list-panes", "-a", "-F", "#{pane_tty}\t#{pane_id}\t#{pane_dead}\t#{pane_in_mode}"])
         #expect(runner.requests[0].includeStandardUserPaths)

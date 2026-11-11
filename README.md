@@ -19,6 +19,8 @@
   <sub>macOS 14+ &nbsp; · &nbsp; Swift + SwiftUI + AppKit &nbsp; · &nbsp; No external package dependencies &nbsp; · &nbsp; <a href="LICENSE">MIT licensed</a></sub>
 </p>
 
+> **Suyoi Next (Parallel Build Channel):** This repository builds **`Suyoi Next.app`** (`local.suyoi.next`) via `./scripts/build-app.sh --parallel` and publishes **[Suyoi-Next.app.zip](https://github.com/yturkkan/suyoi-next/releases/latest)** so you can run and test enhanced chat steering (`tmux` live delivery, Claude Code native session continuation, hardened child environments, smart foreground descendant checks) **side-by-side** without overwriting an installed `Suyoi.app`.
+
 ## Less hunting. More building.
 
 When agents, terminals, and localhost tabs pile up, Suyoi keeps the useful context within reach.
