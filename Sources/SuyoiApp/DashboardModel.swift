@@ -827,13 +827,10 @@ final class DashboardModel: ObservableObject {
                     recordCurrentQuotaBurnSamples()
                 }
             } else if !indexedSessions.isEmpty {
-                let liveByIdentity = Dictionary(
-                    payload.snapshot.agentObservations.map { ($0.process.identity, $0) },
-                    uniquingKeysWith: { first, _ in first }
-                )
+                let freshObservations = payload.snapshot.agentObservations
                 indexedSessions = indexedSessions.map { session in
                     guard let oldObs = session.liveObservation,
-                          let freshObs = liveByIdentity[oldObs.process.identity] else {
+                          let freshObs = freshObservations.first(where: { $0.process.identity == oldObs.process.identity }) else {
                         return session
                     }
                     return IndexedAgentSession(
