@@ -226,8 +226,8 @@ struct AgentChatStreamRunnerTests {
 
         let e3 = parser.parseLine(#"{"type":"text","sessionID":"ses_opencode_42","part":{"id":"prt_m1","type":"text","text":"İlk satır"}}"#)
         let e4 = parser.parseLine(#"{"type":"text","sessionID":"ses_opencode_42","part":{"id":"prt_m1","type":"text","text":"İlk satır ve devamı"}}"#)
-        #expect(e3 == [.assistantMessageUpdated(id: "opencode-prt_m1", text: "İlk satır")])
-        #expect(e4 == [.assistantMessageUpdated(id: "opencode-prt_m1", text: "İlk satır ve devamı")])
+        #expect(e3 == [.assistantMessageUpdated(id: "oc-prt_m1", text: "İlk satır")])
+        #expect(e4 == [.assistantMessageUpdated(id: "oc-prt_m1", text: "İlk satır ve devamı")])
     }
 
     @Test("AgentChatStreamRunner surfaces non-zero exit stderr and supports mid-stream cancellation")

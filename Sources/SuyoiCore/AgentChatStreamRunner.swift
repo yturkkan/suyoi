@@ -603,14 +603,10 @@ public struct AgentStreamLineParser: Sendable {
 public final class AgentChatStreamRunner: @unchecked Sendable {
     private final class ActiveStreamEntry: @unchecked Sendable {
         let process: Process
-        let stdoutPipe: Pipe
-        let stderrPipe: Pipe
         var wasCancelled: Bool = false
 
-        init(process: Process, stdoutPipe: Pipe, stderrPipe: Pipe) {
+        init(process: Process) {
             self.process = process
-            self.stdoutPipe = stdoutPipe
-            self.stderrPipe = stderrPipe
         }
     }
 
@@ -996,6 +992,13 @@ public final class AgentChatStreamRunner: @unchecked Sendable {
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        let stdoutReadHandle = stdoutPipe.fileHandleForReading
+        let stderrReadHandle = stderrPipe.fileHandleForReading
+        let outFD = stdoutReadHandle.fileDescriptor
+        let errFD = stderrReadHandle.fileDescriptor
+        _ = fcntl(outFD, F_SETFD, fcntl(outFD, F_GETFD) | FD_CLOEXEC)
+        _ = fcntl(errFD, F_SETFD, fcntl(errFD, F_GETFD) | FD_CLOEXEC)
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = arguments
@@ -1010,123 +1013,162 @@ public final class AgentChatStreamRunner: @unchecked Sendable {
         process.standardError = stderrPipe
 
         let runID = UUID()
-        let entry = ActiveStreamEntry(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
+        let entry = ActiveStreamEntry(process: process)
         lock.withLock {
             activeRuns[runID] = entry
-        }
-
-        final class StreamStateBox: @unchecked Sendable {
-            var parser: AgentStreamLineParser
-            var stderrCollected = Data()
-            init(provider: SessionProviderKind) {
-                self.parser = AgentStreamLineParser(provider: provider)
-            }
-        }
-
-        let ioGroup = DispatchGroup()
-        let stateQueue = DispatchQueue(label: "local.suyoi.chat-stream.\(runID.uuidString)")
-        let stateBox = StreamStateBox(provider: request.provider)
-        let maxStderrBytes = 32 * 1_024
-
-        process.terminationHandler = { [weak self] terminated in
-            let exitCode = terminated.terminationStatus
-            ioGroup.notify(queue: stateQueue) {
-                let wasCancelled: Bool = self?.lock.withLock {
-                    let removed = self?.activeRuns.removeValue(forKey: runID)
-                    return removed?.wasCancelled ?? false
-                } ?? false
-
-                if exitCode != 0, !wasCancelled, !stateBox.parser.hasEmittedError {
-                    let rawErr = String(decoding: stateBox.stderrCollected, as: UTF8.self)
-                    let message = AgentStreamLineParser.cleanErrorMessage(rawErr)
-                        ?? "\(request.provider.rawValue) exited with status \(exitCode)."
-                    onEvent(.error(message))
-                }
-                onEvent(.finished(exitCode: exitCode))
-            }
         }
 
         do {
             try process.run()
         } catch {
             _ = lock.withLock { activeRuns.removeValue(forKey: runID) }
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            try? stdoutReadHandle.close()
+            try? stderrReadHandle.close()
             return .failure(.launchFailed(error.localizedDescription))
         }
 
-        let stdoutFD = stdoutPipe.fileHandleForReading.fileDescriptor
-        ioGroup.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
+        try? stdoutPipe.fileHandleForWriting.close()
+        try? stderrPipe.fileHandleForWriting.close()
+        _ = fcntl(outFD, F_SETFL, fcntl(outFD, F_GETFL) | O_NONBLOCK)
+        _ = fcntl(errFD, F_SETFL, fcntl(errFD, F_GETFL) | O_NONBLOCK)
+
+        let provider = request.provider
+        let maxStderrBytes = 32 * 1_024
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var parser = AgentStreamLineParser(provider: provider)
             var lineBuffer = Data()
-            var readBuf = [UInt8](repeating: 0, count: 4_096)
-            while true {
-                let count = readBuf.withUnsafeMutableBytes { ptr in
-                    Darwin.read(stdoutFD, ptr.baseAddress, ptr.count)
-                }
-                if count > 0 {
-                    lineBuffer.append(contentsOf: readBuf[0..<count])
-                    while let newlineIndex = lineBuffer.firstIndex(of: 0x0A) {
-                        let lineData = Data(lineBuffer[..<newlineIndex])
-                        lineBuffer.removeSubrange(...newlineIndex)
-                        let lineStr = String(decoding: lineData, as: UTF8.self)
-                        stateQueue.sync {
-                            let produced = stateBox.parser.parseLine(lineStr)
-                            for ev in produced {
+            var stderrCollected = Data()
+            var outOpen = true
+            var errOpen = true
+            var exitedSinceNs: UInt64?
+            var readBuf = [UInt8](repeating: 0, count: 8_192)
+
+            func drainStdout() {
+                while outOpen {
+                    let n = readBuf.withUnsafeMutableBytes { ptr in
+                        Darwin.read(outFD, ptr.baseAddress, ptr.count)
+                    }
+                    if n > 0 {
+                        lineBuffer.append(contentsOf: readBuf[0..<n])
+                        while let newlineIndex = lineBuffer.firstIndex(of: 0x0A) {
+                            let lineData = Data(lineBuffer[..<newlineIndex])
+                            lineBuffer.removeSubrange(...newlineIndex)
+                            let lineStr = String(decoding: lineData, as: UTF8.self)
+                            for ev in parser.parseLine(lineStr) {
                                 onEvent(ev)
                             }
                         }
-                    }
-                    // Prevent unbounded single-line memory growth
-                    if lineBuffer.count > 512 * 1_024 {
-                        let chunkStr = String(decoding: lineBuffer, as: UTF8.self)
-                        lineBuffer.removeAll(keepingCapacity: true)
-                        stateQueue.sync {
-                            let produced = stateBox.parser.parseLine(chunkStr)
-                            for ev in produced {
+                        if lineBuffer.count > 512 * 1_024 {
+                            let chunkStr = String(decoding: lineBuffer, as: UTF8.self)
+                            lineBuffer.removeAll(keepingCapacity: true)
+                            for ev in parser.parseLine(chunkStr) {
                                 onEvent(ev)
                             }
                         }
+                    } else if n == 0 {
+                        outOpen = false
+                        break
+                    } else if errno == EINTR {
+                        continue
+                    } else {
+                        if errno != EAGAIN && errno != EWOULDBLOCK {
+                            outOpen = false
+                        }
+                        break
                     }
-                } else if count == 0 {
-                    break
-                } else if errno != EINTR {
-                    break
                 }
             }
+
+            func drainStderr() {
+                while errOpen {
+                    let n = readBuf.withUnsafeMutableBytes { ptr in
+                        Darwin.read(errFD, ptr.baseAddress, ptr.count)
+                    }
+                    if n > 0 {
+                        let remaining = maxStderrBytes - stderrCollected.count
+                        if remaining > 0 {
+                            stderrCollected.append(contentsOf: readBuf[0..<min(n, remaining)])
+                        }
+                    } else if n == 0 {
+                        errOpen = false
+                        break
+                    } else if errno == EINTR {
+                        continue
+                    } else {
+                        if errno != EAGAIN && errno != EWOULDBLOCK {
+                            errOpen = false
+                        }
+                        break
+                    }
+                }
+            }
+
+            while true {
+                drainStdout()
+                drainStderr()
+
+                if !process.isRunning {
+                    if !outOpen && !errOpen {
+                        break
+                    }
+                    let nowNs = DispatchTime.now().uptimeNanoseconds
+                    if let since = exitedSinceNs {
+                        // Do not block forever if a background MCP/server grandchild retained the pipe fd
+                        if nowNs - since >= 80_000_000 {
+                            break
+                        }
+                    } else {
+                        exitedSinceNs = nowNs
+                    }
+                }
+
+                var pfds: [pollfd] = []
+                if outOpen {
+                    pfds.append(pollfd(fd: outFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0))
+                }
+                if errOpen {
+                    pfds.append(pollfd(fd: errFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0))
+                }
+                if pfds.isEmpty {
+                    if !process.isRunning { break }
+                    usleep(15_000)
+                } else {
+                    let timeoutMs: Int32 = process.isRunning ? 45 : 15
+                    _ = pfds.withUnsafeMutableBufferPointer { buf in
+                        Darwin.poll(buf.baseAddress, nfds_t(buf.count), timeoutMs)
+                    }
+                }
+            }
+
+            drainStdout()
+            drainStderr()
             if !lineBuffer.isEmpty {
                 let finalLine = String(decoding: lineBuffer, as: UTF8.self)
-                stateQueue.sync {
-                    let produced = stateBox.parser.parseLine(finalLine)
-                    for ev in produced {
-                        onEvent(ev)
-                    }
+                for ev in parser.parseLine(finalLine) {
+                    onEvent(ev)
                 }
             }
-            ioGroup.leave()
-        }
 
-        let stderrFD = stderrPipe.fileHandleForReading.fileDescriptor
-        ioGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            var readBuf = [UInt8](repeating: 0, count: 4_096)
-            while true {
-                let count = readBuf.withUnsafeMutableBytes { ptr in
-                    Darwin.read(stderrFD, ptr.baseAddress, ptr.count)
-                }
-                if count > 0 {
-                    let chunk = Array(readBuf[0..<count])
-                    stateQueue.sync {
-                        let remaining = maxStderrBytes - stateBox.stderrCollected.count
-                        if remaining > 0 {
-                            stateBox.stderrCollected.append(contentsOf: chunk.prefix(remaining))
-                        }
-                    }
-                } else if count == 0 {
-                    break
-                } else if errno != EINTR {
-                    break
-                }
+            process.waitUntilExit()
+            let exitCode = process.terminationStatus
+            try? stdoutReadHandle.close()
+            try? stderrReadHandle.close()
+
+            let wasCancelled: Bool = self?.lock.withLock {
+                let removed = self?.activeRuns.removeValue(forKey: runID)
+                return removed?.wasCancelled ?? false
+            } ?? false
+
+            if exitCode != 0, !wasCancelled, !parser.hasEmittedError {
+                let rawErr = String(decoding: stderrCollected, as: UTF8.self)
+                let message = AgentStreamLineParser.cleanErrorMessage(rawErr)
+                    ?? "\(provider.rawValue) exited with status \(exitCode)."
+                onEvent(.error(message))
             }
-            ioGroup.leave()
+            onEvent(.finished(exitCode: exitCode))
         }
 
         return .success(runID)

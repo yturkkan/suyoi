@@ -114,7 +114,7 @@ struct SessionFileEvidence: Equatable, Sendable {
             guard ProcessInfo.processInfo.systemUptime < deadline else { return nil }
             var details = vnode_fdinfowithpath()
             let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
-            guard proc_pidfdinfo(pid, descriptor.proc_fd, PROC_PIDFDVNODEPATHINFO, &details, size) == size else { return nil }
+            guard proc_pidfdinfo(pid, descriptor.proc_fd, PROC_PIDFDVNODEPATHINFO, &details, size) == size else { continue }
             guard details.pfi.fi_openflags & UInt32(FWRITE) != 0 else { continue }
             let path = withUnsafeBytes(of: &details.pvip.vip_path) { bytes in
                 String(bytes: bytes.prefix(while: { $0 != 0 }), encoding: .utf8)
