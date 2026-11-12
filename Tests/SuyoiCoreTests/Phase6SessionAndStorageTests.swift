@@ -246,6 +246,50 @@ struct Phase6SessionAndStorageTests {
         #expect(call.workingDirectory == projectDir.path)
     }
 
+    @Test("steerIndexedSession never starts a parallel CLI resume while a live process still owns the session")
+    func refusesNativeResumeWhileSessionIsLive() throws {
+        let home = try makeTempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let projectDir = home.appendingPathComponent("Developer/payment-api", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+
+        let liveProcess = ObservedProcess(pid: 4_242, parentPID: 1, uid: Int(getuid()), cpuPercent: 0, residentBytes: 0,
+                                          executable: "/tools/claude", startTimeMicroseconds: 1_000, cwd: projectDir.path)
+        let observation = AgentObservation(id: liveProcess.pid, agentName: "Claude Code", process: liveProcess, project: nil,
+                                           terminalApp: nil, statusSource: .processOnly, childServerPorts: [],
+                                           sessionID: "11111111-2222-4333-8444-555555555555")
+        let launcher = RecordingJobLauncher()
+        let steerer = AgentSteerer(
+            processLookup: { pid, _ in pid == 4_242 ? liveProcess : nil },
+            executableResolver: { _ in "/tools/claude" },
+            homeDirectory: home,
+            nativeJobLauncher: launcher
+        )
+        let liveSession = IndexedAgentSession(
+            id: "claude:11111111-2222-4333-8444-555555555555",
+            provider: .claude,
+            agentName: "Claude Code",
+            sessionID: "11111111-2222-4333-8444-555555555555",
+            title: "Live session",
+            projectPath: projectDir.path,
+            projectName: "payment-api",
+            gitBranch: nil,
+            isLive: true,
+            liveObservation: observation,
+            canResumeNatively: true,
+            nativeSteerMode: .claudeResume
+        )
+
+        let outcome = steerer.steerIndexedSession(
+            session: liveSession,
+            prompt: "Continue",
+            preferLiveTerminal: false,
+            uid: Int(getuid())
+        )
+        #expect(!outcome.succeeded)
+        #expect(launcher.calls.isEmpty)
+    }
+
     // MARK: - DeepStorageIndexer & Safe Trash + Put Back Recovery Tests
 
     @Test("DeepStorageIndexer discovers deep monorepo artifacts, Xcode DerivedData & AI caches and marks dirty-repo node_modules Ready")

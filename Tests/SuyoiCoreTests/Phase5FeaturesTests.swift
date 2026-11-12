@@ -309,6 +309,11 @@ struct Phase5FeaturesTests {
         #expect(!AgentApprovalController.isSafeReadOnlyTool(toolName: "Bash", command: "git status; rm -rf /tmp/x"))
         #expect(!AgentApprovalController.isSafeReadOnlyTool(toolName: "Bash", command: "git checkout -f"))
         #expect(!AgentApprovalController.isSafeReadOnlyTool(toolName: "Bash", command: "npm test"))
+        #expect(!AgentApprovalController.isSafeReadOnlyTool(toolName: "Bash", command: "git status\nrm -rf /tmp/x"))
+        #expect(!AgentApprovalController.isSafeReadOnlyTool(toolName: "Bash", command: "git status\trm"))
+        #expect(!AgentApprovalController.isSafeReadOnlyTool(toolName: "Bash", command: "git status\u{00A0}--short"))
+        #expect(!AgentApprovalController.isSafeReadOnlyTool(toolName: "Bash", command: "git log '--output=/tmp/x'"))
+        #expect(!AgentApprovalController.isSafeReadOnlyTool(toolName: "Bash", command: "git diff --no-index /etc/passwd /dev/null"))
 
         let tempProject = FileManager.default.temporaryDirectory.appendingPathComponent("suyoi-ro-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempProject, withIntermediateDirectories: true)

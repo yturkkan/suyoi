@@ -585,7 +585,7 @@ struct AgentsConsoleView: View {
 
     @ViewBuilder
     private func deliveryModeControl(for session: IndexedAgentSession) -> some View {
-        if session.canSteerInLiveTerminal && session.canResumeNatively {
+        if session.canSteerInLiveTerminal && session.canResumeNatively && session.liveObservation == nil {
             HStack(spacing: 3) {
                 Button {
                     model.preferLiveTerminalSteer = true

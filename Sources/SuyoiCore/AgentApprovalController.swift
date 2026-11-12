@@ -102,6 +102,10 @@ public final class AgentApprovalController: @unchecked Sendable {
         let responder: Responder?
         let scope: ApprovalScope?
         let isScopeCurrent: @Sendable () -> Bool
+        /// Verbatim command for read-only evaluation.
+        var autoApprovalCommand: String? = nil
+        /// False when the bridge only forwarded a lossy display summary of the command.
+        var commandIsVerbatim: Bool = true
 
         var currentScope: ApprovalScope? {
             guard let scope, isScopeCurrent() else { return nil }
@@ -134,6 +138,7 @@ public final class AgentApprovalController: @unchecked Sendable {
 
     private struct Input: Decodable {
         var command: String?
+        var command_sanitized: Bool?
         var file_path: String?
         var question: String?
         var options: [Option]?
@@ -165,7 +170,8 @@ public final class AgentApprovalController: @unchecked Sendable {
     ]
 
     private static let forbiddenShellScalars: Set<Unicode.Scalar> = [
-        ";", "|", "&", "`", "$", ">", "<", "(", ")", "\n", "\r", "\\"
+        ";", "|", "&", "`", "$", ">", "<", "(", ")", "\n", "\r", "\\",
+        "'", "\"", "*", "?", "[", "]", "{", "}", "~", "#", "!", "\t"
     ]
 
     private static let forbiddenGitFlags: Set<String> = [
@@ -202,8 +208,8 @@ public final class AgentApprovalController: @unchecked Sendable {
                 guard !entry.isQuestion, let scope = entry.currentScope else { return false }
                 let matchesProject = sanitized.applyToAllVerifiedProjects
                     || sanitized.allowedProjectPaths.contains(scope.projectPath)
-                guard matchesProject,
-                      Self.isSafeReadOnlyTool(toolName: entry.request.toolName, command: entry.request.toolName.caseInsensitiveCompare("Bash") == .orderedSame ? entry.request.summary : nil) else {
+                guard matchesProject, entry.commandIsVerbatim,
+                      Self.isSafeReadOnlyTool(toolName: entry.request.toolName, command: entry.autoApprovalCommand) else {
                     return false
                 }
                 recordAutoApprovalLocked(request: entry.request, projectPath: scope.projectPath, now: Date())
@@ -227,20 +233,25 @@ public final class AgentApprovalController: @unchecked Sendable {
         guard lowerTool == "bash", let rawCommand = command else {
             return false
         }
-        let trimmed = rawCommand.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, trimmed.utf8.count <= 512 else { return false }
-        for scalar in trimmed.unicodeScalars {
+        guard !rawCommand.isEmpty, rawCommand.utf8.count <= 512 else { return false }
+        for scalar in rawCommand.unicodeScalars {
+            // Evaluate exactly what the shell will run: any whitespace other than a plain
+            // ASCII space (tabs, newlines, NBSP, …) could split commands or hide tokens.
+            if scalar != " ", CharacterSet.whitespacesAndNewlines.contains(scalar) { return false }
             if forbiddenShellScalars.contains(scalar) || unsafeScalar(scalar) {
                 return false
             }
         }
-        let tokens = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+        let tokens = rawCommand.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard tokens.count >= 2, tokens[0] == "git" else { return false }
         for token in tokens.dropFirst() {
             if forbiddenGitFlags.contains(token)
                 || token.hasPrefix("-c")
-                || token.hasPrefix("--output=")
-                || token.hasPrefix("--exec=") {
+                || token.hasPrefix("--output")
+                || token.hasPrefix("--exec")
+                || token.hasPrefix("--ext-diff")
+                || token.hasPrefix("--textconv")
+                || token.hasPrefix("--no-index") {
                 return false
             }
         }
@@ -422,13 +433,14 @@ public final class AgentApprovalController: @unchecked Sendable {
             summary: summary, questionOptions: labels, requestedAt: now
         )
         let rawCommand = input?.command
+        let commandIsVerbatim = input?.command_sanitized != true
         let immediate: Reply? = lock.withLock {
             if let scope {
                 guard isScopeCurrent() else { return Reply(decision: "block", reason: "Hook session ended") }
                 if !isQuestion && grants.contains(where: { $0.currentScope == scope }) {
                     return Reply(decision: "approve")
                 }
-                if !isQuestion, policy.autoApproveReadOnlyTools {
+                if !isQuestion, commandIsVerbatim, policy.autoApproveReadOnlyTools {
                     let projectAllowed = policy.applyToAllVerifiedProjects
                         || policy.allowedProjectPaths.contains(scope.projectPath)
                     if projectAllowed && Self.isSafeReadOnlyTool(toolName: toolName, command: rawCommand) {
@@ -441,7 +453,8 @@ public final class AgentApprovalController: @unchecked Sendable {
                 return Reply(decision: "block", reason: "Approval queue is full")
             }
             entries.append(Entry(request: request, isQuestion: isQuestion, responder: responder,
-                                 scope: scope, isScopeCurrent: isScopeCurrent))
+                                 scope: scope, isScopeCurrent: isScopeCurrent,
+                                 autoApprovalCommand: rawCommand, commandIsVerbatim: commandIsVerbatim))
             return nil
         }
         if let immediate {

@@ -105,7 +105,10 @@ struct HookBridgeServiceTests {
         let task = Task.detached { fixture.client.forwardEventAndWait(input, timeout: 5, pollInterval: 0.005) }
         let request = try await fixture.waitForRequest()
         let fields = try reducedFields(at: request)
-        #expect((fields["tool_input"] as? [String: String]) == ["command": "curl -H '[REDACTED]'"])
+        let reducedInput = try #require(fields["tool_input"] as? [String: Any])
+        #expect(reducedInput["command"] as? String == "curl -H '[REDACTED]'")
+        #expect(reducedInput["command_sanitized"] as? Bool == true)
+        #expect(reducedInput.count == 2)
         #expect(fields["tool_response"] == nil && fields["prompt"] == nil)
         let controller = AgentApprovalController()
         #expect(fixture.client.drainInbox(into: controller) == 1)
@@ -212,6 +215,41 @@ struct HookBridgeServiceTests {
         #expect(controller.canAutoApprove(request: newRequest))
         #expect(controller.submitDecision(.deny(reason: "No"), forRequestID: newRequest.id))
         #expect(decision(await newSession.value) == "deny")
+    }
+
+    @Test func multilineCommandIsNeverReadOnlyAutoApprovedThroughBridge() async throws {
+        let owner = ObservedProcess(pid: 123_457, parentPID: 12, uid: Int(getuid()), cpuPercent: 0, residentBytes: 0,
+                                    executable: "/tools/claude", startTimeMicroseconds: 2_000, cwd: project)
+        let fixture = try HookBridgeFixture(owner: owner)
+        defer { fixture.cleanUp() }
+        let controller = AgentApprovalController()
+        controller.setScopedPolicy(ScopedApprovalPolicy(
+            autoApproveReadOnlyTools: true, applyToAllVerifiedProjects: true, allowedProjectPaths: []
+        ))
+        #expect(fixture.client.forwardEventAndWait(try payload("SessionStart")).isEmpty)
+
+        // Plain read-only command: auto-approved without reaching the queue.
+        let plain = try payload("PreToolUse", extra: ["tool_input": ["command": "git status --short"]])
+        let plainTask = Task.detached { fixture.client.forwardEventAndWait(plain, timeout: 5, pollInterval: 0.005) }
+        _ = try await fixture.waitForRequest()
+        #expect(fixture.client.drainInbox(into: controller) == 0)
+        #expect(decision(await plainTask.value) == "allow")
+
+        // Same prefix with a hidden second line must be queued for the user.
+        for hidden in ["git status\nrm -rf /tmp/suyoi-x", "git status\trm", "git log '--output=/tmp/x'"] {
+            let forged = try payload("PreToolUse", extra: ["tool_input": ["command": hidden]])
+            let task = Task.detached { fixture.client.forwardEventAndWait(forged, timeout: 5, pollInterval: 0.005) }
+            _ = try await fixture.waitForRequest()
+            #expect(fixture.client.drainInbox(into: controller) == 1)
+            let pending = try #require(controller.pendingRequests().first)
+            // Re-applying the policy must not approve it via the display summary either.
+            controller.setScopedPolicy(ScopedApprovalPolicy(
+                autoApproveReadOnlyTools: true, applyToAllVerifiedProjects: true, allowedProjectPaths: []
+            ))
+            #expect(controller.pendingRequests().count == 1)
+            #expect(controller.submitDecision(.deny(reason: nil), forRequestID: pending.id))
+            #expect(decision(await task.value) == "deny")
+        }
     }
 
     @Test func structuredQuestionAnswerUsesOriginalProviderInputWithoutSpoolingIt() async throws {

@@ -611,6 +611,13 @@ public struct AgentSteerer: AgentSteering, Sendable {
         }
 
         let agentID = session.liveObservation?.id ?? 0
+        if let obs = session.liveObservation,
+           let pid = Int32(exactly: obs.process.pid), pid > 1,
+           let current = processLookup(pid, uid), current.identity == obs.process.identity, !current.isStopped {
+            // The session is still owned by a running process. Never start a second writer
+            // via unvalidated CLI resume; only the validated live paths may deliver.
+            return steer(agent: obs, prompt: prompt, uid: uid)
+        }
         guard let mode = session.nativeSteerMode, session.canResumeNatively else {
             if let obs = session.liveObservation {
                 return steer(agent: obs, prompt: prompt, uid: uid)

@@ -291,7 +291,14 @@ public struct HookBridgeClient: Sendable {
         }
         let candidate = (input["command"] as? String) ?? (input["file_path"] as? String)
         let summary = candidate.flatMap { display($0, limit: 1_024) }
-        return ReducedInput(fields: summary.map { ["command": $0] } ?? [:],
+        var fields: [String: Any] = summary.map { ["command": $0] } ?? [:]
+        // The summary is display-only (whitespace collapsed, secrets redacted, truncated).
+        // If it differs from what the agent will actually execute, the controller must not
+        // treat it as the verbatim command for read-only auto-approval.
+        if let candidate, summary != candidate {
+            fields["command_sanitized"] = true
+        }
+        return ReducedInput(fields: fields,
                             originalQuestion: nil, labels: [], originalLabels: [])
     }
 
