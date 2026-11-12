@@ -114,7 +114,7 @@ enum DashboardFixture {
             isWaitingForInput: true,
             firstApprovalID: "question-1",
             firstApprovalToolName: "Claude Code · AskUserQuestion",
-            firstApprovalSummary: "Which verification target should run before packaging Suyoi Next?",
+            firstApprovalSummary: "Which verification target should run before packaging Suyoi?",
             firstApprovalIsQuestion: true,
             firstApprovalOptions: ["SuyoiCoreTests", "Full Suite + App", "Skip Tests", "Lint Only"],
             canInlineSteerPrimary: true,
@@ -700,7 +700,7 @@ enum DashboardFixture {
                     )
                 ]
                 claudeHookStatus = .installed(
-                    command: "\"/Applications/Suyoi Next.app/Contents/MacOS/Suyoi\" --hook-bridge",
+                    command: "\"/Applications/Suyoi.app/Contents/MacOS/Suyoi\" --hook-bridge",
                     includesPreToolUse: true
                 )
                 includePreToolUseHook = true

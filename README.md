@@ -19,8 +19,6 @@
   <sub>macOS 14+ &nbsp; · &nbsp; Swift + SwiftUI + AppKit &nbsp; · &nbsp; No external package dependencies &nbsp; · &nbsp; <a href="LICENSE">MIT licensed</a></sub>
 </p>
 
-> **Suyoi Next (Parallel Build Channel):** This repository builds **`Suyoi Next.app`** (`local.suyoi.next`) via `./scripts/build-app.sh --parallel` and publishes **[Suyoi-Next.app.zip](https://github.com/yturkkan/suyoi/releases?q=next&expanded=true)** as **pre-releases of this repository** so you can run and test enhanced chat steering (`tmux` live delivery, Claude Code native session continuation, hardened child environments, smart foreground descendant checks) **side-by-side** without overwriting an installed `Suyoi.app`.
-
 ## Less hunting. More building.
 
 When agents, terminals, and localhost tabs pile up, Suyoi keeps the useful context within reach.
@@ -31,7 +29,7 @@ When agents, terminals, and localhost tabs pile up, Suyoi keeps the useful conte
 
 ### Follow your agents
 
-See recognized coding agents, their projects, and available activity. Jump back to a verified terminal, tmux pane, or IDE target.
+See recognized coding agents, their projects, and available activity. Chat directly in the Unified Agent Hub or jump back to a verified terminal, tmux pane, or IDE target.
 
 </td>
 <td width="50%" valign="top">
@@ -76,7 +74,7 @@ Inspect build folders, caches, merged worktrees, and old session logs. Eligible 
 <details>
 <summary>About these captures</summary>
 
-The video, GIF, and screenshots were captured from Suyoi 0.3.6's native macOS views in an isolated sample-data preview. They show dashboard views and themes, not the Notch or Floating Companion surfaces. No live agent actions, quota requests, or cleanup are performed. The cover is brand artwork, not an application screenshot.
+The video, GIF, and screenshots were captured from Suyoi's native macOS views in an isolated sample-data preview. They show dashboard views and themes, not the Notch or Floating Companion surfaces. No live agent actions, quota requests, or cleanup are performed. The cover is brand artwork, not an application screenshot.
 
 Explore full-resolution captures: [Agents](docs/media/suyoi-overview.jpg) · [Servers](docs/media/suyoi-servers.jpg) · [Quotas](docs/media/suyoi-quotas.jpg) · [Storage](docs/media/suyoi-storage.jpg).
 
@@ -84,20 +82,26 @@ Explore full-resolution captures: [Agents](docs/media/suyoi-overview.jpg) · [Se
 
 ## Get started
 
+**One-line install (verifies SHA-256 & signature, installs to `/Applications/Suyoi.app` without Gatekeeper quarantine prompts):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yturkkan/suyoi/main/scripts/install.sh | bash
+```
+
+Or install manually:
+
 1. **[Download Suyoi.app.zip](https://github.com/yturkkan/suyoi/releases/latest)**, extract it, and move Suyoi to Applications.
 2. **Open Suyoi** while a supported coding agent or dev server is running.
 3. **Pick your view:** Menu Bar Popover, Notch Dynamic Island, or Floating Companion.
 
-**macOS 14+ required.** The app is ad-hoc signed, not Developer ID signed or notarized. Review macOS security prompts before opening it. The signature checks bundle integrity; publisher trust depends on the GitHub release source.
+**macOS 14+ required.** The app is ad-hoc signed, not Developer ID signed or notarized. Review macOS security prompts before opening manual browser downloads. The signature checks bundle integrity; publisher trust depends on the GitHub release source.
 
 **Live quota checks are on by default.** You can turn them off in Quotas or Settings.
 
 <details>
 <summary><strong>Updating an installed copy</strong></summary>
 
-To update an installed copy, open **Settings → About Suyoi**, check for updates, and choose **Update & Relaunch**. Suyoi downloads the archive from GitHub Releases and verifies the bundle identifier, release version, code signature, and checksum when supplied. The helper waits for the running app to exit before replacing the bundle.
-
-The repository also includes [the app bundle](build/Suyoi.app) and [a ZIP archive](build/Suyoi.app.zip).
+To update an installed copy, open **Settings → About Suyoi**, check for updates, and choose **Update & Relaunch**. Suyoi downloads the archive from GitHub Releases and verifies the bundle identifier, release version, code signature, and SHA-256 checksum before replacing the bundle without Gatekeeper prompts.
 
 </details>
 

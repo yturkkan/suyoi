@@ -3372,7 +3372,7 @@ final class DashboardModel: ObservableObject {
     }
 
     var currentAppVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.6"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.6.0"
     }
 
     func checkForUpdates() {

@@ -1,4 +1,4 @@
-name: macOS CI & Parallel App Package
+name: macOS CI & App Package
 
 on:
   push:
@@ -11,11 +11,11 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Optional existing CI run ID whose verified Suyoi-Next-macOS artifact should be attached to release_tag"
+        description: "Optional existing CI run ID whose verified Suyoi-macOS artifact should be attached to release_tag"
         required: false
         default: ""
       release_tag:
-        description: "Optional release tag (e.g. v0.4.0-next.1) to upload verified Suyoi-Next.app.zip assets to"
+        description: "Optional release tag (e.g. v0.6.0) to upload verified Suyoi.app.zip assets to"
         required: false
         default: ""
       export_screenshots:
@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   macos-build-and-test:
-    name: Build, Test & Package Suyoi Next (macOS 15)
+    name: Build, Test & Package Suyoi (macOS 15)
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.run_id == '' && inputs.export_screenshots != 'true') }}
     runs-on: macos-15
     timeout-minutes: 20
@@ -65,34 +65,66 @@ jobs:
           "$DEBUG_BIN_DIR/Suyoi" --export-screenshots build/screenshots
           ls -lh build/screenshots/*.png
 
-      - name: Build parallel side-by-side Suyoi Next.app
+      - name: Build Suyoi.app
         run: |
-          # Tag builds embed the tag's version so the in-app updater compares correctly.
           case "${GITHUB_REF}" in
             refs/tags/v*)
               export SUYOI_VERSION="${GITHUB_REF_NAME#v}"
               export SUYOI_BUILD_VERSION="${SUYOI_VERSION%%-*}"
               ;;
           esac
-          ./scripts/build-app.sh --parallel
-
-      - name: Verify Suyoi Next bundle, signature, version, CLI & archive checksum
-        run: |
-          test -d "build/Suyoi Next.app"
-          PLIST="build/Suyoi Next.app/Contents/Info.plist"
-          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST")"
-          test "$BUNDLE_ID" = "local.suyoi.next"
           case "${GITHUB_REF}" in
-            refs/tags/v*)
-              SHORT="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")"
-              test "$SHORT" = "${GITHUB_REF_NAME#v}"
+            refs/tags/v*-next*)
+              ./scripts/build-app.sh --parallel
+              ;;
+            *)
+              ./scripts/build-app.sh
               ;;
           esac
-          /usr/bin/codesign --verify --deep --strict "build/Suyoi Next.app"
-          "build/Suyoi Next.app/Contents/MacOS/Suyoi" --help
-          (cd build && /usr/bin/shasum -a 256 -c Suyoi-Next.app.zip.sha256)
+
+      - name: Verify Suyoi bundle, signature, version, CLI & archive checksum
+        run: |
+          case "${GITHUB_REF}" in
+            refs/tags/v*-next*)
+              APP_PATH="build/Suyoi Next.app"
+              EXPECTED_BUNDLE_ID="local.suyoi.next"
+              SHA_FILE="Suyoi-Next.app.zip.sha256"
+              ;;
+            *)
+              APP_PATH="build/Suyoi.app"
+              EXPECTED_BUNDLE_ID="local.suyoi.app"
+              SHA_FILE="Suyoi.app.zip.sha256"
+              ;;
+          esac
+          test -d "$APP_PATH"
+          PLIST="${APP_PATH}/Contents/Info.plist"
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST")"
+          test "$BUNDLE_ID" = "$EXPECTED_BUNDLE_ID"
+          SHORT="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")"
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              test "$SHORT" = "${GITHUB_REF_NAME#v}"
+              ;;
+            *)
+              test "$SHORT" = "0.6.0"
+              ;;
+          esac
+          /usr/bin/codesign --verify --deep --strict "$APP_PATH"
+          "${APP_PATH}/Contents/MacOS/Suyoi" --help
+          (cd build && /usr/bin/shasum -a 256 -c "$SHA_FILE")
+
+      - name: Upload Suyoi.app.zip artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') || !contains(github.ref, '-next') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Suyoi-macOS
+          if-no-files-found: error
+          path: |
+            build/Suyoi.app.zip
+            build/Suyoi.app.zip.sha256
 
       - name: Upload Suyoi-Next.app.zip artifact
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-next') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Suyoi-Next-macOS
@@ -101,15 +133,15 @@ jobs:
             build/Suyoi-Next.app.zip
             build/Suyoi-Next.app.zip.sha256
 
-      - name: Upload Suyoi-Next-Screenshots artifact
+      - name: Upload Suyoi-Screenshots artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: Suyoi-Next-Screenshots
+          name: Suyoi-Screenshots
           if-no-files-found: error
           path: build/screenshots/*.png
 
-  publish-next-prerelease:
-    name: Publish Suyoi Next Pre-release (tag)
+  publish-release:
+    name: Publish Suyoi Release (tag)
     needs: macos-build-and-test
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
@@ -117,33 +149,49 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Refuse non-Next tags
-        run: |
-          case "${GITHUB_REF_NAME}" in
-            v*-next*) ;;
-            *) echo "::error::Only vX.Y.Z-next.N tags may be published from this workflow"; exit 1 ;;
-          esac
+      - name: Download verified stable artifact
+        if: ${{ !contains(github.ref_name, '-next') }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: Suyoi-macOS
+          path: dist
 
-      - name: Download verified artifact
+      - name: Download verified pre-release artifact
+        if: ${{ contains(github.ref_name, '-next') }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: Suyoi-Next-macOS
           path: dist
 
-      - name: Create or update pre-release (never marked latest)
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          (cd dist && sha256sum -c Suyoi-Next.app.zip.sha256)
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            test "$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq .isPrerelease)" = "true"
-            gh release upload "${GITHUB_REF_NAME}" dist/Suyoi-Next.app.zip dist/Suyoi-Next.app.zip.sha256 --clobber
-          else
-            gh release create "${GITHUB_REF_NAME}" dist/Suyoi-Next.app.zip dist/Suyoi-Next.app.zip.sha256 \
-              --verify-tag --prerelease --latest=false \
-              --title "Suyoi Next ${GITHUB_REF_NAME}" --generate-notes
-          fi
+          case "${GITHUB_REF_NAME}" in
+            v*-next*)
+              (cd dist && sha256sum -c Suyoi-Next.app.zip.sha256)
+              if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+                test "$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq .isPrerelease)" = "true"
+                gh release upload "${GITHUB_REF_NAME}" dist/Suyoi-Next.app.zip dist/Suyoi-Next.app.zip.sha256 --clobber
+              else
+                gh release create "${GITHUB_REF_NAME}" dist/Suyoi-Next.app.zip dist/Suyoi-Next.app.zip.sha256 \
+                  --verify-tag --prerelease --latest=false \
+                  --title "Suyoi Next ${GITHUB_REF_NAME}" --generate-notes
+              fi
+              ;;
+            v*)
+              (cd dist && sha256sum -c Suyoi.app.zip.sha256)
+              if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+                gh release upload "${GITHUB_REF_NAME}" dist/Suyoi.app.zip dist/Suyoi.app.zip.sha256 --clobber
+                gh release edit "${GITHUB_REF_NAME}" --prerelease=false --latest
+              else
+                gh release create "${GITHUB_REF_NAME}" dist/Suyoi.app.zip dist/Suyoi.app.zip.sha256 \
+                  --verify-tag --latest \
+                  --title "Suyoi ${GITHUB_REF_NAME}" --generate-notes
+              fi
+              ;;
+          esac
 
   attach-release-assets:
     name: Attach Verified Artifact to Release
@@ -162,24 +210,34 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           case "$RUN_ID" in ''|*[!0-9]*) echo "::error::run_id must be numeric"; exit 1 ;; esac
-          case "$RELEASE_TAG" in
-            v*-next*) ;;
-            *) echo "::error::Only -next pre-release tags may receive Suyoi Next assets"; exit 1 ;;
-          esac
           RUN_JSON="$(gh run view "$RUN_ID" --json conclusion,event,headBranch,workflowName)"
           test "$(jq -r .conclusion <<<"$RUN_JSON")" = "success"
           test "$(jq -r .workflowName <<<"$RUN_JSON")" = "${GITHUB_WORKFLOW}"
           test "$(jq -r .event <<<"$RUN_JSON")" = "push"
           HEAD_BRANCH="$(jq -r .headBranch <<<"$RUN_JSON")"
-          case "$HEAD_BRANCH" in
-            next|v*-next*) ;;
-            *) echo "::error::Source run must come from the next branch or a -next tag (got $HEAD_BRANCH)"; exit 1 ;;
-          esac
-          test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease)" = "true"
           mkdir -p dist
-          gh run download "$RUN_ID" -n Suyoi-Next-macOS --dir dist
-          (cd dist && sha256sum -c Suyoi-Next.app.zip.sha256)
-          gh release upload "$RELEASE_TAG" dist/Suyoi-Next.app.zip dist/Suyoi-Next.app.zip.sha256 --clobber
+          case "$RELEASE_TAG" in
+            v*-next*)
+              test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease)" = "true"
+              gh run download "$RUN_ID" -n Suyoi-Next-macOS --dir dist
+              (cd dist && sha256sum -c Suyoi-Next.app.zip.sha256)
+              gh release upload "$RELEASE_TAG" dist/Suyoi-Next.app.zip dist/Suyoi-Next.app.zip.sha256 --clobber
+              ;;
+            v*)
+              case "$HEAD_BRANCH" in
+                main|v*) ;;
+                *) echo "::error::Stable release assets must come from main or a stable tag run (got $HEAD_BRANCH)"; exit 1 ;;
+              esac
+              test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease)" = "false"
+              gh run download "$RUN_ID" -n Suyoi-macOS --dir dist
+              (cd dist && sha256sum -c Suyoi.app.zip.sha256)
+              gh release upload "$RELEASE_TAG" dist/Suyoi.app.zip dist/Suyoi.app.zip.sha256 --clobber
+              ;;
+            *)
+              echo "::error::release_tag must start with v"
+              exit 1
+              ;;
+          esac
 
   render-screenshots:
     name: Render Retina UI Screenshots (macOS 15)
@@ -215,7 +273,7 @@ jobs:
       - name: Upload screenshots artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: Suyoi-Next-Screenshots
+          name: Suyoi-Screenshots
           if-no-files-found: error
           path: docs/screenshots/*.png
 
@@ -225,7 +283,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/screenshots/*.png
           if ! git diff --cached --quiet; then
-            git commit -m "docs(screenshots): add 2x Retina macOS 15 screenshots for Suyoi Next [skip ci]"
+            git commit -m "docs(screenshots): add 2x Retina macOS 15 screenshots for Suyoi [skip ci]"
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
