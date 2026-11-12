@@ -101,16 +101,25 @@ public struct AppUpdater: AppUpdating, Sendable {
     public static let allowedDownloadURLPrefix = "https://github.com/yturkkan/suyoi/releases/download/"
     public static let expectedAssetName = "Suyoi.app.zip"
     public static let expectedChecksumAssetName = "Suyoi.app.zip.sha256"
-    public static let nextLatestReleaseEndpoint = URL(string: "https://api.github.com/repos/yturkkan/suyoi-next/releases/latest")!
-    public static let nextAllowedReleaseURLPrefix = "https://github.com/yturkkan/suyoi-next/releases/"
-    public static let nextAllowedDownloadURLPrefix = "https://github.com/yturkkan/suyoi-next/releases/download/"
+    /// Next builds are published as pre-releases of the same repository; `/releases/latest`
+    /// never returns pre-releases, so the Next channel lists releases and picks the highest
+    /// `-next` pre-release itself.
+    public static let nextReleasesListEndpoint = URL(string: "https://api.github.com/repos/yturkkan/suyoi/releases?per_page=30")!
+    public static let nextAllowedReleaseURLPrefix = "https://github.com/yturkkan/suyoi/releases/"
+    public static let nextAllowedDownloadURLPrefix = "https://github.com/yturkkan/suyoi/releases/download/"
     public static let nextExpectedAssetName = "Suyoi-Next.app.zip"
     public static let nextExpectedChecksumAssetName = "Suyoi-Next.app.zip.sha256"
-    public static let allowedBundleIdentifiers: Set<String> = ["local.suyoi.app", "io.suyoi.app", "local.suyoi.next"]
+    public static let nextTagMarker = "-next"
+    public static let stableBundleIdentifiers: Set<String> = ["local.suyoi.app", "io.suyoi.app"]
+    public static let nextBundleIdentifiers: Set<String> = ["local.suyoi.next"]
     public static let maxAssetBytes: Int64 = 100 * 1024 * 1024
 
+    static func allowedBundleIdentifiers(parallelNext: Bool) -> Set<String> {
+        parallelNext ? nextBundleIdentifiers : stableBundleIdentifiers
+    }
+
     private static var activeReleaseEndpoint: URL {
-        SuyoiAppIdentity.isParallelNextBuild ? nextLatestReleaseEndpoint : latestReleaseEndpoint
+        SuyoiAppIdentity.isParallelNextBuild ? nextReleasesListEndpoint : latestReleaseEndpoint
     }
     private static var activeReleaseURLPrefix: String {
         SuyoiAppIdentity.isParallelNextBuild ? nextAllowedReleaseURLPrefix : allowedReleaseURLPrefix
@@ -159,7 +168,7 @@ public struct AppUpdater: AppUpdating, Sendable {
         if http.statusCode == 403 || http.statusCode == 429 {
             throw AppUpdaterError.rateLimited
         }
-        guard (200..<300).contains(http.statusCode), data.count <= 512 * 1024 else {
+        guard (200..<300).contains(http.statusCode), data.count <= 2 * 1024 * 1024 else {
             throw AppUpdaterError.invalidResponse
         }
 
@@ -245,7 +254,7 @@ public struct AppUpdater: AppUpdating, Sendable {
             }
 
             let extractedAppURL = extractDir.appendingPathComponent(Self.activeExtractedAppName, isDirectory: true)
-            try Self.verifyExtractedBundle(at: extractedAppURL, expectedVersion: release.version)
+            try Self.verifyExtractedBundle(at: extractedAppURL, expectedVersion: release.version, parallelNext: isNext)
 
             return StagedAppUpdate(
                 release: release,
@@ -338,22 +347,53 @@ public struct AppUpdater: AppUpdating, Sendable {
         let assetName = parallelNext ? nextExpectedAssetName : expectedAssetName
         let checksumAssetName = parallelNext ? nextExpectedChecksumAssetName : expectedChecksumAssetName
 
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rawTag = root["tag_name"] as? String,
+        guard let json = try? JSONSerialization.jsonObject(with: data) else {
+            throw AppUpdaterError.invalidResponse
+        }
+        let current = SemanticVersion(currentVersion)
+        let currentDisplay = current?.description ?? normalizeVersion(currentVersion)
+
+        let root: [String: Any]
+        if parallelNext {
+            let candidates: [[String: Any]]
+            if let list = json as? [[String: Any]] {
+                candidates = list
+            } else if let single = json as? [String: Any] {
+                candidates = [single]
+            } else {
+                throw AppUpdaterError.invalidResponse
+            }
+            // Only published Next pre-releases are eligible; drafts and stable tags are ignored.
+            let eligible = candidates.compactMap { release -> (SemanticVersion, [String: Any])? in
+                guard release["draft"] as? Bool != true,
+                      release["prerelease"] as? Bool ?? true,
+                      let tag = release["tag_name"] as? String, tag.contains(nextTagMarker),
+                      let version = SemanticVersion(tag) else { return nil }
+                return (version, release)
+            }
+            guard let best = eligible.max(by: { $0.0 < $1.0 }) else {
+                return .upToDate(currentVersion: currentDisplay)
+            }
+            root = best.1
+        } else {
+            guard let single = json as? [String: Any] else { throw AppUpdaterError.invalidResponse }
+            root = single
+        }
+
+        guard let rawTag = root["tag_name"] as? String,
               let rawReleaseURL = root["html_url"] as? String,
               rawReleaseURL.hasPrefix(releasePrefix),
               let releaseURL = URL(string: rawReleaseURL) else {
             throw AppUpdaterError.invalidResponse
         }
 
-        let normalizedRemote = normalizeVersion(rawTag)
-        let normalizedCurrent = normalizeVersion(currentVersion)
-        guard !normalizedRemote.isEmpty else {
+        guard let remote = SemanticVersion(rawTag) else {
             throw AppUpdaterError.invalidResponse
         }
+        let normalizedRemote = remote.description
 
-        guard isRemoteVersionNewer(normalizedRemote, than: normalizedCurrent) else {
-            return .upToDate(currentVersion: normalizedCurrent)
+        guard let current, remote > current else {
+            return .upToDate(currentVersion: currentDisplay)
         }
 
         guard let assets = root["assets"] as? [[String: Any]] else {
@@ -415,20 +455,10 @@ public struct AppUpdater: AppUpdating, Sendable {
     }
 
     public static func isRemoteVersionNewer(_ remote: String, than current: String) -> Bool {
-        let remoteParts = normalizeVersion(remote).split(separator: ".").compactMap { Int($0) }
-        let currentParts = normalizeVersion(current).split(separator: ".").compactMap { Int($0) }
-        guard !remoteParts.isEmpty, !currentParts.isEmpty else {
+        guard let remoteVersion = SemanticVersion(remote), let currentVersion = SemanticVersion(current) else {
             return false
         }
-        let count = max(remoteParts.count, currentParts.count)
-        for index in 0..<count {
-            let r = index < remoteParts.count ? remoteParts[index] : 0
-            let c = index < currentParts.count ? currentParts[index] : 0
-            if r != c {
-                return r > c
-            }
-        }
-        return false
+        return remoteVersion > currentVersion
     }
 
     // MARK: - Verification Helpers
@@ -493,7 +523,7 @@ public struct AppUpdater: AppUpdating, Sendable {
         }
     }
 
-    private static func verifyExtractedBundle(at appURL: URL, expectedVersion: String) throws {
+    private static func verifyExtractedBundle(at appURL: URL, expectedVersion: String, parallelNext: Bool) throws {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: appURL.path, isDirectory: &isDir), isDir.boolValue else {
             throw AppUpdaterError.bundleVerificationFailed("missing Suyoi.app")
@@ -503,14 +533,14 @@ public struct AppUpdater: AppUpdating, Sendable {
         guard let plistData = try? Data(contentsOf: plistURL),
               let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
               let bundleID = plist["CFBundleIdentifier"] as? String,
-              allowedBundleIdentifiers.contains(bundleID) else {
+              allowedBundleIdentifiers(parallelNext: parallelNext).contains(bundleID) else {
             throw AppUpdaterError.bundleVerificationFailed("bundle identifier mismatch")
         }
 
-        let normalizedExpectedVersion = normalizeVersion(expectedVersion)
-        guard !normalizedExpectedVersion.isEmpty,
-              let bundleVersion = plist["CFBundleShortVersionString"] as? String,
-              normalizeVersion(bundleVersion) == normalizedExpectedVersion else {
+        guard let expected = SemanticVersion(expectedVersion),
+              let bundleVersionString = plist["CFBundleShortVersionString"] as? String,
+              let bundleVersion = SemanticVersion(bundleVersionString),
+              bundleVersion == expected else {
             throw AppUpdaterError.bundleVerificationFailed("version mismatch")
         }
 
@@ -548,5 +578,87 @@ public struct AppUpdater: AppUpdating, Sendable {
         config.httpShouldSetCookies = false
         config.urlCache = nil
         return URLSession(configuration: config)
+    }
+}
+
+/// Semantic version with SemVer 2.0 §11 precedence. Accepts an optional leading `v`,
+/// 1–4 numeric core components (missing components compare as 0) and an optional
+/// dot-separated pre-release (`0.5.0-next.2`). Build metadata (`+…`) is ignored.
+public struct SemanticVersion: Comparable, CustomStringConvertible, Sendable {
+    public let core: [Int]
+    public let prerelease: [String]
+
+    public init?(_ raw: String) {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix("v") || text.hasPrefix("V") { text.removeFirst() }
+        if let plus = text.firstIndex(of: "+") { text = String(text[..<plus]) }
+        var prereleaseText: Substring?
+        if let dash = text.firstIndex(of: "-") {
+            prereleaseText = text[text.index(after: dash)...]
+            text = String(text[..<dash])
+        }
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...4).contains(parts.count) else { return nil }
+        var numbers: [Int] = []
+        for part in parts {
+            guard !part.isEmpty, part.utf8.allSatisfy({ (48...57).contains($0) }), let value = Int(part) else { return nil }
+            numbers.append(value)
+        }
+        var identifiers: [String] = []
+        if let prereleaseText {
+            let pieces = prereleaseText.split(separator: ".", omittingEmptySubsequences: false)
+            for piece in pieces {
+                guard !piece.isEmpty,
+                      piece.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 })
+                else { return nil }
+                identifiers.append(String(piece))
+            }
+        }
+        core = numbers
+        prerelease = identifiers
+    }
+
+    public var description: String {
+        let base = core.map(String.init).joined(separator: ".")
+        return prerelease.isEmpty ? base : base + "-" + prerelease.joined(separator: ".")
+    }
+
+    private func paddedCore(_ count: Int) -> [Int] {
+        core + Array(repeating: 0, count: max(0, count - core.count))
+    }
+
+    public static func == (lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
+        let count = max(lhs.core.count, rhs.core.count)
+        return lhs.paddedCore(count) == rhs.paddedCore(count) && lhs.prerelease == rhs.prerelease
+    }
+
+    public static func < (lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
+        let count = max(lhs.core.count, rhs.core.count)
+        let left = lhs.paddedCore(count)
+        let right = rhs.paddedCore(count)
+        if left != right {
+            for index in 0..<count where left[index] != right[index] {
+                return left[index] < right[index]
+            }
+        }
+        // A release ranks above any of its pre-releases.
+        switch (lhs.prerelease.isEmpty, rhs.prerelease.isEmpty) {
+        case (true, true): return false
+        case (true, false): return false
+        case (false, true): return true
+        case (false, false): break
+        }
+        func numeric(_ identifier: String) -> Int? {
+            identifier.utf8.allSatisfy({ (48...57).contains($0) }) ? Int(identifier) : nil
+        }
+        for (a, b) in zip(lhs.prerelease, rhs.prerelease) where a != b {
+            switch (numeric(a), numeric(b)) {
+            case let (x?, y?): return x < y
+            case (.some, nil): return true
+            case (nil, .some): return false
+            case (nil, nil): return a < b
+            }
+        }
+        return lhs.prerelease.count < rhs.prerelease.count
     }
 }

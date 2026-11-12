@@ -723,7 +723,7 @@ struct SettingsView: View {
                     Spacer()
                 }
 
-                let repoSlug = model.isParallelBuild ? "yturkkan/suyoi-next" : "yturkkan/suyoi"
+                let repoSlug = "yturkkan/suyoi"
                 let repoURL = "https://github.com/\(repoSlug)"
                 HStack(spacing: 7) {
                     Button {

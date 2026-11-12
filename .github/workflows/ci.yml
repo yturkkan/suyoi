@@ -23,9 +23,9 @@ on:
         required: false
         default: "false"
 
+# Least privilege by default; only the release/screenshot jobs below request write access.
 permissions:
-  contents: write
-  actions: read
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}-${{ github.event_name }}
@@ -37,9 +37,11 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.run_id == '' && inputs.export_screenshots != 'true') }}
     runs-on: macos-15
     timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Select Swift 6 Xcode toolchain
         run: |
@@ -64,19 +66,34 @@ jobs:
           ls -lh build/screenshots/*.png
 
       - name: Build parallel side-by-side Suyoi Next.app
-        run: ./scripts/build-app.sh --parallel
+        run: |
+          # Tag builds embed the tag's version so the in-app updater compares correctly.
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              export SUYOI_VERSION="${GITHUB_REF_NAME#v}"
+              export SUYOI_BUILD_VERSION="${SUYOI_VERSION%%-*}"
+              ;;
+          esac
+          ./scripts/build-app.sh --parallel
 
-      - name: Verify Suyoi Next bundle, signature, CLI & archive checksum
+      - name: Verify Suyoi Next bundle, signature, version, CLI & archive checksum
         run: |
           test -d "build/Suyoi Next.app"
-          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "build/Suyoi Next.app/Contents/Info.plist")"
+          PLIST="build/Suyoi Next.app/Contents/Info.plist"
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST")"
           test "$BUNDLE_ID" = "local.suyoi.next"
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              SHORT="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")"
+              test "$SHORT" = "${GITHUB_REF_NAME#v}"
+              ;;
+          esac
           /usr/bin/codesign --verify --deep --strict "build/Suyoi Next.app"
           "build/Suyoi Next.app/Contents/MacOS/Suyoi" --help
           (cd build && /usr/bin/shasum -a 256 -c Suyoi-Next.app.zip.sha256)
 
       - name: Upload Suyoi-Next.app.zip artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Suyoi-Next-macOS
           if-no-files-found: error
@@ -85,25 +102,47 @@ jobs:
             build/Suyoi-Next.app.zip.sha256
 
       - name: Upload Suyoi-Next-Screenshots artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Suyoi-Next-Screenshots
           if-no-files-found: error
           path: build/screenshots/*.png
 
-      - name: Publish release assets on tag push
-        if: startsWith(github.ref, 'refs/tags/v')
+  publish-next-prerelease:
+    name: Publish Suyoi Next Pre-release (tag)
+    needs: macos-build-and-test
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse non-Next tags
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            v*-next*) ;;
+            *) echo "::error::Only vX.Y.Z-next.N tags may be published from this workflow"; exit 1 ;;
+          esac
+
+      - name: Download verified artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: Suyoi-Next-macOS
+          path: dist
+
+      - name: Create or update pre-release (never marked latest)
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          (cd dist && sha256sum -c Suyoi-Next.app.zip.sha256)
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" build/Suyoi-Next.app.zip build/Suyoi-Next.app.zip.sha256 --clobber
+            test "$(gh release view "${GITHUB_REF_NAME}" --json isPrerelease --jq .isPrerelease)" = "true"
+            gh release upload "${GITHUB_REF_NAME}" dist/Suyoi-Next.app.zip dist/Suyoi-Next.app.zip.sha256 --clobber
           else
-            PRERELEASE_FLAG=""
-            case "${GITHUB_REF_NAME}" in
-              *-next*|*-beta*|*-rc*|*-alpha*) PRERELEASE_FLAG="--prerelease" ;;
-            esac
-            gh release create "${GITHUB_REF_NAME}" build/Suyoi-Next.app.zip build/Suyoi-Next.app.zip.sha256 ${PRERELEASE_FLAG} --title "Suyoi Next ${GITHUB_REF_NAME}" --generate-notes
+            gh release create "${GITHUB_REF_NAME}" dist/Suyoi-Next.app.zip dist/Suyoi-Next.app.zip.sha256 \
+              --verify-tag --prerelease --latest=false \
+              --title "Suyoi Next ${GITHUB_REF_NAME}" --generate-notes
           fi
 
   attach-release-assets:
@@ -111,14 +150,32 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_id != '' && inputs.release_tag != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
     steps:
-      - name: Download verified artifact and attach to GitHub Release
+      - name: Validate source run and target release, then attach
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ inputs.run_id }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
+          case "$RUN_ID" in ''|*[!0-9]*) echo "::error::run_id must be numeric"; exit 1 ;; esac
+          case "$RELEASE_TAG" in
+            v*-next*) ;;
+            *) echo "::error::Only -next pre-release tags may receive Suyoi Next assets"; exit 1 ;;
+          esac
+          RUN_JSON="$(gh run view "$RUN_ID" --json conclusion,event,headBranch,workflowName)"
+          test "$(jq -r .conclusion <<<"$RUN_JSON")" = "success"
+          test "$(jq -r .workflowName <<<"$RUN_JSON")" = "${GITHUB_WORKFLOW}"
+          test "$(jq -r .event <<<"$RUN_JSON")" = "push"
+          HEAD_BRANCH="$(jq -r .headBranch <<<"$RUN_JSON")"
+          case "$HEAD_BRANCH" in
+            next|v*-next*) ;;
+            *) echo "::error::Source run must come from the next branch or a -next tag (got $HEAD_BRANCH)"; exit 1 ;;
+          esac
+          test "$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease)" = "true"
           mkdir -p dist
           gh run download "$RUN_ID" -n Suyoi-Next-macOS --dir dist
           (cd dist && sha256sum -c Suyoi-Next.app.zip.sha256)
@@ -129,9 +186,11 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_screenshots == 'true' }}
     runs-on: macos-15
     timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -154,7 +213,7 @@ jobs:
           ls -lh docs/screenshots/*.png
 
       - name: Upload screenshots artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Suyoi-Next-Screenshots
           if-no-files-found: error
@@ -170,4 +229,3 @@ jobs:
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
-

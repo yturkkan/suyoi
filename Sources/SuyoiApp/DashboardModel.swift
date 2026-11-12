@@ -209,6 +209,10 @@ final class DashboardModel: ObservableObject {
     private var stuckAgentTracker = StuckAgentTracker()
     private var livePollTask: Task<Void, Never>?
     private var livePollGeneration: UInt64 = 0
+    /// Automatic (refresh-tick) live quota polls are throttled; explicit user refreshes are not.
+    private var lastAutomaticLiveQuotaPollAt: Date?
+    private var liveQuotaFailureStreak = 0
+    private static let automaticLiveQuotaInterval: TimeInterval = 120
     private var cleanupScanTask: Task<Void, Never>?
     private var cleanupScanGeneration: UInt64 = 0
     private var deepStorageTask: Task<Void, Never>?
@@ -792,9 +796,14 @@ final class DashboardModel: ObservableObject {
 
     func pollLiveQuotas(trigger: LiveQuotaTrigger = .userInitiated) {
         guard isLiveQuotaEnabled else { return }
-        if trigger == .automatic && isPollingLiveQuotas {
-            return
+        if trigger == .automatic {
+            if isPollingLiveQuotas { return }
+            let backoff = Self.automaticLiveQuotaInterval * Double(1 << min(liveQuotaFailureStreak, 3))
+            if let last = lastAutomaticLiveQuotaPollAt, Date().timeIntervalSince(last) < backoff {
+                return
+            }
         }
+        lastAutomaticLiveQuotaPollAt = Date()
         livePollGeneration &+= 1
         let gen = livePollGeneration
         livePollTask?.cancel()
@@ -810,6 +819,8 @@ final class DashboardModel: ObservableObject {
             liveQuotas[.codex] = codexStatus
             liveQuotas[.claude] = claudeStatus
             liveQuotas[.gemini] = geminiStatus
+            let allFailed = [codexStatus, claudeStatus, geminiStatus].allSatisfy { $0.status == .unavailable }
+            liveQuotaFailureStreak = allFailed ? liveQuotaFailureStreak + 1 : 0
             isPollingLiveQuotas = false
             recordCurrentQuotaBurnSamples(at: now)
             evaluateAndDeliverAlerts()

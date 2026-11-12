@@ -202,6 +202,81 @@ struct AppUpdaterTests {
         #expect(!AppUpdater.isRemoteVersionNewer("0.1.7", than: "0.1.8"))
     }
 
+    @Test("Pre-release identifiers follow SemVer 2.0 precedence")
+    func prereleasePrecedence() {
+        #expect(AppUpdater.isRemoteVersionNewer("v0.5.0-next.2", than: "0.5.0-next.1"))
+        #expect(AppUpdater.isRemoteVersionNewer("0.5.0-next.10", than: "0.5.0-next.9"))
+        #expect(AppUpdater.isRemoteVersionNewer("0.5.0", than: "0.5.0-next.9"))
+        #expect(AppUpdater.isRemoteVersionNewer("0.5.1-next.1", than: "0.5.0"))
+        #expect(!AppUpdater.isRemoteVersionNewer("0.5.0-next.1", than: "0.5.0-next.1"))
+        #expect(!AppUpdater.isRemoteVersionNewer("0.4.1-next.2", than: "0.5.0-next.1"))
+        #expect(!AppUpdater.isRemoteVersionNewer("0.5.0-next.1", than: "0.5.0"))
+        #expect(SemanticVersion("0.5.0-alpha")! < SemanticVersion("0.5.0-alpha.1")!)
+        #expect(SemanticVersion("0.5.0-1")! < SemanticVersion("0.5.0-alpha")!)
+        #expect(SemanticVersion("1.2") == SemanticVersion("1.2.0"))
+        #expect(SemanticVersion("1..2") == nil)
+        #expect(SemanticVersion("1.2.3-") == nil)
+        #expect(SemanticVersion("v0.5.0-next.2")?.description == "0.5.0-next.2")
+    }
+
+    @Test("Next channel picks the highest published -next pre-release from the release list")
+    func nextChannelSelectsHighestPrerelease() throws {
+        func release(_ tag: String, prerelease: Bool, draft: Bool = false) -> [String: Any] {
+            [
+                "tag_name": tag, "prerelease": prerelease, "draft": draft,
+                "html_url": "https://github.com/yturkkan/suyoi/releases/tag/\(tag)",
+                "assets": [
+                    ["name": "Suyoi-Next.app.zip", "size": 4096,
+                     "browser_download_url": "https://github.com/yturkkan/suyoi/releases/download/\(tag)/Suyoi-Next.app.zip"],
+                    ["name": "Suyoi-Next.app.zip.sha256", "size": 90,
+                     "browser_download_url": "https://github.com/yturkkan/suyoi/releases/download/\(tag)/Suyoi-Next.app.zip.sha256"]
+                ]
+            ]
+        }
+        let list: [[String: Any]] = [
+            release("v0.3.6", prerelease: false),
+            release("v0.5.0-next.3", prerelease: true, draft: true),
+            release("v0.5.0-next.2", prerelease: true),
+            release("v0.5.0-next.1", prerelease: true),
+            release("v0.9.0", prerelease: true)
+        ]
+        let data = try JSONSerialization.data(withJSONObject: list)
+        let result = try AppUpdater.parseReleaseResponse(data, currentVersion: "0.5.0-next.1", parallelNext: true)
+        guard case .updateAvailable(let info) = result else {
+            Issue.record("Expected next.2 to be offered")
+            return
+        }
+        #expect(info.version == "0.5.0-next.2")
+        #expect(info.tagName == "v0.5.0-next.2")
+        #expect(info.sha256AssetURL?.absoluteString.hasSuffix("/v0.5.0-next.2/Suyoi-Next.app.zip.sha256") == true)
+
+        let upToDate = try AppUpdater.parseReleaseResponse(data, currentVersion: "0.5.0-next.2", parallelNext: true)
+        #expect(upToDate == .upToDate(currentVersion: "0.5.0-next.2"))
+        let none = try AppUpdater.parseReleaseResponse(Data("[]".utf8), currentVersion: "0.5.0-next.2", parallelNext: true)
+        #expect(none == .upToDate(currentVersion: "0.5.0-next.2"))
+    }
+
+    @Test("Staging refuses an archive that has no SHA-256 checksum")
+    func stagingRequiresChecksum() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("suyoi-nosha-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archive = directory.appendingPathComponent("download.zip")
+        try Data(repeating: 0, count: 2048).write(to: archive)
+        let downloadURL = URL(string: "https://github.com/yturkkan/suyoi/releases/download/v0.1.9/Suyoi.app.zip")!
+        let updater = AppUpdater(downloadArchive: { _ in
+            (archive, HTTPURLResponse(url: downloadURL, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        })
+        let release = AppReleaseInfo(
+            version: "0.1.9", tagName: "v0.1.9",
+            releaseURL: URL(string: "https://github.com/yturkkan/suyoi/releases/tag/v0.1.9")!,
+            downloadURL: downloadURL, assetSizeBytes: 2048
+        )
+        await #expect(throws: AppUpdaterError.bundleVerificationFailed("missing SHA-256 checksum")) {
+            _ = try await updater.stageUpdate(release, currentBundleURL: directory.appendingPathComponent("Suyoi.app"))
+        }
+    }
+
     @Test("Release parser returns updateAvailable for newer valid GitHub release")
     func releaseParserUpdateAvailable() throws {
         let json = """
