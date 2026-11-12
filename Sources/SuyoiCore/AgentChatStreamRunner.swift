@@ -781,6 +781,10 @@ public final class AgentChatStreamRunner: @unchecked Sendable {
         return cleaned
     }
 
+    public static func validateSessionID(_ raw: String) -> String? {
+        AgentContextValidation.sessionID(raw)
+    }
+
     public static func buildArguments(
         for request: AgentChatStreamRequest,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser

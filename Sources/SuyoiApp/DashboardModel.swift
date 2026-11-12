@@ -2420,7 +2420,7 @@ final class DashboardModel: ObservableObject {
             return true
         }
         guard let rawSID = session.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-              AgentContextValidation.sessionID(rawSID) != nil else {
+              AgentChatStreamRunner.validateSessionID(rawSID) != nil else {
             return false
         }
         return true
@@ -2579,7 +2579,7 @@ final class DashboardModel: ObservableObject {
         let folderPath = URL(fileURLWithPath: rawFolder, isDirectory: true).standardizedFileURL.path
         let folderName = URL(fileURLWithPath: folderPath).lastPathComponent
         let provider = newChatProvider
-        let titleText = WorkspaceSessionIndexer.sanitizeInlineText(trimmed, maxLength: 84) ?? String(trimmed.prefix(84))
+        let titleText = SessionTurnPreviewInspector.sanitizeAndRedact(trimmed, maxLength: 84) ?? String(trimmed.prefix(84))
 
         let pendingSession = IndexedAgentSession(
             id: "pending:\(UUID().uuidString)",
@@ -2597,11 +2597,11 @@ final class DashboardModel: ObservableObject {
             canResumeNatively: true,
             nativeSteerMode: WorkspaceSessionIndexer.nativeResumeMode(for: provider),
             liveSteerMode: nil,
-            lastMessageSnippet: WorkspaceSessionIndexer.sanitizeInlineText(trimmed, maxLength: 140),
+            lastMessageSnippet: SessionTurnPreviewInspector.sanitizeAndRedact(trimmed, maxLength: 140),
             turnCount: 1
         )
 
-        if sessionScopeFilter == .liveOnly {
+        if sessionScopeFilter == .live {
             sessionScopeFilter = .all
         }
         if let providerFilter = sessionProviderFilter, providerFilter != provider {
@@ -2872,7 +2872,7 @@ final class DashboardModel: ObservableObject {
         updateSessionMetadataInPlace(
             sessionKey: session.id,
             updatedAt: Date(),
-            snippet: WorkspaceSessionIndexer.sanitizeInlineText(prompt, maxLength: 140),
+            snippet: SessionTurnPreviewInspector.sanitizeAndRedact(prompt, maxLength: 140),
             incrementTurnCount: true
         )
 
@@ -2899,7 +2899,7 @@ final class DashboardModel: ObservableObject {
             sessionID: session.sessionID,
             projectPath: projectPath,
             prompt: prompt,
-            preferredExecutablePath: session.liveObservation?.process.executablePath
+            preferredExecutablePath: session.liveObservation?.process.executable
         )
 
         let streamToken = UUID()
@@ -2945,7 +2945,7 @@ final class DashboardModel: ObservableObject {
 
         switch event {
         case .sessionStarted(let rawSID):
-            guard let validSID = AgentContextValidation.sessionID(rawSID),
+            guard let validSID = AgentChatStreamRunner.validateSessionID(rawSID),
                   let currentSession = indexedSessions.first(where: { $0.id == sessionKey }) else {
                 return
             }
@@ -3014,7 +3014,7 @@ final class DashboardModel: ObservableObject {
             updateSessionMetadataInPlace(
                 sessionKey: sessionKey,
                 updatedAt: Date(),
-                snippet: WorkspaceSessionIndexer.sanitizeInlineText(text, maxLength: 140),
+                snippet: SessionTurnPreviewInspector.sanitizeAndRedact(text, maxLength: 140),
                 incrementTurnCount: false
             )
 
