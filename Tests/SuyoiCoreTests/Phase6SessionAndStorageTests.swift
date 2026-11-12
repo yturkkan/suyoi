@@ -4,6 +4,13 @@ import SQLite3
 import Testing
 @testable import SuyoiCore
 
+private final class TrashCallRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+    var paths: [String] { lock.withLock { recorded } }
+    func record(_ path: String) { lock.withLock { recorded.append(path) } }
+}
+
 private final class RecordingJobLauncher: NativeAgentJobLaunching, @unchecked Sendable {
     struct LaunchCall: Equatable, Sendable {
         let executable: String
@@ -386,5 +393,60 @@ struct Phase6SessionAndStorageTests {
         let restoreOutcome = recoveryStore.restore(record)
         #expect(restoreOutcome.restored)
         #expect(FileManager.default.fileExists(atPath: modulesURL.appendingPathComponent("react/index.js").path))
+    }
+
+    @Test("moveItemsToTrash refuses stale or forged cached items that no longer classify as artifacts")
+    func trashRevalidatesCachedItemsAgainstDisk() throws {
+        let home = try makeTempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let appRoot = home.appendingPathComponent("Developer/beta-web", isDirectory: true)
+        try writeUTF8("{\"name\":\"beta-web\"}", to: appRoot.appendingPathComponent("package.json"))
+        let sourceDir = appRoot.appendingPathComponent("src", isDirectory: true)
+        try writeSizedFile(bytes: 8_192, to: sourceDir.appendingPathComponent("index.ts"))
+        let vendoredRepo = appRoot.appendingPathComponent("node_modules", isDirectory: true)
+        try writeSizedFile(bytes: 8_192, to: vendoredRepo.appendingPathComponent("lib/a.js"))
+        try writeUTF8("ref: refs/heads/main\n", to: vendoredRepo.appendingPathComponent(".git/HEAD"))
+        let unknownCache = home.appendingPathComponent("Library/Caches/some-random-app", isDirectory: true)
+        try writeSizedFile(bytes: 8_192, to: unknownCache.appendingPathComponent("blob.bin"))
+
+        let trashedPaths = TrashCallRecorder()
+        let indexer = DeepStorageIndexer(
+            homeDirectory: home,
+            minimumBytes: 1_024,
+            trashHandler: { url in
+                trashedPaths.record(url.path)
+                return nil
+            }
+        )
+        let reader = FileMetadataReader()
+        func forged(_ url: URL, projectRoot: String?, category: StorageCategory) throws -> IndexedStorageItem {
+            IndexedStorageItem(
+                path: url.path,
+                displayName: url.lastPathComponent,
+                subtitle: "forged",
+                projectName: nil,
+                projectRootPath: projectRoot,
+                category: category,
+                ecosystemLabel: "forged",
+                bytes: 8_192,
+                allocatedBytes: 8_192,
+                fileCount: 1,
+                lastModifiedAt: nil,
+                fileIdentity: try #require(reader.identity(at: url)),
+                safety: .ready
+            )
+        }
+
+        let report = indexer.moveItemsToTrash([
+            try forged(sourceDir, projectRoot: appRoot.path, category: .dependencies),
+            try forged(vendoredRepo, projectRoot: appRoot.path, category: .dependencies),
+            try forged(unknownCache, projectRoot: nil, category: .aiAgentStorage)
+        ], liveProcesses: [])
+
+        #expect(report.trashedCount == 0)
+        #expect(trashedPaths.paths.isEmpty)
+        #expect(report.outcomes.count == 3)
+        #expect(report.outcomes.allSatisfy { !$0.succeeded })
     }
 }

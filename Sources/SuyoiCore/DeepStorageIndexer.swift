@@ -473,6 +473,13 @@ public struct DeepStorageIndexer: Sendable {
                 continue
             }
 
+            // Items may come from the on-disk cache written by an older scan. Re-check the
+            // classification against the current disk state before acting on it.
+            guard revalidatesAsRegenerableArtifact(url: url, item: item) else {
+                outcomes.append(fail("No longer matches a known cache or build artifact; rescan first"))
+                continue
+            }
+
             guard hasNoSymlinkInTargetOrAncestors(url),
                   let currentIdentity = readDirectoryOrFileIdentity(at: url),
                   currentIdentity == item.fileIdentity else {
@@ -516,6 +523,50 @@ public struct DeepStorageIndexer: Sendable {
         }
 
         return TrashExecutionReport(outcomes: outcomes, reclaimedBytes: reclaimedBytes)
+    }
+
+    // MARK: - Trash-Time Revalidation
+
+    /// Re-derives the item's classification from the current disk state. Cache items must
+    /// still be one of the known cache targets; workspace items must still match the same
+    /// artifact rule given their current sibling manifests, and must not be a nested Git repo.
+    func revalidatesAsRegenerableArtifact(url: URL, item: IndexedStorageItem) -> Bool {
+        let path = url.standardizedFileURL.path
+        guard item.projectRootPath != nil else {
+            return collectSystemAndAgentCacheTargets().contains {
+                $0.url.standardizedFileURL.path == path && $0.category == item.category
+            }
+        }
+
+        var gitMarker = stat()
+        if lstat(physicalPath(for: path + "/.git"), &gitMarker) == 0 { return false }
+
+        let parent = url.deletingLastPathComponent().standardizedFileURL
+        let name = url.lastPathComponent
+        if name == "Build", parent.lastPathComponent == "Carthage" {
+            return item.category == .dependencies
+        }
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: physicalPath(for: parent.path)) else {
+            return false
+        }
+        var siblingFiles = Set<String>()
+        var siblingDirs = Set<String>()
+        for entry in entries {
+            var st = stat()
+            guard lstat(physicalPath(for: parent.path + "/" + entry), &st) == 0 else { continue }
+            switch st.st_mode & S_IFMT {
+            case S_IFREG: siblingFiles.insert(entry)
+            case S_IFDIR: siblingDirs.insert(entry)
+            default: break
+            }
+        }
+        guard let match = classifyArtifactDirectory(
+            name: name,
+            url: url,
+            siblingFiles: siblingFiles,
+            siblingDirs: siblingDirs
+        ) else { return false }
+        return match.category == item.category
     }
 
     // MARK: - Workspace Recursive Discovery
