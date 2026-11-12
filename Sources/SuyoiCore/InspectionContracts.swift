@@ -44,11 +44,25 @@ public extension ActionExecuting {
 public protocol AgentSteering: Sendable {
     func steer(agent: AgentObservation, prompt: String, uid: Int) -> AgentSteerOutcome
     func steer(agent: AgentObservation, target: NativeSessionTarget, prompt: String, uid: Int) -> AgentSteerOutcome
+    func steerIndexedSession(session: IndexedAgentSession, prompt: String, preferLiveTerminal: Bool, uid: Int) -> AgentSteerOutcome
 }
 
 public extension AgentSteering {
     func steer(agent: AgentObservation, target: NativeSessionTarget, prompt: String, uid: Int) -> AgentSteerOutcome {
         AgentSteerOutcome(agentID: agent.id, mode: target.mode, succeeded: false, error: "Native continuation is unavailable")
+    }
+
+    func steerIndexedSession(session: IndexedAgentSession, prompt: String, preferLiveTerminal: Bool, uid: Int) -> AgentSteerOutcome {
+        if preferLiveTerminal, let obs = session.liveObservation {
+            return steer(agent: obs, prompt: prompt, uid: uid)
+        }
+        let fallbackMode = session.nativeSteerMode ?? session.liveSteerMode ?? .claudeResume
+        return AgentSteerOutcome(
+            agentID: session.liveObservation?.id ?? 0,
+            mode: fallbackMode,
+            succeeded: false,
+            error: "Session continuation is unavailable"
+        )
     }
 }
 

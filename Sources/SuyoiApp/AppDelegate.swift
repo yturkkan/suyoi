@@ -5,9 +5,10 @@ import SuyoiCore
 import UserNotifications
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
+    private var detachedWindow: NSWindow?
     private let model = DashboardModel()
     private lazy var islandController: IslandWindowController = {
         let controller = IslandWindowController(
@@ -36,13 +37,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var globalClickMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
 
-    static let popoverSize = NSSize(width: 700, height: 600)
+    static let popoverSize = NSSize(width: 920, height: 660)
+    static let detachedWindowDefaultSize = NSSize(width: 980, height: 720)
+    static let detachedWindowMinSize = NSSize(width: 860, height: 600)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if Bundle.main.bundleURL.pathExtension == "app" {
             let center = UNUserNotificationCenter.current()
             center.delegate = self
             model.registerNotificationCategories()
+        }
+
+        model.onToggleDetachedWindow = { [weak self] in
+            self?.toggleDetachedWindow()
         }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -131,11 +138,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func showPopoverIfNeeded() {
+        if let win = detachedWindow, win.isVisible {
+            NSApp.activate(ignoringOtherApps: true)
+            win.makeKeyAndOrderFront(nil)
+            return
+        }
         guard let button = statusItem.button, !popover.isShown else { return }
         popover.behavior = model.isPopoverPinned ? .applicationDefined : .transient
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
+    }
+
+    func toggleDetachedWindow() {
+        if let existing = detachedWindow, existing.isVisible {
+            existing.close()
+            detachedWindow = nil
+            model.isDetachedWindowOpen = false
+            return
+        }
+
+        if popover.isShown {
+            popover.close()
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: Self.detachedWindowDefaultSize),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "\(model.appDisplayName) — Command Center"
+        window.minSize = Self.detachedWindowMinSize
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.contentViewController = NSHostingController(rootView: DashboardView(model: model))
+        window.center()
+        detachedWindow = window
+        model.isDetachedWindowOpen = true
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        scheduleRefreshTimer(interval: 5)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if let closed = notification.object as? NSWindow, closed === detachedWindow {
+            detachedWindow = nil
+            model.isDetachedWindowOpen = false
+            if !popover.isShown {
+                scheduleRefreshTimer(interval: 10)
+            }
+        }
     }
 
     private func updateStatusItemBadge() {
@@ -172,6 +225,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func togglePopover() {
+        if let win = detachedWindow, win.isVisible {
+            if win.isKeyWindow && NSApp.isActive {
+                win.orderOut(nil)
+                detachedWindow = nil
+                model.isDetachedWindowOpen = false
+            } else {
+                NSApp.activate(ignoringOtherApps: true)
+                win.makeKeyAndOrderFront(nil)
+            }
+            return
+        }
         guard let button = statusItem.button else { return }
         if popover.isShown {
             forceClosePopover()
@@ -194,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             && !model.isPerformingAction
             && !model.isLoadingSteerSessions
             && model.steerPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && model.consoleComposerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && model.selectedSteerSessionID == nil
             && !model.isShowingCleanupPreview
             && !model.isShowingNotesPopover
@@ -241,7 +306,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         removeGlobalClickMonitor()
-        scheduleRefreshTimer(interval: 10)
+        if detachedWindow?.isVisible != true {
+            scheduleRefreshTimer(interval: 10)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

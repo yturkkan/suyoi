@@ -45,7 +45,7 @@ struct DashboardView: View {
             Group {
                 switch model.tab {
                 case .agents:
-                    agentsWorkspace
+                    AgentsConsoleView(model: model)
                 case .ports:
                     serversWorkspace
                 case .quotas:
@@ -56,12 +56,7 @@ struct DashboardView: View {
                             .padding(.vertical, 10)
                     }
                 case .cleanup:
-                    ScrollView {
-                        cleanupSection
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                    }
+                    DeepStorageView(model: model)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -69,7 +64,14 @@ struct DashboardView: View {
             footer
         }
         .fontDesign(model.themeTokens.usesMonospacedChrome ? .monospaced : .default)
-        .frame(width: 700, height: 600)
+        .frame(
+            minWidth: AppDelegate.detachedWindowMinSize.width,
+            idealWidth: AppDelegate.popoverSize.width,
+            maxWidth: .infinity,
+            minHeight: AppDelegate.detachedWindowMinSize.height,
+            idealHeight: AppDelegate.popoverSize.height,
+            maxHeight: .infinity
+        )
         .sheet(isPresented: $model.isShowingCleanupPreview) {
             if let report = model.cleanup {
                 CleanupPreviewView(
@@ -108,10 +110,17 @@ struct DashboardView: View {
             Text("·")
                 .foregroundStyle(.tertiary)
 
-            Text("\(agentCount) agent\(agentCount == 1 ? "" : "s") · \(serverCount) server\(serverCount == 1 ? "" : "s")")
+            Text("\(agentCount) live agent\(agentCount == 1 ? "" : "s") · \(serverCount) server\(serverCount == 1 ? "" : "s")")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
+
+            if let storage = model.storageReport, storage.readyBytes > 0 {
+                Text("· \(formatBytes(storage.readyBytes)) cleanable")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(accent)
+                    .monospacedDigit()
+            }
 
             if !model.pendingApprovals.isEmpty {
                 Text("· \(model.pendingApprovals.count) approval\(model.pendingApprovals.count == 1 ? "" : "s") waiting")
@@ -145,28 +154,52 @@ struct DashboardView: View {
                 }
             }
 
-            Button {
-                model.togglePopoverPinned()
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: model.isPopoverPinned ? "pin.fill" : "pin")
-                        .font(.system(size: 11, weight: .semibold))
-                    if model.isPopoverPinned {
-                        Text("Pinned")
+            if let toggleWindow = model.onToggleDetachedWindow {
+                Button {
+                    toggleWindow()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: model.isDetachedWindowOpen ? "macwindow.badge.plus" : "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text(model.isDetachedWindowOpen ? "Window Open" : "Open Window")
                             .font(.system(size: 10.5, weight: .semibold))
                     }
+                    .foregroundStyle(model.isDetachedWindowOpen ? accent : .secondary)
+                    .padding(.horizontal, 7)
+                    .frame(height: 22)
+                    .background(
+                        model.isDetachedWindowOpen ? accent.opacity(0.14) : Color.primary.opacity(0.05),
+                        in: RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    )
                 }
-                .foregroundStyle(model.isPopoverPinned ? accent : .secondary)
-                .padding(.horizontal, model.isPopoverPinned ? 7 : 5)
-                .frame(height: 22)
-                .background(
-                    model.isPopoverPinned ? accent.opacity(0.14) : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 5, style: .continuous)
-                )
+                .buttonStyle(.plain)
+                .help(model.isDetachedWindowOpen ? "Close detached Command Center window" : "Open Suyoi in a full resizable desktop window")
             }
-            .buttonStyle(.plain)
-            .help(model.isPopoverPinned ? "Pinned: stays open when clicking outside" : "Pin panel: keep open when clicking outside")
-            .accessibilityLabel(model.isPopoverPinned ? "Unpin panel" : "Pin panel")
+
+            if !model.isDetachedWindowOpen {
+                Button {
+                    model.togglePopoverPinned()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: model.isPopoverPinned ? "pin.fill" : "pin")
+                            .font(.system(size: 11, weight: .semibold))
+                        if model.isPopoverPinned {
+                            Text("Pinned")
+                                .font(.system(size: 10.5, weight: .semibold))
+                        }
+                    }
+                    .foregroundStyle(model.isPopoverPinned ? accent : .secondary)
+                    .padding(.horizontal, model.isPopoverPinned ? 7 : 5)
+                    .frame(height: 22)
+                    .background(
+                        model.isPopoverPinned ? accent.opacity(0.14) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    )
+                }
+                .buttonStyle(.plain)
+                .help(model.isPopoverPinned ? "Pinned: stays open when clicking outside" : "Pin panel: keep open when clicking outside")
+                .accessibilityLabel(model.isPopoverPinned ? "Unpin panel" : "Pin panel")
+            }
         }
         .padding(.horizontal, 14)
         .padding(.top, 11)
@@ -174,21 +207,27 @@ struct DashboardView: View {
     }
 
     private var toolbarRow: some View {
-        HStack(spacing: 10) {
+        let agentsTabCount: Int? = !model.indexedSessions.isEmpty
+            ? model.indexedSessions.count
+            : model.snapshot.map { !model.agentRows.isEmpty ? model.agentRows.count : $0.agents.count }
+        let storageTabCount: Int? = model.storageReport?.items.count
+            ?? model.cleanup.map { _ in model.allCleanupCandidates.count }
+
+        return HStack(spacing: 10) {
             Picker("Section", selection: $model.tab) {
-                Text(segmentedTitle(.agents, count: model.snapshot.map { !model.agentRows.isEmpty ? model.agentRows.count : $0.agents.count }))
+                Text(segmentedTitle(.agents, count: agentsTabCount))
                     .tag(DashboardTab.agents)
                 Text(segmentedTitle(.ports, count: model.snapshot.map { _ in model.developmentServerGroups.count }))
                     .tag(DashboardTab.ports)
                 Text(segmentedTitle(.quotas, count: model.quotaSnapshot.map { _ in model.activeQuotaProvidersCount }))
                     .tag(DashboardTab.quotas)
-                Text(segmentedTitle(.cleanup, count: model.cleanup.map { _ in model.allCleanupCandidates.count }))
+                Text(segmentedTitle(.cleanup, count: storageTabCount))
                     .tag(DashboardTab.cleanup)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
             .controlSize(.regular)
-            .frame(width: model.tab == .quotas ? nil : 410)
+            .frame(width: model.tab == .quotas ? nil : 450)
 
             if model.tab != .quotas {
                 searchBar
@@ -575,7 +614,7 @@ struct DashboardView: View {
                     )
                 }
             }
-            .frame(width: 309)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.primary.opacity(0.02))
         }
     }
@@ -1036,7 +1075,7 @@ struct DashboardView: View {
 
 // MARK: - Approval & Active Grant Subviews
 
-private struct PendingApprovalCardView: View {
+struct PendingApprovalCardView: View {
     let request: PendingApprovalRequest
     let canAutoApprove: Bool
     var canAutoApproveProjectReadOnly: Bool = false
@@ -1160,7 +1199,7 @@ private struct PendingApprovalCardView: View {
     }
 }
 
-private struct WorktreeCollisionWarningBar: View {
+struct WorktreeCollisionWarningBar: View {
     let collisions: [WorktreeCollisionGroup]
     let onIsolateFirst: (WorktreeCollisionGroup) -> Void
 
@@ -1200,7 +1239,7 @@ private struct WorktreeCollisionWarningBar: View {
     }
 }
 
-private struct OrphanMCPHelpersBar: View {
+struct OrphanMCPHelpersBar: View {
     let orphans: [OrphanToolProcess]
     let isPerformingAction: Bool
     let onStopOne: (OrphanToolProcess) -> Void
@@ -1250,7 +1289,7 @@ private struct OrphanMCPHelpersBar: View {
     }
 }
 
-private struct ActiveAutoApproveSessionsBar: View {
+struct ActiveAutoApproveSessionsBar: View {
     let grants: [PendingApprovalRequest]
     let accent: Color
     let onRevoke: (PendingApprovalRequest) -> Void
@@ -1874,7 +1913,7 @@ private struct CleanupCandidateCardRow: View {
 
 // MARK: - Formatting & Styling Utilities
 
-private func statusBadge(_ text: String, tint: Color) -> some View {
+func statusBadge(_ text: String, tint: Color) -> some View {
     Text(text)
         .font(.system(size: 10, weight: .semibold))
         .foregroundStyle(tint)
@@ -1884,11 +1923,11 @@ private func statusBadge(_ text: String, tint: Color) -> some View {
         .fixedSize(horizontal: true, vertical: false)
 }
 
-private func formatBytes(_ value: Int64) -> String {
+func formatBytes(_ value: Int64) -> String {
     ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
 }
 
-private func shortenHomePath(_ path: String) -> String {
+func shortenHomePath(_ path: String) -> String {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     return path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
 }

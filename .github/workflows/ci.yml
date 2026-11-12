@@ -55,6 +55,14 @@ jobs:
       - name: Run Swift test suite
         run: swift test
 
+      - name: Export 2x Retina UI screenshots
+        run: |
+          swift build --product Suyoi
+          DEBUG_BIN_DIR="$(swift build --show-bin-path)"
+          mkdir -p build/screenshots
+          "$DEBUG_BIN_DIR/Suyoi" --export-screenshots build/screenshots
+          ls -lh build/screenshots/*.png
+
       - name: Build parallel side-by-side Suyoi Next.app
         run: ./scripts/build-app.sh --parallel
 
@@ -75,6 +83,13 @@ jobs:
           path: |
             build/Suyoi-Next.app.zip
             build/Suyoi-Next.app.zip.sha256
+
+      - name: Upload Suyoi-Next-Screenshots artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Suyoi-Next-Screenshots
+          if-no-files-found: error
+          path: build/screenshots/*.png
 
       - name: Publish release assets on tag push
         if: startsWith(github.ref, 'refs/tags/v')

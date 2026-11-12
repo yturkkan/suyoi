@@ -18,8 +18,8 @@ done
 if [ "$PARALLEL" = "1" ]; then
     APP_NAME="Suyoi Next"
     BUNDLE_ID="local.suyoi.next"
-    SHORT_VERSION="${SUYOI_VERSION:-0.4.1-next.2}"
-    BUNDLE_VERSION="${SUYOI_BUILD_VERSION:-0.4.1}"
+    SHORT_VERSION="${SUYOI_VERSION:-0.5.0-next.1}"
+    BUNDLE_VERSION="${SUYOI_BUILD_VERSION:-0.5.0}"
     ARCHIVE_NAME="Suyoi-Next.app.zip"
     USAGE_DESC="Suyoi Next uses Apple Events to send explicit user-submitted steering commands to matching Terminal or iTerm2 tabs."
 else

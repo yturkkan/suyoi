@@ -63,58 +63,33 @@ enum DashboardFixture {
 
         let showcaseSample = Sample(scenario: .showcase)
 
-        // 1. Agents Overview + Collisions + Approvals + Orphan MCP Helpers (Native Glass)
+        // 1. Unified Agents & Multi-Turn Chat Steering Console (Native Glass · 920x660)
         let agentsModel = DashboardModel(fixture: showcaseSample, tab: .agents, theme: .nativeGlass)
-        let shot1 = SequoiaWindowCanvas(canvasSize: CGSize(width: 760, height: 660), windowCornerRadius: 14) {
+        agentsModel.onToggleDetachedWindow = {}
+        let shot1 = SequoiaWindowCanvas(canvasSize: CGSize(width: 980, height: 720), windowCornerRadius: 14) {
             DashboardView(model: agentsModel)
-                .frame(width: 700, height: 600)
+                .frame(width: 920, height: 660)
                 .background(Color(red: 0.10, green: 0.11, blue: 0.14))
         }
         writeScreenshot(
             shot1,
-            size: CGSize(width: 760, height: 660),
-            to: outputURL.appendingPathComponent("01-agents-collisions-approvals.png")
+            size: CGSize(width: 980, height: 720),
+            to: outputURL.appendingPathComponent("01-agents-console-chat-steering.png")
         )
 
-        // 2. Focused Inspector: Live WezTerm Steering + Slash Snippets + Continuation Jobs + Uncommitted Git Diff
-        if let primaryAgent = agentsModel.agentRows.first {
-            let inspectorView = SequoiaWindowCanvas(canvasSize: CGSize(width: 560, height: 780), windowCornerRadius: 14) {
-                ProcessDetailView(
-                    subject: .agent(primaryAgent),
-                    theme: .nativeGlass,
-                    isEmbedded: false,
-                    turnPreview: agentsModel.agentTurnPreviews[primaryAgent.id],
-                    steerMode: agentsModel.steerMode(for: primaryAgent),
-                    steerModeLabel: agentsModel.steerModeLabel(for: primaryAgent),
-                    steerSessionTargets: agentsModel.steerSessionTargets,
-                    selectedSteerSessionID: .constant(agentsModel.selectedSteerSessionID),
-                    isLoadingSteerSessions: false,
-                    canSendSteer: true,
-                    steerPromptText: .constant("/test --filter Phase5FeaturesTests"),
-                    isSteering: false,
-                    isPerformingAction: false,
-                    snippets: agentsModel.allSteeringSnippets,
-                    continuationJobs: agentsModel.continuationJobs(for: primaryAgent),
-                    collisionGroup: agentsModel.collisionGroup(for: primaryAgent),
-                    diffSummary: agentsModel.diffSummary(for: primaryAgent),
-                    stuckDiagnostic: agentsModel.stuckDiagnostic(for: primaryAgent),
-                    onFocusAgent: { _ in },
-                    onSteerAgent: { _ in },
-                    onStopAgent: { _, _ in },
-                    onApplySnippet: { _ in },
-                    onCancelContinuationJob: { _ in },
-                    onCreateIsolatedWorktree: { _ in },
-                    onDismiss: {}
-                )
-                .frame(width: 500, height: 720)
+        // 2. Deep Background Storage Indexer & Ready Cleanup (Native Glass · 920x660)
+        let storageModel = DashboardModel(fixture: showcaseSample, tab: .cleanup, theme: .nativeGlass)
+        storageModel.onToggleDetachedWindow = {}
+        let shot2 = SequoiaWindowCanvas(canvasSize: CGSize(width: 980, height: 720), windowCornerRadius: 14) {
+            DashboardView(model: storageModel)
+                .frame(width: 920, height: 660)
                 .background(Color(red: 0.10, green: 0.11, blue: 0.14))
-            }
-            writeScreenshot(
-                inspectorView,
-                size: CGSize(width: 560, height: 780),
-                to: outputURL.appendingPathComponent("02-steering-inspector-snippets-diff.png")
-            )
         }
+        writeScreenshot(
+            shot2,
+            size: CGSize(width: 980, height: 720),
+            to: outputURL.appendingPathComponent("02-deep-storage-indexer-cleanup.png")
+        )
 
         // 3. Notch Dynamic Island (Inline Reply + AskUserQuestion Chips) & Floating Companion
         let inlineSteerNotchSnapshot = IslandSurfaceSnapshot(
@@ -123,7 +98,7 @@ enum DashboardFixture {
             pendingApprovalCount: 0,
             serverCount: 1,
             primaryAgentName: "Codex",
-            primaryAgentTask: "Running: swift test --filter Phase5FeaturesTests",
+            primaryAgentTask: "Running: swift test --filter Phase6SessionAndStorageTests",
             isWaitingForInput: true,
             canInlineSteerPrimary: true,
             primarySteerModeSummary: "WezTerm (ttys004)",
@@ -213,14 +188,15 @@ enum DashboardFixture {
 
         // 4. Quotas + Burn-Rate Depletion Forecast + Best Headroom Recommendation
         let quotasModel = DashboardModel(fixture: showcaseSample, tab: .quotas, theme: .nativeGlass)
-        let shot4 = SequoiaWindowCanvas(canvasSize: CGSize(width: 760, height: 660), windowCornerRadius: 14) {
+        quotasModel.onToggleDetachedWindow = {}
+        let shot4 = SequoiaWindowCanvas(canvasSize: CGSize(width: 980, height: 720), windowCornerRadius: 14) {
             DashboardView(model: quotasModel)
-                .frame(width: 700, height: 600)
+                .frame(width: 920, height: 660)
                 .background(Color(red: 0.10, green: 0.11, blue: 0.14))
         }
         writeScreenshot(
             shot4,
-            size: CGSize(width: 760, height: 660),
+            size: CGSize(width: 980, height: 720),
             to: outputURL.appendingPathComponent("04-quotas-burn-rate-forecast.png")
         )
 
@@ -237,16 +213,17 @@ enum DashboardFixture {
             to: outputURL.appendingPathComponent("05-settings-hooks-readonly-snippets.png")
         )
 
-        // 6. Pixel Arcade Theme Showcase
+        // 6. Pixel Arcade Theme Showcase (920x660)
         let pixelModel = DashboardModel(fixture: showcaseSample, tab: .agents, theme: .pixelArcade)
-        let shot6 = SequoiaWindowCanvas(canvasSize: CGSize(width: 760, height: 660), windowCornerRadius: 14) {
+        pixelModel.onToggleDetachedWindow = {}
+        let shot6 = SequoiaWindowCanvas(canvasSize: CGSize(width: 980, height: 720), windowCornerRadius: 14) {
             DashboardView(model: pixelModel)
-                .frame(width: 700, height: 600)
+                .frame(width: 920, height: 660)
                 .background(Color(red: 0.07, green: 0.08, blue: 0.11))
         }
         writeScreenshot(
             shot6,
-            size: CGSize(width: 760, height: 660),
+            size: CGSize(width: 980, height: 720),
             to: outputURL.appendingPathComponent("06-pixel-arcade-theme.png")
         )
 
@@ -464,6 +441,11 @@ enum DashboardFixture {
         let autoApprovedToolHistory: [AutoApprovedToolRecord]
         let customSnippets: [SteeringSnippet]
         let burnRateTracker: QuotaBurnRateTracker
+        let indexedSessions: [IndexedAgentSession]
+        let turnsBySessionID: [String: [SessionChatTurn]]
+        let storageReport: StorageIndexReport
+        let storageProgress: StorageIndexProgress
+        let selectedStorageItemIDs: Set<String>
 
         fileprivate init(scenario: Scenario) {
             let now = Date()
@@ -771,6 +753,289 @@ enum DashboardFixture {
                 autoApprovedToolHistory = []
                 customSnippets = []
             }
+
+            let claudeSessionID = "06eb0a11-b8aa-464e-834b-eb7eced111e4"
+            let openCodeSessionID = "ses_8892b41cf0"
+            let cursorSessionID = "cursor-composer-4412"
+            let geminiSessionID = "gemini-chat-91a8"
+
+            indexedSessions = [
+                IndexedAgentSession(
+                    id: "codex:\(codexSession)",
+                    provider: .codex,
+                    agentName: "Codex",
+                    sessionID: codexSession,
+                    title: "Account usage dashboard & deep storage indexer",
+                    projectPath: web.rootPath,
+                    projectName: "customer-dashboard",
+                    gitBranch: web.gitBranch,
+                    updatedAt: now,
+                    isLive: true,
+                    liveObservation: agents[0],
+                    canResumeNatively: true,
+                    nativeSteerMode: .codexResume,
+                    liveSteerMode: .weztermPane,
+                    lastMessageSnippet: "Running Phase6SessionAndStorageTests across monorepo fixtures.",
+                    turnCount: 6
+                ),
+                IndexedAgentSession(
+                    id: "claude:\(claudeSessionID)",
+                    provider: .claude,
+                    agentName: "Claude Code",
+                    sessionID: claudeSessionID,
+                    title: "Notification delivery retry queue & dead-letter tests",
+                    projectPath: service.rootPath,
+                    projectName: "notification-service",
+                    gitBranch: "main",
+                    updatedAt: now.addingTimeInterval(-25),
+                    isLive: true,
+                    liveObservation: agents[1],
+                    canResumeNatively: true,
+                    nativeSteerMode: .claudeResume,
+                    liveSteerMode: .terminalTTY,
+                    lastMessageSnippet: "Waiting for Bash approval: swift test --filter NotificationDeliveryTests",
+                    turnCount: 8
+                ),
+                IndexedAgentSession(
+                    id: "opencode:\(openCodeSessionID)",
+                    provider: .openCode,
+                    agentName: "OpenCode",
+                    sessionID: openCodeSessionID,
+                    title: "Refactor customer-dashboard server routes",
+                    projectPath: web.rootPath,
+                    projectName: "customer-dashboard",
+                    gitBranch: web.gitBranch,
+                    updatedAt: now.addingTimeInterval(-190),
+                    isLive: true,
+                    liveObservation: agents[2],
+                    canResumeNatively: true,
+                    nativeSteerMode: .openCodeSession,
+                    liveSteerMode: .kittyWindow,
+                    lastMessageSnippet: "Inspecting App Router layout middleware and auth headers.",
+                    turnCount: 5
+                ),
+                IndexedAgentSession(
+                    id: "claude:hist-storage-v2",
+                    provider: .claude,
+                    agentName: "Claude Code",
+                    sessionID: "91d4a7c2-4312-4091-a211-88910e43fb12",
+                    title: "Fix Xcode DerivedData & pnpm store cleanup rules",
+                    projectPath: "/Users/yturkkan/Developer/suyoi",
+                    projectName: "suyoi",
+                    gitBranch: "next",
+                    updatedAt: now.addingTimeInterval(-2_100),
+                    isLive: false,
+                    liveObservation: nil,
+                    canResumeNatively: true,
+                    nativeSteerMode: .claudeResume,
+                    liveSteerMode: nil,
+                    lastMessageSnippet: "All 455 core tests passed; ready to resume whenever needed.",
+                    turnCount: 14
+                ),
+                IndexedAgentSession(
+                    id: "cursor:\(cursorSessionID)",
+                    provider: .cursor,
+                    agentName: "Cursor",
+                    sessionID: cursorSessionID,
+                    title: "Design system token migration for dark glass theme",
+                    projectPath: "/Users/yturkkan/Developer/design-tokens",
+                    projectName: "design-tokens",
+                    gitBranch: "feat/sequoia-glass",
+                    updatedAt: now.addingTimeInterval(-9_400),
+                    isLive: false,
+                    liveObservation: nil,
+                    canResumeNatively: false,
+                    lastMessageSnippet: "Exported updated SwiftUI color tokens and spacing scale.",
+                    turnCount: 9
+                ),
+                IndexedAgentSession(
+                    id: "gemini:\(geminiSessionID)",
+                    provider: .gemini,
+                    agentName: "Gemini CLI",
+                    sessionID: geminiSessionID,
+                    title: "Benchmark POSIX openat/fstatat vs FileManager enumerator",
+                    projectPath: "/Users/yturkkan/Developer/storage-bench",
+                    projectName: "storage-bench",
+                    gitBranch: "main",
+                    updatedAt: now.addingTimeInterval(-21_600),
+                    isLive: false,
+                    liveObservation: nil,
+                    canResumeNatively: false,
+                    lastMessageSnippet: "fstatat AT_SYMLINK_NOFOLLOW completed 180k entries in 0.41s.",
+                    turnCount: 7
+                )
+            ]
+
+            turnsBySessionID = [
+                "codex:\(codexSession)": [
+                    SessionChatTurn(
+                        id: "t1",
+                        kind: .user,
+                        text: "Unify live and historical agent sessions into a single console, and make sure provider names like Codex never truncate in the sidebar.",
+                        timestamp: now.addingTimeInterval(-340)
+                    ),
+                    SessionChatTurn(
+                        id: "t2",
+                        kind: .toolCall,
+                        text: "Sources/SuyoiCore/WorkspaceSessionIndexer.swift",
+                        toolName: "Read",
+                        toolStatus: "completed",
+                        timestamp: now.addingTimeInterval(-310)
+                    ),
+                    SessionChatTurn(
+                        id: "t3",
+                        kind: .assistant,
+                        text: "I've indexed workspace sessions across Claude Code, Codex, OpenCode, Cursor, and Gemini CLI, correlated live processes by session ID and canonical project root, and expanded the console to 920×660 with a detachable window.",
+                        timestamp: now.addingTimeInterval(-240)
+                    ),
+                    SessionChatTurn(
+                        id: "t4",
+                        kind: .user,
+                        text: "Now verify that monorepo node_modules containing 'history' and 'config' packages are marked Ready for Trash instead of blocked.",
+                        timestamp: now.addingTimeInterval(-115)
+                    ),
+                    SessionChatTurn(
+                        id: "t5",
+                        kind: .toolCall,
+                        text: "swift test --filter Phase6SessionAndStorageTests",
+                        toolName: "Bash",
+                        toolStatus: "running",
+                        timestamp: now.addingTimeInterval(-22)
+                    ),
+                    SessionChatTurn(
+                        id: "t6",
+                        kind: .assistant,
+                        text: "Replaced the over-broad substring path blocker with root-anchored sensitive path checks in DeepStorageIndexer. Running Phase6SessionAndStorageTests now to confirm Put Back recovery.",
+                        timestamp: now.addingTimeInterval(-8)
+                    )
+                ]
+            ]
+
+            let deepItems: [IndexedStorageItem] = [
+                IndexedStorageItem(
+                    path: "/Users/yturkkan/Library/Developer/Xcode/DerivedData/Suyoi-fbqpmzxlk",
+                    displayName: "DerivedData · Suyoi",
+                    subtitle: "Xcode DerivedData build intermediates & index store",
+                    projectName: "Suyoi",
+                    category: .xcodeAndSimulators,
+                    ecosystemLabel: "Xcode Build",
+                    bytes: 9_420_000_000,
+                    allocatedBytes: 9_480_000_000,
+                    fileCount: 42_180,
+                    lastModifiedAt: now.addingTimeInterval(-86_400 * 9),
+                    fileIdentity: identity,
+                    safety: .ready
+                ),
+                IndexedStorageItem(
+                    path: "/Users/yturkkan/Developer/search-engine/target",
+                    displayName: "search-engine · target",
+                    subtitle: "Rust Cargo debug & release artifacts",
+                    projectName: "search-engine",
+                    projectRootPath: "/Users/yturkkan/Developer/search-engine",
+                    category: .buildOutputs,
+                    ecosystemLabel: "Rust / Cargo",
+                    bytes: 7_850_000_000,
+                    allocatedBytes: 7_910_000_000,
+                    fileCount: 19_410,
+                    lastModifiedAt: now.addingTimeInterval(-86_400 * 18),
+                    fileIdentity: identity,
+                    safety: .ready
+                ),
+                IndexedStorageItem(
+                    path: "/Users/yturkkan/Developer/monorepo/apps/analytics-web/node_modules",
+                    displayName: "analytics-web · node_modules",
+                    subtitle: "Node / pnpm workspace dependencies",
+                    projectName: "analytics-web",
+                    projectRootPath: "/Users/yturkkan/Developer/monorepo/apps/analytics-web",
+                    category: .dependencies,
+                    ecosystemLabel: "Node / pnpm",
+                    bytes: 3_240_000_000,
+                    allocatedBytes: 3_390_000_000,
+                    fileCount: 68_920,
+                    lastModifiedAt: now.addingTimeInterval(-86_400 * 24),
+                    fileIdentity: identity,
+                    safety: .ready
+                ),
+                IndexedStorageItem(
+                    path: "/Users/yturkkan/Library/pnpm/store/v3",
+                    displayName: "pnpm Content-Addressable Store",
+                    subtitle: "Global pnpm package store cache",
+                    category: .toolchainCaches,
+                    ecosystemLabel: "pnpm Store",
+                    bytes: 4_120_000_000,
+                    allocatedBytes: 4_200_000_000,
+                    fileCount: 94_300,
+                    lastModifiedAt: now.addingTimeInterval(-86_400 * 14),
+                    fileIdentity: identity,
+                    safety: .ready
+                ),
+                IndexedStorageItem(
+                    path: "/Users/yturkkan/Developer/ml-pipeline/.venv",
+                    displayName: "ml-pipeline · .venv",
+                    subtitle: "Python virtual environment (PyTorch / uv)",
+                    projectName: "ml-pipeline",
+                    projectRootPath: "/Users/yturkkan/Developer/ml-pipeline",
+                    category: .pythonAndEnvs,
+                    ecosystemLabel: "Python venv",
+                    bytes: 3_680_000_000,
+                    allocatedBytes: 3_720_000_000,
+                    fileCount: 28_150,
+                    lastModifiedAt: now.addingTimeInterval(-86_400 * 37),
+                    fileIdentity: identity,
+                    safety: .highImpactReview(reason: "Virtual environment — recreate via uv sync or pip install -r requirements.txt")
+                ),
+                IndexedStorageItem(
+                    path: "/Users/yturkkan/Library/Caches/claude-cli-nodejs",
+                    displayName: "Claude Code · CLI Cache",
+                    subtitle: "Regenerable AI agent runtime & update cache",
+                    category: .aiAgentStorage,
+                    ecosystemLabel: "Claude Code",
+                    bytes: 1_490_000_000,
+                    allocatedBytes: 1_510_000_000,
+                    fileCount: 4_120,
+                    lastModifiedAt: now.addingTimeInterval(-86_400 * 11),
+                    fileIdentity: identity,
+                    safety: .ready
+                ),
+                IndexedStorageItem(
+                    path: web.rootPath + "/node_modules",
+                    displayName: "customer-dashboard · node_modules",
+                    subtitle: "Active Next.js workspace dependencies",
+                    projectName: "customer-dashboard",
+                    projectRootPath: web.rootPath,
+                    category: .dependencies,
+                    ecosystemLabel: "Node / pnpm",
+                    bytes: 1_820_000_000,
+                    allocatedBytes: 1_860_000_000,
+                    fileCount: 41_200,
+                    lastModifiedAt: now.addingTimeInterval(-3_600),
+                    fileIdentity: identity,
+                    safety: .inUse(processSummary: "node (PID 90104)")
+                )
+            ]
+
+            let report = StorageIndexReport(
+                items: deepItems,
+                scannedRoots: [
+                    "/Users/yturkkan/Developer",
+                    "/Users/yturkkan/Projects",
+                    "/Users/yturkkan/Code"
+                ],
+                scannedDirectories: 18_420,
+                indexedAt: now
+            )
+            storageReport = report
+            storageProgress = StorageIndexProgress(
+                isIndexing: false,
+                phase: "Complete",
+                currentPath: "",
+                scannedDirectories: 18_420,
+                discoveredCount: deepItems.count,
+                totalBytes: report.totalBytes,
+                readyBytes: report.readyBytes,
+                fractionCompleted: 1.0
+            )
+            selectedStorageItemIDs = Set(deepItems.filter { $0.safety.isRecommendedDefault }.map(\.id))
         }
     }
 }

@@ -26,6 +26,32 @@ public enum CleanupScopeFilter: String, CaseIterable, Sendable {
     case agentCaches = "Caches"
 }
 
+public enum AgentSessionScopeFilter: String, CaseIterable, Sendable {
+    case all = "All"
+    case live = "Live"
+    case history = "History"
+}
+
+public enum StorageAgeFilter: String, CaseIterable, Sendable {
+    case any = "Any Age"
+    case olderThan7d = "> 7d"
+    case olderThan30d = "> 30d"
+
+    var minimumDays: Int? {
+        switch self {
+        case .any: return nil
+        case .olderThan7d: return 7
+        case .olderThan30d: return 30
+        }
+    }
+}
+
+public enum StorageSortOrder: String, CaseIterable, Sendable {
+    case largest = "Largest"
+    case oldest = "Oldest"
+    case name = "Name"
+}
+
 public enum SettingsTab: String, CaseIterable, Sendable {
     case general = "General"
     case about = "About"
@@ -73,6 +99,7 @@ final class DashboardModel: ObservableObject {
     @Published var isShowingCleanupPreview = false
     @Published var isShowingSettings = false
     @Published var isPopoverPinned = false
+    @Published var isDetachedWindowOpen = false
     @Published var settingsTab: SettingsTab = .general
     @Published var providerOrder: [QuotaProvider]
     @Published var hiddenProviders: Set<QuotaProvider>
@@ -112,9 +139,30 @@ final class DashboardModel: ObservableObject {
     @Published private(set) var orphanToolProcesses: [OrphanToolProcess] = []
     @Published private(set) var stuckAgents: [Int: StuckAgentDiagnostic] = [:]
 
+    // Unified Session Console & Deep Storage Indexer state
+    @Published var indexedSessions: [IndexedAgentSession] = []
+    @Published var selectedIndexedSessionID: String?
+    @Published var selectedSessionTurns: [SessionChatTurn] = []
+    @Published var isLoadingSessionTurns = false
+    @Published var sessionScopeFilter: AgentSessionScopeFilter = .all
+    @Published var sessionProviderFilter: SessionProviderKind?
+    @Published var preferLiveTerminalSteer = true
+    @Published var consoleComposerText: String = ""
+
+    @Published var storageReport: StorageIndexReport?
+    @Published var storageProgress: StorageIndexProgress = .idle
+    @Published var selectedStorageCategory: StorageCategory?
+    @Published var storageAgeFilter: StorageAgeFilter = .any
+    @Published var storageSortOrder: StorageSortOrder = .largest
+    @Published var selectedStorageItemIDs: Set<String> = []
+    @Published var customStorageRoots: [URL] = []
+
+    var onToggleDetachedWindow: (() -> Void)?
+
     private static let providerOrderKey = "suyoi.quotaProviderOrder"
     private static let hiddenProvidersKey = "suyoi.hiddenQuotaProviders"
     private static let cleanupRootPathKey = "suyoi.cleanupRootPath"
+    private static let customStorageRootsKey = "suyoi.customStorageRoots"
     private static let liveQuotaEnabledKey = "suyoi.isLiveQuotaEnabled"
     private static let scanAllWorkspacesKey = "suyoi.scanAllWorkspaces"
     private static let notificationsEnabledKey = "suyoi.areNotificationsEnabled"
@@ -155,6 +203,7 @@ final class DashboardModel: ObservableObject {
     private var previousAgentStates: [Int: AgentActivityState] = [:]
     private var notifiedApprovalIDs = Set<String>()
     private var hasCompletedInitialRefresh = false
+    private var hasStartedInitialStorageIndex = false
     private var alertTracker = AlertStateTracker()
     private var burnRateTracker = QuotaBurnRateTracker()
     private var stuckAgentTracker = StuckAgentTracker()
@@ -162,6 +211,11 @@ final class DashboardModel: ObservableObject {
     private var livePollGeneration: UInt64 = 0
     private var cleanupScanTask: Task<Void, Never>?
     private var cleanupScanGeneration: UInt64 = 0
+    private var deepStorageTask: Task<Void, Never>?
+    private var deepStorageGeneration: UInt64 = 0
+    private var sessionTurnsTask: Task<Void, Never>?
+    private var sessionTurnsGeneration = UUID()
+    private var fixtureTurnsBySessionID: [String: [SessionChatTurn]] = [:]
 
     init(
         actionExecutor: any ActionExecuting = ActionExecutor(),
@@ -189,6 +243,11 @@ final class DashboardModel: ObservableObject {
             resolvedRoot = Self.defaultCleanupRoot(home: home)
         }
         self.cleanupRoot = resolvedRoot
+        if let savedCustomPaths = UserDefaults.standard.stringArray(forKey: Self.customStorageRootsKey) {
+            self.customStorageRoots = savedCustomPaths
+                .filter { $0.hasPrefix("/") && FileManager.default.fileExists(atPath: $0) }
+                .map { URL(fileURLWithPath: $0).standardizedFileURL }
+        }
         if UserDefaults.standard.object(forKey: Self.liveQuotaEnabledKey) != nil {
             self.isLiveQuotaEnabled = UserDefaults.standard.bool(forKey: Self.liveQuotaEnabledKey)
         } else {
@@ -201,11 +260,13 @@ final class DashboardModel: ObservableObject {
             resolvedScanAll = true
         }
         self.scanAllWorkspaces = resolvedScanAll
-        self.scannedWorkspaceRoots = Self.computeWorkspaceRoots(
+        self.scannedWorkspaceRoots = DeepStorageIndexer.discoverWorkspaceRoots(
+            homeDirectory: home,
             primaryRoot: resolvedRoot,
-            home: home,
-            scanAllWorkspaces: resolvedScanAll
+            customRoots: self.customStorageRoots,
+            includeAutoDetected: resolvedScanAll
         )
+        self.storageReport = DeepStorageIndexer.loadCachedReport(homeDirectory: home)
         if let savedRaw = UserDefaults.standard.stringArray(forKey: Self.providerOrderKey) {
             var restored = savedRaw.compactMap(QuotaProvider.init(rawValue:))
             for p in QuotaProvider.allCases where !restored.contains(p) {
@@ -295,7 +356,7 @@ final class DashboardModel: ObservableObject {
         appUpdater = services
         cleanupRoot = fixture.root
         isLiveQuotaEnabled = true
-        scanAllWorkspaces = false
+        scanAllWorkspaces = true
         providerOrder = QuotaProvider.allCases
         hiddenProviders = []
         areNotificationsEnabled = true
@@ -311,7 +372,7 @@ final class DashboardModel: ObservableObject {
         liveQuotas = fixture.liveQuotas
         cleanup = fixture.cleanup
         cleanupScannedAt = fixture.inventory.capturedAt
-        scannedWorkspaceRoots = [fixture.root]
+        scannedWorkspaceRoots = fixture.storageReport.scannedRoots.map { URL(fileURLWithPath: $0) }
         staleSessionLogs = fixture.staleSessionLogs
         selectedAgent = fixture.inventory.agentObservations.first
         steerContext = selectedAgent?.process.identity
@@ -319,6 +380,7 @@ final class DashboardModel: ObservableObject {
         steerSessionTargets = fixture.sessionTargets
         selectedSteerSessionID = fixture.selectedSteerSessionID
         steerPromptText = fixture.instruction
+        consoleComposerText = fixture.instruction
         pendingApprovals = fixture.approvals
         agentTurnPreviews = fixture.turnPreviews
         worktreeCollisions = fixture.worktreeCollisions
@@ -332,6 +394,15 @@ final class DashboardModel: ObservableObject {
         autoApprovedToolHistory = fixture.autoApprovedToolHistory
         customSnippets = fixture.customSnippets
         burnRateTracker = fixture.burnRateTracker
+        indexedSessions = fixture.indexedSessions
+        selectedIndexedSessionID = fixture.indexedSessions.first?.id
+        fixtureTurnsBySessionID = fixture.turnsBySessionID
+        if let firstID = fixture.indexedSessions.first?.id {
+            selectedSessionTurns = fixture.turnsBySessionID[firstID] ?? []
+        }
+        storageReport = fixture.storageReport
+        storageProgress = fixture.storageProgress
+        selectedStorageItemIDs = fixture.selectedStorageItemIDs
     }
 #endif
 
@@ -544,12 +615,13 @@ final class DashboardModel: ObservableObject {
     func setScanAllWorkspaces(_ enabled: Bool) {
         scanAllWorkspaces = enabled
         UserDefaults.standard.set(enabled, forKey: Self.scanAllWorkspacesKey)
-        scannedWorkspaceRoots = Self.computeWorkspaceRoots(
+        scannedWorkspaceRoots = DeepStorageIndexer.discoverWorkspaceRoots(
+            homeDirectory: homeDirectory,
             primaryRoot: cleanupRoot,
-            home: homeDirectory,
-            scanAllWorkspaces: enabled
+            customRoots: customStorageRoots,
+            includeAutoDetected: enabled
         )
-        scanCleanup(forceRestart: true)
+        startDeepStorageScan(force: true)
     }
 
     func chooseCleanupRoot() {
@@ -567,26 +639,28 @@ final class DashboardModel: ObservableObject {
         if panel.runModal() == .OK, let selected = panel.url?.standardizedFileURL {
             cleanupRoot = selected
             UserDefaults.standard.set(selected.path, forKey: Self.cleanupRootPathKey)
-            scannedWorkspaceRoots = Self.computeWorkspaceRoots(
+            scannedWorkspaceRoots = DeepStorageIndexer.discoverWorkspaceRoots(
+                homeDirectory: homeDirectory,
                 primaryRoot: selected,
-                home: homeDirectory,
-                scanAllWorkspaces: scanAllWorkspaces
+                customRoots: customStorageRoots,
+                includeAutoDetected: scanAllWorkspaces
             )
             showBanner("Updated scan folder to \(cleanupRootDisplayPath)")
-            scanCleanup(forceRestart: true)
+            startDeepStorageScan(force: true)
         }
     }
 
     func resetCleanupRootFolder() {
         UserDefaults.standard.removeObject(forKey: Self.cleanupRootPathKey)
         cleanupRoot = Self.defaultCleanupRoot(home: homeDirectory)
-        scannedWorkspaceRoots = Self.computeWorkspaceRoots(
+        scannedWorkspaceRoots = DeepStorageIndexer.discoverWorkspaceRoots(
+            homeDirectory: homeDirectory,
             primaryRoot: cleanupRoot,
-            home: homeDirectory,
-            scanAllWorkspaces: scanAllWorkspaces
+            customRoots: customStorageRoots,
+            includeAutoDetected: scanAllWorkspaces
         )
         showBanner("Reset scan folder to \(cleanupRootDisplayPath)")
-        scanCleanup(forceRestart: true)
+        startDeepStorageScan(force: true)
     }
 
     private func saveQuotaPreferences() {
@@ -633,10 +707,12 @@ final class DashboardModel: ObservableObject {
         let currentQuotaInspector = quotaInspector
         let previewInspector = turnPreviewInspector
         let diffInspector = worktreeDiffInspector
+        let sessionIndexer = WorkspaceSessionIndexer(homeDirectory: homeDirectory)
+        let home = homeDirectory
         let currentUID = Int(getuid())
         Task {
             async let invResult = Task.detached(priority: .utility) {
-                () -> (InventorySnapshot, [Int: SessionTurnPreview], [String: WorktreeDiffSummary], [OrphanToolProcess]) in
+                () -> (InventorySnapshot, [Int: SessionTurnPreview], [String: WorktreeDiffSummary], [OrphanToolProcess], [IndexedAgentSession]) in
                 let snap = currentInspector.snapshot()
                 var previews: [Int: SessionTurnPreview] = [:]
                 for obs in snap.agentObservations {
@@ -646,14 +722,29 @@ final class DashboardModel: ObservableObject {
                 }
                 let diffs = diffInspector.inspectActiveProjects(for: snap.agentObservations)
                 let orphans = ProcessHealthAdvisor.detectOrphanToolProcesses(in: snap, uid: currentUID)
-                return (snap, previews, diffs, orphans)
+                let sessions = sessionIndexer.indexSessions(liveAgents: snap.agentObservations, allProcesses: snap.processes)
+                return (snap, previews, diffs, orphans, sessions)
             }.value
             async let quotaResult = Task.detached(priority: .utility) { currentQuotaInspector.inspectQuotas(at: Date()) }.value
-            let ((newSnapshot, newPreviews, newDiffs, newOrphans), newQuotas) = await (invResult, quotaResult)
+            let ((newSnapshot, newPreviews, newDiffs, newOrphans, newSessions), newQuotas) = await (invResult, quotaResult)
             snapshot = newSnapshot
             agentTurnPreviews = newPreviews
             worktreeDiffs = newDiffs
             orphanToolProcesses = newOrphans
+            indexedSessions = newSessions
+            if selectedIndexedSessionID == nil || !newSessions.contains(where: { $0.id == selectedIndexedSessionID }) {
+                if let firstSession = newSessions.first {
+                    selectedIndexedSessionID = firstSession.id
+                    preferLiveTerminalSteer = firstSession.canSteerInLiveTerminal
+                }
+            }
+            reloadSelectedSessionTurns()
+            if let existingStorage = storageReport, !storageProgress.isIndexing {
+                storageReport = DeepStorageIndexer(homeDirectory: home).refreshSafetyStates(
+                    in: existingStorage,
+                    liveProcesses: newSnapshot.processes
+                )
+            }
             let currentAgents = agentRows
             worktreeCollisions = AgentCollisionDetector.detectCollisions(in: currentAgents)
             stuckAgents = stuckAgentTracker.evaluate(agents: currentAgents, turnPreviews: newPreviews)
@@ -668,6 +759,10 @@ final class DashboardModel: ObservableObject {
             evaluateAndDeliverAlerts()
             if isLiveQuotaEnabled {
                 pollLiveQuotas(trigger: .automatic)
+            }
+            if !hasStartedInitialStorageIndex {
+                hasStartedInitialStorageIndex = true
+                startDeepStorageScan(force: false)
             }
         }
     }
@@ -2025,9 +2120,439 @@ final class DashboardModel: ObservableObject {
             if outcome.restored {
                 let name = URL(fileURLWithPath: item.originalPath).lastPathComponent
                 showBanner("Restored \(name) to \(shortenPathForBanner(item.originalPath))")
-                scanCleanup(forceRestart: true)
+                startDeepStorageScan(force: true)
             } else {
                 showBanner(outcome.error ?? "Could not restore item from Trash", isError: true)
+            }
+        }
+    }
+
+    // MARK: - Unified Session Console (Live + Historical Sessions & Multi-Turn Stream)
+
+    var liveSessionsCount: Int {
+        indexedSessions.filter(\.isLive).count
+    }
+
+    var historySessionsCount: Int {
+        indexedSessions.filter { !$0.isLive }.count
+    }
+
+    var filteredIndexedSessions: [IndexedAgentSession] {
+        let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return indexedSessions.filter { session in
+            switch sessionScopeFilter {
+            case .all: break
+            case .live: if !session.isLive { return false }
+            case .history: if session.isLive { return false }
+            }
+            if let provider = sessionProviderFilter, session.provider != provider {
+                return false
+            }
+            guard !trimmedQuery.isEmpty else { return true }
+            let haystacks = [
+                session.title,
+                session.agentName,
+                session.projectName,
+                session.projectPath ?? "",
+                session.gitBranch ?? "",
+                session.sessionID ?? "",
+                session.lastMessageSnippet ?? "",
+                session.liveObservation.map { String($0.process.pid) } ?? ""
+            ]
+            return haystacks.contains { $0.lowercased().contains(trimmedQuery) }
+        }
+    }
+
+    var activeSelectedSession: IndexedAgentSession? {
+        if let selectedID = selectedIndexedSessionID,
+           let matched = filteredIndexedSessions.first(where: { $0.id == selectedID }) {
+            return matched
+        }
+        return filteredIndexedSessions.first
+    }
+
+    func selectIndexedSession(_ session: IndexedAgentSession) {
+        let changed = selectedIndexedSessionID != session.id
+        selectedIndexedSessionID = session.id
+        selectedAgent = session.liveObservation
+        if changed {
+            preferLiveTerminalSteer = session.canSteerInLiveTerminal
+            reloadSelectedSessionTurns()
+        }
+    }
+
+    func reloadSelectedSessionTurns() {
+        guard let session = activeSelectedSession ?? indexedSessions.first(where: { $0.id == selectedIndexedSessionID }) else {
+            selectedSessionTurns = []
+            isLoadingSessionTurns = false
+            return
+        }
+        if inspector == nil {
+            selectedSessionTurns = fixtureTurnsBySessionID[session.id] ?? []
+            isLoadingSessionTurns = false
+            return
+        }
+        sessionTurnsTask?.cancel()
+        let gen = UUID()
+        sessionTurnsGeneration = gen
+        isLoadingSessionTurns = true
+        let home = homeDirectory
+        let procs = snapshot?.processes ?? []
+        sessionTurnsTask = Task {
+            let turns = await Task.detached(priority: .userInitiated) {
+                WorkspaceSessionIndexer(homeDirectory: home).loadConversationTurns(
+                    for: session,
+                    allProcesses: procs,
+                    maxTurns: 75
+                )
+            }.value
+            guard !Task.isCancelled, sessionTurnsGeneration == gen else { return }
+            selectedSessionTurns = turns
+            isLoadingSessionTurns = false
+        }
+    }
+
+    func applySnippetToConsole(_ snippet: SteeringSnippet) {
+        if consoleComposerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            consoleComposerText = snippet.prompt
+        } else {
+            consoleComposerText += "\n" + snippet.prompt
+        }
+    }
+
+    func canSendConsoleInstruction(to session: IndexedAgentSession) -> Bool {
+        guard !isSteering,
+              !consoleComposerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        if preferLiveTerminalSteer && session.canSteerInLiveTerminal {
+            return true
+        }
+        return session.canResumeNatively || session.canSteerInLiveTerminal
+    }
+
+    func sendConsoleInstruction(to session: IndexedAgentSession) {
+        guard canSendConsoleInstruction(to: session) else { return }
+        let expanded = SteeringSnippetCatalog.expand(consoleComposerText, snippets: allSteeringSnippets)
+        let trimmed = expanded.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let useLiveTTY = preferLiveTerminalSteer && session.canSteerInLiveTerminal
+        isSteering = true
+        let steerer = agentSteerer
+        let uid = Int(getuid())
+
+        // Optimistically show user's instruction in the conversation stream
+        let optimisticTurn = SessionChatTurn(
+            id: "optimistic-\(UUID().uuidString)",
+            kind: .user,
+            text: trimmed,
+            timestamp: Date()
+        )
+        selectedSessionTurns.append(optimisticTurn)
+
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) {
+                steerer.steerIndexedSession(
+                    session: session,
+                    prompt: trimmed,
+                    preferLiveTerminal: useLiveTTY,
+                    uid: uid
+                )
+            }.value
+            isSteering = false
+            if let launcher = nativeJobLauncher {
+                continuationJobs = launcher.recentJobs()
+            }
+            if outcome.succeeded {
+                consoleComposerText = ""
+                showBanner(outcome.detail ?? "Sent instruction to \(session.agentName)")
+                try? await Task.sleep(nanoseconds: 450_000_000)
+                refresh()
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                reloadSelectedSessionTurns()
+            } else {
+                selectedSessionTurns.removeAll { $0.id == optimisticTurn.id }
+                showBanner(outcome.error ?? "Could not send instruction to \(session.agentName)", isError: true)
+            }
+        }
+    }
+
+    func activeContinuationJobs(for session: IndexedAgentSession) -> [NativeContinuationJob] {
+        continuationJobs.filter { job in
+            if let sid = session.sessionID, !sid.isEmpty, job.sessionID == sid {
+                return true
+            }
+            if let obs = session.liveObservation, job.agentID == obs.id {
+                return true
+            }
+            return false
+        }
+    }
+
+    // MARK: - Deep Background Storage Indexer & Cleanup
+
+    var filteredStorageItems: [IndexedStorageItem] {
+        guard let report = storageReport else { return [] }
+        let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let now = Date()
+
+        let filtered = report.items.filter { item in
+            if let cat = selectedStorageCategory, item.category != cat {
+                return false
+            }
+            if let minDays = storageAgeFilter.minimumDays {
+                guard let age = item.ageDays(from: now), age >= minDays else {
+                    return false
+                }
+            }
+            guard !trimmedQuery.isEmpty else { return true }
+            return item.displayName.lowercased().contains(trimmedQuery)
+                || item.subtitle.lowercased().contains(trimmedQuery)
+                || item.path.lowercased().contains(trimmedQuery)
+                || item.category.rawValue.lowercased().contains(trimmedQuery)
+        }
+
+        switch storageSortOrder {
+        case .largest:
+            return filtered.sorted { $0.bytes != $1.bytes ? $0.bytes > $1.bytes : $0.path < $1.path }
+        case .oldest:
+            return filtered.sorted {
+                let l = $0.lastModifiedAt ?? .distantFuture
+                let r = $1.lastModifiedAt ?? .distantFuture
+                return l != r ? l < r : $0.bytes > $1.bytes
+            }
+        case .name:
+            return filtered.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+        }
+    }
+
+    var recommendedStorageItems: [IndexedStorageItem] {
+        filteredStorageItems.filter { $0.safety.isRecommendedDefault }
+    }
+
+    var selectedStorageItems: [IndexedStorageItem] {
+        guard let report = storageReport else { return [] }
+        return report.items.filter { selectedStorageItemIDs.contains($0.id) && $0.safety.isCleanable }
+    }
+
+    var selectedStorageBytes: Int64 {
+        selectedStorageItems.reduce(0) { $0 + $1.bytes }
+    }
+
+    func isStorageItemSelected(_ item: IndexedStorageItem) -> Bool {
+        selectedStorageItemIDs.contains(item.id)
+    }
+
+    func toggleStorageItemSelection(_ item: IndexedStorageItem) {
+        guard item.safety.isCleanable else { return }
+        if selectedStorageItemIDs.contains(item.id) {
+            selectedStorageItemIDs.remove(item.id)
+        } else {
+            selectedStorageItemIDs.insert(item.id)
+        }
+    }
+
+    func toggleSelectRecommendedStorageItems() {
+        let recommendedIDs = recommendedStorageItems.map(\.id)
+        guard !recommendedIDs.isEmpty else { return }
+        if recommendedIDs.allSatisfy({ selectedStorageItemIDs.contains($0) }) {
+            selectedStorageItemIDs.subtract(recommendedIDs)
+        } else {
+            selectedStorageItemIDs.formUnion(recommendedIDs)
+        }
+    }
+
+    func clearStorageSelection() {
+        selectedStorageItemIDs.removeAll()
+    }
+
+    func addCustomStorageRoot() {
+        let panel = NSOpenPanel()
+        panel.title = "Add Workspace Folders to Deep Storage Indexer"
+        panel.message = "Select one or more developer folders or monorepos to index for build & dependency cleanup."
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.directoryURL = homeDirectory
+        guard panel.runModal() == .OK else { return }
+
+        var changed = false
+        for rawURL in panel.urls {
+            let clean = rawURL.standardizedFileURL.resolvingSymlinksInPath()
+            if !customStorageRoots.contains(clean) && clean.path != "/" && clean.path != homeDirectory.path {
+                customStorageRoots.append(clean)
+                changed = true
+            }
+        }
+        guard changed else { return }
+        UserDefaults.standard.set(customStorageRoots.map(\.path), forKey: Self.customStorageRootsKey)
+        scannedWorkspaceRoots = DeepStorageIndexer.discoverWorkspaceRoots(
+            homeDirectory: homeDirectory,
+            primaryRoot: cleanupRoot,
+            customRoots: customStorageRoots,
+            includeAutoDetected: scanAllWorkspaces
+        )
+        showBanner("Added folder to storage index — rescanning…")
+        startDeepStorageScan(force: true)
+    }
+
+    func removeCustomStorageRoot(_ url: URL) {
+        customStorageRoots.removeAll { $0.standardizedFileURL.path == url.standardizedFileURL.path }
+        UserDefaults.standard.set(customStorageRoots.map(\.path), forKey: Self.customStorageRootsKey)
+        scannedWorkspaceRoots = DeepStorageIndexer.discoverWorkspaceRoots(
+            homeDirectory: homeDirectory,
+            primaryRoot: cleanupRoot,
+            customRoots: customStorageRoots,
+            includeAutoDetected: scanAllWorkspaces
+        )
+        startDeepStorageScan(force: true)
+    }
+
+    func cancelDeepStorageScan() {
+        deepStorageGeneration &+= 1
+        deepStorageTask?.cancel()
+        deepStorageTask = nil
+        isScanning = false
+        storageProgress = .idle
+    }
+
+    func startDeepStorageScan(force: Bool = false) {
+        guard inspector != nil else { return }
+        if storageProgress.isIndexing && !force {
+            return
+        }
+        deepStorageTask?.cancel()
+        deepStorageGeneration &+= 1
+        let gen = deepStorageGeneration
+        isScanning = true
+
+        let home = homeDirectory
+        let roots = DeepStorageIndexer.discoverWorkspaceRoots(
+            homeDirectory: home,
+            primaryRoot: cleanupRoot,
+            customRoots: customStorageRoots,
+            includeAutoDetected: scanAllWorkspaces
+        )
+        scannedWorkspaceRoots = roots
+        let liveProcs = snapshot?.processes ?? []
+        let activeAgents = agentRows
+        let retentionDays = sessionLogRetentionDays
+
+        storageProgress = StorageIndexProgress(
+            isIndexing: true,
+            phase: "Starting deep storage scan…",
+            currentPath: roots.first?.path ?? home.path,
+            scannedDirectories: 0,
+            discoveredCount: 0,
+            totalBytes: 0,
+            readyBytes: 0,
+            fractionCompleted: 0.02
+        )
+
+        deepStorageTask = Task {
+            let (report, agedLogs) = await Task.detached(priority: .utility) {
+                () -> (StorageIndexReport, [StaleSessionLogSummary]) in
+                let indexer = DeepStorageIndexer(homeDirectory: home)
+                let built = indexer.indexAll(
+                    workspaceRoots: roots,
+                    includeSystemAndAgentCaches: true,
+                    liveProcesses: liveProcs,
+                    isCancelled: { Task.isCancelled },
+                    onProgress: { progress in
+                        Task { @MainActor in
+                            guard self.deepStorageGeneration == gen else { return }
+                            self.storageProgress = progress
+                        }
+                    }
+                )
+                if !Task.isCancelled {
+                    DeepStorageIndexer.saveCachedReport(built, homeDirectory: home)
+                }
+                let logs = SessionLogRetentionScanner(homeDirectory: home)
+                    .scanStaleSessionLogs(olderThanDays: retentionDays, activeAgents: activeAgents)
+                return (built, logs)
+            }.value
+
+            guard !Task.isCancelled, deepStorageGeneration == gen else { return }
+            storageReport = report
+            staleSessionLogs = agedLogs
+            let validIDs = Set(report.items.map(\.id))
+            selectedStorageItemIDs = selectedStorageItemIDs.intersection(validIDs)
+            cleanupScannedAt = report.indexedAt
+            isScanning = false
+            storageProgress = StorageIndexProgress(
+                isIndexing: false,
+                phase: "Complete",
+                currentPath: "",
+                scannedDirectories: report.scannedDirectories,
+                discoveredCount: report.items.count,
+                totalBytes: report.totalBytes,
+                readyBytes: report.readyBytes,
+                fractionCompleted: 1.0
+            )
+        }
+    }
+
+    func trashStorageItem(_ item: IndexedStorageItem) {
+        executeDeepTrash([item])
+    }
+
+    func trashSelectedStorageItems() {
+        let targets = selectedStorageItems
+        guard !targets.isEmpty else { return }
+        executeDeepTrash(targets)
+    }
+
+    private func executeDeepTrash(_ items: [IndexedStorageItem]) {
+        guard !isPerformingAction, !items.isEmpty else { return }
+        isPerformingAction = true
+        let home = homeDirectory
+        let itemsByID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+
+        Task {
+            let report = await Task.detached(priority: .userInitiated) {
+                let freshProcs = NativeProcessInspector().inspectProcesses(uid: Int(getuid())).value
+                return DeepStorageIndexer(homeDirectory: home).moveItemsToTrash(items, liveProcesses: freshProcs)
+            }.value
+
+            isPerformingAction = false
+            var succeededPaths = Set<String>()
+
+            for outcome in report.outcomes where outcome.succeeded {
+                succeededPaths.insert(outcome.path)
+                if let trashedPath = outcome.trashedURL {
+                    let sourceItem = itemsByID[outcome.candidateID]
+                    trashRecoveryStore.record(
+                        originalPath: outcome.path,
+                        trashedURL: URL(fileURLWithPath: trashedPath),
+                        category: sourceItem?.category.rawValue ?? "Developer Artifact",
+                        bytes: outcome.bytes,
+                        recovery: outcome.recovery
+                    )
+                }
+            }
+            trashedHistory = trashRecoveryStore.records()
+            selectedStorageItemIDs.subtract(succeededPaths)
+
+            if let existing = storageReport, !succeededPaths.isEmpty {
+                let remaining = existing.items.filter { !succeededPaths.contains($0.path) }
+                let updated = StorageIndexReport(
+                    items: remaining,
+                    scannedRoots: existing.scannedRoots,
+                    scannedDirectories: existing.scannedDirectories,
+                    indexedAt: Date()
+                )
+                storageReport = updated
+                DeepStorageIndexer.saveCachedReport(updated, homeDirectory: home)
+            }
+
+            if report.trashedCount > 0 {
+                let sizeText = ByteCountFormatter.string(fromByteCount: report.reclaimedBytes, countStyle: .file)
+                showBanner("Moved \(report.trashedCount) item\(report.trashedCount == 1 ? "" : "s") (\(sizeText)) to macOS Trash")
+            } else {
+                let err = report.outcomes.first?.error ?? "Could not move selected items to Trash"
+                showBanner(err, isError: true)
             }
         }
     }

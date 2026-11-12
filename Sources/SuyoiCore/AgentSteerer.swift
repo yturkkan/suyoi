@@ -557,12 +557,18 @@ public struct AgentSteerer: AgentSteering, Sendable {
     }
 
     private func resolve(_ name: String, agent: AgentObservation) -> String? {
+        resolveCLIExecutable(name, preferredExecutable: agent.process.executable)
+    }
+
+    private func resolveCLIExecutable(_ name: String, preferredExecutable: String? = nil) -> String? {
         if let executableResolver {
             guard let path = executableResolver(name), path.hasPrefix("/"), URL(fileURLWithPath: path).lastPathComponent == name else { return nil }
             return path
         }
         var candidates: [String] = []
-        if agent.process.executable.hasSuffix("/" + name) { candidates.append(agent.process.executable) }
+        if let preferredExecutable, preferredExecutable.hasSuffix("/" + name) {
+            candidates.append(preferredExecutable)
+        }
         candidates += ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
         if name == "claude" {
             candidates.append(homeDirectory.appendingPathComponent(".claude/local/claude").path)
@@ -575,6 +581,148 @@ public struct AgentSteerer: AgentSteering, Sendable {
             candidates.append(URL(fileURLWithPath: String(dir)).appendingPathComponent(name).path)
         }
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    static func cleanMultilinePrompt(_ prompt: String) -> String? {
+        let normalized = prompt
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var scalars = String.UnicodeScalarView()
+        for scalar in normalized.unicodeScalars {
+            if scalar == "\n" || scalar == "\t" || !CharacterSet.controlCharacters.contains(scalar) {
+                scalars.append(scalar)
+            }
+        }
+        let cleaned = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (!cleaned.isEmpty && cleaned.count <= 4_000) ? cleaned : nil
+    }
+
+    public func steerIndexedSession(
+        session: IndexedAgentSession,
+        prompt: String,
+        preferLiveTerminal: Bool = true,
+        uid: Int = Int(getuid())
+    ) -> AgentSteerOutcome {
+        if preferLiveTerminal,
+           let obs = session.liveObservation,
+           let liveMode = Self.preferredMode(for: obs),
+           liveMode.isLiveTerminalDelivery {
+            return steer(agent: obs, prompt: prompt, uid: uid)
+        }
+
+        let agentID = session.liveObservation?.id ?? 0
+        guard let mode = session.nativeSteerMode, session.canResumeNatively else {
+            if let obs = session.liveObservation {
+                return steer(agent: obs, prompt: prompt, uid: uid)
+            }
+            return AgentSteerOutcome(
+                agentID: agentID,
+                mode: session.liveSteerMode ?? .claudeResume,
+                succeeded: false,
+                error: "This session does not support background CLI continuation"
+            )
+        }
+
+        func failure(_ error: String) -> AgentSteerOutcome {
+            AgentSteerOutcome(agentID: agentID, mode: mode, succeeded: false, error: error)
+        }
+
+        guard uid == Int(getuid()) else {
+            return failure("User identity mismatch for local session continuation")
+        }
+        guard let clean = Self.cleanMultilinePrompt(prompt) else {
+            return failure("Instruction must contain 1 to 4000 characters")
+        }
+        guard let rawSessionID = session.sessionID,
+              let validSessionID = AgentContextValidation.sessionID(rawSessionID) else {
+            return failure("Session identifier is missing or invalid")
+        }
+        guard let rawProjectPath = session.projectPath,
+              rawProjectPath.hasPrefix("/"),
+              rawProjectPath != "/" else {
+            return failure("Workspace folder is unavailable for this session")
+        }
+
+        let projectURL = URL(fileURLWithPath: rawProjectPath, isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let homeResolved = homeDirectory.resolvingSymlinksInPath().standardizedFileURL.path
+        var isDir: ObjCBool = false
+        guard projectURL.path != "/",
+              projectURL.path != homeResolved,
+              FileManager.default.fileExists(atPath: projectURL.path, isDirectory: &isDir),
+              isDir.boolValue else {
+            return failure("Workspace directory no longer exists on disk")
+        }
+
+        let cliName: String
+        switch mode {
+        case .claudeResume:
+            guard UUID(uuidString: validSessionID) != nil else {
+                return failure("Claude Code session ID must be a valid UUID")
+            }
+            cliName = "claude"
+        case .codexResume:
+            guard UUID(uuidString: validSessionID) != nil else {
+                return failure("Codex session ID must be a valid UUID")
+            }
+            cliName = "codex"
+        case .openCodeSession:
+            guard validSessionID.hasPrefix("ses_") else {
+                return failure("OpenCode session ID is invalid")
+            }
+            cliName = "opencode"
+        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
+            return failure("Invalid continuation mode")
+        }
+
+        guard let executable = resolveCLIExecutable(cliName, preferredExecutable: session.liveObservation?.process.executable) else {
+            return failure("\(session.agentName) CLI executable was not found in PATH or standard install locations")
+        }
+
+        let catalog = NativeSessionCatalog(homeDirectory: homeDirectory)
+        let arguments: [String]
+        switch mode {
+        case .claudeResume:
+            arguments = ["--print", "--resume", validSessionID, "--", clean]
+        case .codexResume:
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.withoutEscapingSlashes]
+            guard let bytes = try? encoder.encode(catalog.codexHome.path),
+                  let quotedHome = String(data: bytes, encoding: .utf8) else {
+                return failure("Codex home path could not be encoded")
+            }
+            arguments = ["exec", "-c", "sqlite_home=" + quotedHome, "resume", validSessionID, "--", clean]
+        case .openCodeSession:
+            arguments = ["--standalone", "run", "--session", validSessionID, "--", clean]
+        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
+            return failure("Invalid continuation mode")
+        }
+
+        let metadata = NativeContinuationMetadata(
+            agentID: agentID,
+            agentName: session.agentName,
+            sessionID: validSessionID,
+            projectPath: projectURL.path
+        )
+        do {
+            try nativeJobLauncher.launch(
+                executable: executable,
+                arguments: arguments,
+                workingDirectory: projectURL,
+                metadata: metadata
+            )
+            return AgentSteerOutcome(
+                agentID: agentID,
+                mode: mode,
+                succeeded: true,
+                detail: "Resumed \(session.agentName) session in \(projectURL.lastPathComponent)"
+            )
+        } catch let NativeAgentJobLauncher.Error.startupExited(code) {
+            return failure("\(session.agentName) exited immediately (code \(code)). Check CLI login or session status.")
+        } catch {
+            return failure("Unable to launch \(session.agentName) continuation process")
+        }
     }
 
     // Fixed scripts: all untrusted values arrive via argv. Count matches before sending.
