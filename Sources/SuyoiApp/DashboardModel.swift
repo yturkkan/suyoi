@@ -243,11 +243,15 @@ final class DashboardModel: ObservableObject {
             resolvedRoot = Self.defaultCleanupRoot(home: home)
         }
         self.cleanupRoot = resolvedRoot
+        let resolvedCustomRoots: [URL]
         if let savedCustomPaths = UserDefaults.standard.stringArray(forKey: Self.customStorageRootsKey) {
-            self.customStorageRoots = savedCustomPaths
+            resolvedCustomRoots = savedCustomPaths
                 .filter { $0.hasPrefix("/") && FileManager.default.fileExists(atPath: $0) }
                 .map { URL(fileURLWithPath: $0).standardizedFileURL }
+        } else {
+            resolvedCustomRoots = []
         }
+        self.customStorageRoots = resolvedCustomRoots
         if UserDefaults.standard.object(forKey: Self.liveQuotaEnabledKey) != nil {
             self.isLiveQuotaEnabled = UserDefaults.standard.bool(forKey: Self.liveQuotaEnabledKey)
         } else {
@@ -263,7 +267,7 @@ final class DashboardModel: ObservableObject {
         self.scannedWorkspaceRoots = DeepStorageIndexer.discoverWorkspaceRoots(
             homeDirectory: home,
             primaryRoot: resolvedRoot,
-            customRoots: self.customStorageRoots,
+            customRoots: resolvedCustomRoots,
             includeAutoDetected: resolvedScanAll
         )
         self.storageReport = DeepStorageIndexer.loadCachedReport(homeDirectory: home)
