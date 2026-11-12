@@ -536,10 +536,10 @@ struct Phase6SessionAndStorageTests {
             process: procWithNewID,
             project: ProjectContext(rootPath: repoDir.path, name: "billing-service", framework: nil, gitBranch: "main", gitCommit: nil, isWorktree: false),
             terminalApp: "Terminal",
-            sessionID: "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb",
             statusSource: .processOnly,
             childServerPorts: [],
-            activityState: .idle
+            activityState: .idle,
+            sessionID: "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb"
         )
         let res1 = indexer.indexSessions(liveAgents: [obsWithNewID], allProcesses: [procWithNewID])
         #expect(res1.count == 2)
