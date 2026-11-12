@@ -857,10 +857,11 @@ enum DashboardFixture {
                     projectPath: "/Users/yturkkan/Developer/storage-bench",
                     projectName: "storage-bench",
                     gitBranch: "main",
-                    updatedAt: now.addingTimeInterval(-21_600),
+                    updatedAt: now.addingTimeInterval(-120),
                     isLive: false,
                     liveObservation: nil,
-                    canResumeNatively: false,
+                    canResumeNatively: true,
+                    nativeSteerMode: .geminiResume,
                     lastMessageSnippet: "fstatat AT_SYMLINK_NOFOLLOW completed 180k entries in 0.41s.",
                     turnCount: 7
                 )

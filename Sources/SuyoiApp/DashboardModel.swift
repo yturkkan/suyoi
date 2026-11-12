@@ -147,8 +147,16 @@ final class DashboardModel: ObservableObject {
     @Published var isLoadingSessionTurns = false
     @Published var sessionScopeFilter: AgentSessionScopeFilter = .all
     @Published var sessionProviderFilter: SessionProviderKind?
-    @Published var preferLiveTerminalSteer = true
+    @Published var preferLiveTerminalSteer = false
     @Published var consoleComposerText: String = ""
+    @Published var isCreatingNewChat = false
+    @Published var newChatProvider: SessionProviderKind = .codex
+    @Published var newChatProjectPath: String?
+    @Published private(set) var installedChatProviders: [SessionProviderKind] = AgentChatStreamRunner.supportedChatProviders
+    @Published private(set) var recentWorkspacePaths: [String] = []
+    @Published private(set) var streamingSessionID: String?
+    @Published private(set) var streamingStatusText: String?
+    @Published private(set) var chatStreamErrorText: String?
 
     @Published var storageReport: StorageIndexReport?
     @Published var storageProgress: StorageIndexProgress = .idle
@@ -190,6 +198,7 @@ final class DashboardModel: ObservableObject {
     private let liveQuotaPoller: any LiveQuotaPolling
     private let agentSteerer: any AgentSteering
     private let nativeJobLauncher: NativeAgentJobLauncher?
+    private let chatStreamRunner: AgentChatStreamRunner
     private let worktreeDiffInspector = WorktreeDiffInspector()
     private var steerSessionGeneration = UUID()
     private var steerContext: ProcessIdentity?
@@ -235,6 +244,12 @@ final class DashboardModel: ObservableObject {
     private var deepStorageGeneration: UInt64 = 0
     private var sessionTurnsTask: Task<Void, Never>?
     private var sessionTurnsGeneration = UUID()
+    private var activeChatRunID: UUID?
+    private var activeStreamToken: UUID?
+    private var activeStreamSessionKey: String?
+    private var liveTailTask: Task<Void, Never>?
+    private var inAppCreatedSessions: [IndexedAgentSession] = []
+    private var streamedTurnsBySessionID: [String: [SessionChatTurn]] = [:]
     #if DEBUG
     private var fixtureTurnsBySessionID: [String: [SessionChatTurn]] = [:]
     #endif
@@ -254,6 +269,7 @@ final class DashboardModel: ObservableObject {
         self.homeDirectory = home
         let sharedLauncher = NativeAgentJobLauncher(homeDirectory: home)
         self.nativeJobLauncher = sharedLauncher
+        self.chatStreamRunner = AgentChatStreamRunner(homeDirectory: home)
         self.agentSteerer = agentSteerer ?? AgentSteerer(homeDirectory: home, nativeJobLauncher: sharedLauncher)
         self.appUpdater = appUpdater
         let resolvedRoot: URL
@@ -367,6 +383,26 @@ final class DashboardModel: ObservableObject {
         }
         self.approvalInboxWatcher = watcher
         watcher.start()
+
+        let defaultRootPath = resolvedRoot.path
+        Task { [weak self] in
+            let (installed, workspaces) = await Task.detached(priority: .utility) {
+                let providers = AgentChatStreamRunner.installedChatProviders(homeDirectory: home)
+                let dirs = WorkspaceSessionIndexer(homeDirectory: home).discoverWorkspaceDirectories(additionalPaths: [defaultRootPath])
+                return (providers, dirs)
+            }.value
+            guard let self else { return }
+            if !installed.isEmpty {
+                self.installedChatProviders = installed
+                if !installed.contains(self.newChatProvider), let first = installed.first {
+                    self.newChatProvider = first
+                }
+            }
+            self.recentWorkspacePaths = workspaces
+            if self.newChatProjectPath == nil {
+                self.newChatProjectPath = workspaces.first ?? defaultRootPath
+            }
+        }
     }
 
 #if DEBUG
@@ -379,6 +415,7 @@ final class DashboardModel: ObservableObject {
         liveQuotaPoller = services
         agentSteerer = services
         nativeJobLauncher = nil
+        chatStreamRunner = AgentChatStreamRunner(homeDirectory: fixture.root)
         appUpdater = services
         cleanupRoot = fixture.root
         isLiveQuotaEnabled = true
@@ -422,6 +459,10 @@ final class DashboardModel: ObservableObject {
         burnRateTracker = fixture.burnRateTracker
         indexedSessions = fixture.indexedSessions
         selectedIndexedSessionID = fixture.indexedSessions.first?.id
+        preferLiveTerminalSteer = false
+        installedChatProviders = [.codex, .gemini, .openCode, .claude]
+        recentWorkspacePaths = Array(Set(fixture.indexedSessions.compactMap(\.projectPath))).sorted()
+        newChatProjectPath = fixture.indexedSessions.first?.projectPath ?? fixture.root.path
         fixtureTurnsBySessionID = fixture.turnsBySessionID
         if let firstID = fixture.indexedSessions.first?.id {
             selectedSessionTurns = fixture.turnsBySessionID[firstID] ?? []
@@ -820,7 +861,8 @@ final class DashboardModel: ObservableObject {
                     worktreeDiffs = newDiffs
                 }
                 if let newSessions = payload.sessions {
-                    indexedSessions = newSessions
+                    indexedSessions = mergeInAppSessions(into: newSessions)
+                    syncRecentWorkspacePathsFromSessions()
                 }
                 if let newQuotas = payload.quotas {
                     quotaSnapshot = newQuotas
@@ -858,14 +900,15 @@ final class DashboardModel: ObservableObject {
             if selectedIndexedSessionID == nil || !indexedSessions.contains(where: { $0.id == selectedIndexedSessionID }) {
                 if let firstSession = indexedSessions.first {
                     selectedIndexedSessionID = firstSession.id
-                    preferLiveTerminalSteer = firstSession.canSteerInLiveTerminal
+                    preferLiveTerminalSteer = defaultPreferLiveTerminalSteer(for: firstSession)
                 }
             }
             if let activeSession = activeSelectedSession ?? indexedSessions.first(where: { $0.id == selectedIndexedSessionID }) {
-                if forceHeavy || computeTurnsSignature(for: activeSession) != lastLoadedTurnsSignature {
+                if streamingSessionID != activeSession.id,
+                   forceHeavy || computeTurnsSignature(for: activeSession) != lastLoadedTurnsSignature {
                     reloadSelectedSessionTurns(showLoadingIndicator: loadedTurnsSessionID != activeSession.id)
                 }
-            } else if !selectedSessionTurns.isEmpty {
+            } else if !selectedSessionTurns.isEmpty && streamingSessionID == nil {
                 reloadSelectedSessionTurns()
             }
             if let refreshedStorage = payload.refreshedStorage,
@@ -1924,6 +1967,8 @@ final class DashboardModel: ObservableObject {
             return "Continue a Codex session"
         case .claudeResume:
             return "Continue a Claude Code session"
+        case .geminiResume:
+            return "Continue a Gemini CLI session"
         }
     }
 
@@ -2327,13 +2372,285 @@ final class DashboardModel: ObservableObject {
         return filteredIndexedSessions.first
     }
 
+    static func chatProviderDisplayName(_ provider: SessionProviderKind) -> String {
+        switch provider {
+        case .codex: return "Codex"
+        case .gemini: return "Gemini CLI"
+        case .openCode: return "OpenCode"
+        case .claude: return "Claude Code"
+        case .cursor: return "Cursor"
+        case .other: return "Agent"
+        }
+    }
+
+    private static func sessionKeyPrefix(for provider: SessionProviderKind) -> String {
+        switch provider {
+        case .codex: return "codex"
+        case .gemini: return "gemini"
+        case .openCode: return "opencode"
+        case .claude: return "claude"
+        case .cursor: return "cursor"
+        case .other: return "agent"
+        }
+    }
+
+    var isStreamingAnyChat: Bool {
+        streamingSessionID != nil
+    }
+
+    func isStreamingSession(_ session: IndexedAgentSession) -> Bool {
+        streamingSessionID == session.id
+    }
+
+    func isProviderInstalled(_ provider: SessionProviderKind) -> Bool {
+        #if DEBUG
+        if inspector == nil { return true }
+        #endif
+        return installedChatProviders.contains(provider)
+    }
+
+    func canStreamInApp(for session: IndexedAgentSession) -> Bool {
+        guard AgentChatStreamRunner.cliBinaryName(for: session.provider) != nil,
+              let projectPath = session.projectPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              projectPath.hasPrefix("/"),
+              projectPath != "/" else {
+            return false
+        }
+        if session.id.hasPrefix("pending:") {
+            return true
+        }
+        guard let rawSID = session.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              AgentContextValidation.sessionID(rawSID) != nil else {
+            return false
+        }
+        return true
+    }
+
+    private func defaultPreferLiveTerminalSteer(for session: IndexedAgentSession) -> Bool {
+        if canStreamInApp(for: session) {
+            return false
+        }
+        return session.canSteerInLiveTerminal
+    }
+
+    func dismissChatStreamError() {
+        chatStreamErrorText = nil
+    }
+
+    private func syncRecentWorkspacePathsFromSessions() {
+        var seen = Set<String>()
+        var combined: [String] = []
+        let candidates = indexedSessions.compactMap(\.projectPath) + recentWorkspacePaths
+        for raw in candidates {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("/"), trimmed != "/", seen.insert(trimmed).inserted else { continue }
+            combined.append(trimmed)
+            if combined.count >= 30 { break }
+        }
+        if combined != recentWorkspacePaths {
+            recentWorkspacePaths = combined
+        }
+        if newChatProjectPath == nil {
+            newChatProjectPath = combined.first ?? homeDirectory.path
+        }
+    }
+
+    private func mergeInAppSessions(into discovered: [IndexedAgentSession]) -> [IndexedAgentSession] {
+        guard !inAppCreatedSessions.isEmpty else { return discovered }
+        var remainingInApp: [IndexedAgentSession] = []
+        for inApp in inAppCreatedSessions {
+            if let matchedDisk = discovered.first(where: { disk in
+                if disk.id == inApp.id { return true }
+                if let inAppSID = inApp.sessionID, !inAppSID.isEmpty,
+                   disk.provider == inApp.provider, disk.sessionID == inAppSID {
+                    return true
+                }
+                return false
+            }) {
+                if matchedDisk.id != inApp.id {
+                    if let turns = streamedTurnsBySessionID.removeValue(forKey: inApp.id) {
+                        streamedTurnsBySessionID[matchedDisk.id] = turns
+                    }
+                    if selectedIndexedSessionID == inApp.id {
+                        selectedIndexedSessionID = matchedDisk.id
+                    }
+                    if loadedTurnsSessionID == inApp.id {
+                        loadedTurnsSessionID = matchedDisk.id
+                    }
+                    if activeStreamSessionKey == inApp.id {
+                        activeStreamSessionKey = matchedDisk.id
+                        streamingSessionID = matchedDisk.id
+                    }
+                }
+                if streamingSessionID == inApp.id || streamingSessionID == matchedDisk.id {
+                    remainingInApp.append(matchedDisk)
+                }
+            } else {
+                remainingInApp.append(inApp)
+            }
+        }
+        inAppCreatedSessions = remainingInApp
+        let discoveredIDs = Set(discovered.map(\.id))
+        let unsaved = remainingInApp.filter { !discoveredIDs.contains($0.id) }
+        guard !unsaved.isEmpty else { return discovered }
+        return (unsaved + discovered).sorted {
+            ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast)
+        }
+    }
+
+    func beginNewChat(provider: SessionProviderKind? = nil, projectPath: String? = nil) {
+        if inspector != nil {
+            let detected = AgentChatStreamRunner.installedChatProviders(homeDirectory: homeDirectory)
+            if !detected.isEmpty {
+                installedChatProviders = detected
+            }
+        }
+        if let explicitProvider = provider, AgentChatStreamRunner.supportedChatProviders.contains(explicitProvider) {
+            newChatProvider = explicitProvider
+        } else if let current = activeSelectedSession?.provider,
+                  AgentChatStreamRunner.supportedChatProviders.contains(current),
+                  isProviderInstalled(current) {
+            newChatProvider = current
+        } else if !isProviderInstalled(newChatProvider), let firstInstalled = installedChatProviders.first {
+            newChatProvider = firstInstalled
+        }
+
+        let candidatePath = projectPath
+            ?? activeSelectedSession?.projectPath
+            ?? newChatProjectPath
+            ?? recentWorkspacePaths.first
+            ?? homeDirectory.path
+        let cleanPath = URL(fileURLWithPath: candidatePath).standardizedFileURL.path
+        newChatProjectPath = cleanPath
+        if cleanPath.hasPrefix("/"), cleanPath != "/", !recentWorkspacePaths.contains(cleanPath) {
+            recentWorkspacePaths.insert(cleanPath, at: 0)
+        }
+        chatStreamErrorText = nil
+        isCreatingNewChat = true
+    }
+
+    func cancelNewChat() {
+        isCreatingNewChat = false
+        chatStreamErrorText = nil
+    }
+
+    func chooseNewChatFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Select Folder"
+        panel.message = "Choose the project folder for this agent chat"
+        if let existing = newChatProjectPath {
+            panel.directoryURL = URL(fileURLWithPath: existing, isDirectory: true)
+        } else {
+            panel.directoryURL = homeDirectory
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            let selectedPath = url.standardizedFileURL.path
+            newChatProjectPath = selectedPath
+            recentWorkspacePaths.removeAll { $0 == selectedPath }
+            recentWorkspacePaths.insert(selectedPath, at: 0)
+        }
+    }
+
+    var canSendNewChat: Bool {
+        guard !isStreamingAnyChat,
+              !isSteering,
+              let path = newChatProjectPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              path.hasPrefix("/"),
+              path != "/",
+              !consoleComposerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return true
+    }
+
+    func startNewChatAndSend() {
+        guard canSendNewChat,
+              let rawFolder = newChatProjectPath?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return
+        }
+        let expanded = SteeringSnippetCatalog.expand(consoleComposerText, snippets: allSteeringSnippets)
+        let trimmed = expanded.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let folderPath = URL(fileURLWithPath: rawFolder, isDirectory: true).standardizedFileURL.path
+        let folderName = URL(fileURLWithPath: folderPath).lastPathComponent
+        let provider = newChatProvider
+        let titleText = WorkspaceSessionIndexer.sanitizeInlineText(trimmed, maxLength: 84) ?? String(trimmed.prefix(84))
+
+        let pendingSession = IndexedAgentSession(
+            id: "pending:\(UUID().uuidString)",
+            provider: provider,
+            agentName: Self.chatProviderDisplayName(provider),
+            sessionID: nil,
+            title: titleText,
+            projectPath: folderPath,
+            projectName: folderName.isEmpty ? folderPath : folderName,
+            gitBranch: nil,
+            sourcePath: nil,
+            updatedAt: Date(),
+            isLive: false,
+            liveObservation: nil,
+            canResumeNatively: true,
+            nativeSteerMode: WorkspaceSessionIndexer.nativeResumeMode(for: provider),
+            liveSteerMode: nil,
+            lastMessageSnippet: WorkspaceSessionIndexer.sanitizeInlineText(trimmed, maxLength: 140),
+            turnCount: 1
+        )
+
+        if sessionScopeFilter == .liveOnly {
+            sessionScopeFilter = .all
+        }
+        if let providerFilter = sessionProviderFilter, providerFilter != provider {
+            sessionProviderFilter = nil
+        }
+
+        recentWorkspacePaths.removeAll { $0 == folderPath }
+        recentWorkspacePaths.insert(folderPath, at: 0)
+
+        inAppCreatedSessions.insert(pendingSession, at: 0)
+        indexedSessions.insert(pendingSession, at: 0)
+        selectedIndexedSessionID = pendingSession.id
+        selectedAgent = nil
+        selectedSessionTurns = []
+        preferLiveTerminalSteer = false
+        isCreatingNewChat = false
+        consoleComposerText = ""
+
+        runStreamingTurn(for: pendingSession, prompt: trimmed, restoreDraftOnLaunchFailure: true)
+    }
+
+    func stopActiveChatStream() {
+        if let runID = activeChatRunID {
+            _ = chatStreamRunner.cancel(runID: runID)
+        }
+        activeChatRunID = nil
+        activeStreamToken = nil
+        activeStreamSessionKey = nil
+        streamingSessionID = nil
+        streamingStatusText = nil
+    }
+
     func selectIndexedSession(_ session: IndexedAgentSession) {
         let changed = selectedIndexedSessionID != session.id
+        isCreatingNewChat = false
         selectedIndexedSessionID = session.id
         selectedAgent = session.liveObservation
         if changed {
-            preferLiveTerminalSteer = session.canSteerInLiveTerminal
-            reloadSelectedSessionTurns()
+            chatStreamErrorText = nil
+            liveTailTask?.cancel()
+            liveTailTask = nil
+            preferLiveTerminalSteer = defaultPreferLiveTerminalSteer(for: session)
+            if streamingSessionID == session.id, let activeTurns = streamedTurnsBySessionID[session.id] {
+                selectedSessionTurns = activeTurns
+                loadedTurnsSessionID = session.id
+                isLoadingSessionTurns = false
+            } else {
+                reloadSelectedSessionTurns()
+            }
         }
     }
 
@@ -2362,16 +2679,29 @@ final class DashboardModel: ObservableObject {
             isLoadingSessionTurns = false
             return
         }
+        if streamingSessionID == session.id, let activeTurns = streamedTurnsBySessionID[session.id] {
+            selectedSessionTurns = activeTurns
+            loadedTurnsSessionID = session.id
+            isLoadingSessionTurns = false
+            return
+        }
         let signature = computeTurnsSignature(for: session)
         #if DEBUG
         if inspector == nil {
-            selectedSessionTurns = fixtureTurnsBySessionID[session.id] ?? []
+            selectedSessionTurns = streamedTurnsBySessionID[session.id] ?? fixtureTurnsBySessionID[session.id] ?? []
             loadedTurnsSessionID = session.id
             lastLoadedTurnsSignature = signature
             isLoadingSessionTurns = false
             return
         }
         #endif
+        if session.id.hasPrefix("pending:") {
+            selectedSessionTurns = streamedTurnsBySessionID[session.id] ?? []
+            loadedTurnsSessionID = session.id
+            lastLoadedTurnsSignature = signature
+            isLoadingSessionTurns = false
+            return
+        }
         sessionTurnsTask?.cancel()
         let gen = UUID()
         sessionTurnsGeneration = gen
@@ -2385,11 +2715,26 @@ final class DashboardModel: ObservableObject {
                 WorkspaceSessionIndexer(homeDirectory: home).loadConversationTurns(
                     for: session,
                     allProcesses: procs,
-                    maxTurns: 75
+                    maxTurns: 120
                 )
             }.value
             guard !Task.isCancelled, sessionTurnsGeneration == gen else { return }
-            selectedSessionTurns = turns
+            guard streamingSessionID != session.id else {
+                isLoadingSessionTurns = false
+                return
+            }
+            if let cachedStreamTurns = streamedTurnsBySessionID[session.id], !cachedStreamTurns.isEmpty {
+                let diskDialogCount = turns.filter { $0.kind != .toolCall }.count
+                let cachedDialogCount = cachedStreamTurns.filter { $0.kind != .toolCall }.count
+                if turns.isEmpty || diskDialogCount < cachedDialogCount {
+                    selectedSessionTurns = cachedStreamTurns
+                } else {
+                    streamedTurnsBySessionID.removeValue(forKey: session.id)
+                    selectedSessionTurns = turns
+                }
+            } else {
+                selectedSessionTurns = turns
+            }
             loadedTurnsSessionID = session.id
             lastLoadedTurnsSignature = signature
             isLoadingSessionTurns = false
@@ -2406,13 +2751,14 @@ final class DashboardModel: ObservableObject {
 
     func canSendConsoleInstruction(to session: IndexedAgentSession) -> Bool {
         guard !isSteering,
+              !isStreamingAnyChat,
               !consoleComposerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return false
         }
         if preferLiveTerminalSteer && session.canSteerInLiveTerminal {
             return true
         }
-        return session.canResumeNatively || session.canSteerInLiveTerminal
+        return canStreamInApp(for: session) || session.canResumeNatively || session.canSteerInLiveTerminal
     }
 
     func sendConsoleInstruction(to session: IndexedAgentSession) {
@@ -2422,11 +2768,17 @@ final class DashboardModel: ObservableObject {
         guard !trimmed.isEmpty else { return }
 
         let useLiveTTY = preferLiveTerminalSteer && session.canSteerInLiveTerminal
+        if !useLiveTTY && canStreamInApp(for: session) {
+            consoleComposerText = ""
+            runStreamingTurn(for: session, prompt: trimmed, restoreDraftOnLaunchFailure: true)
+            return
+        }
+
         isSteering = true
+        chatStreamErrorText = nil
         let steerer = agentSteerer
         let uid = Int(getuid())
 
-        // Optimistically show user's instruction in the conversation stream
         let optimisticTurn = SessionChatTurn(
             id: "optimistic-\(UUID().uuidString)",
             kind: .user,
@@ -2450,15 +2802,288 @@ final class DashboardModel: ObservableObject {
             }
             if outcome.succeeded {
                 consoleComposerText = ""
-                showBanner(outcome.detail ?? "Sent instruction to \(session.agentName)")
-                try? await Task.sleep(nanoseconds: 450_000_000)
-                refresh()
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                reloadSelectedSessionTurns()
+                showBanner(outcome.detail ?? "Sent message to \(session.agentName)")
+                startLiveTranscriptTail(for: session)
             } else {
                 selectedSessionTurns.removeAll { $0.id == optimisticTurn.id }
-                showBanner(outcome.error ?? "Could not send instruction to \(session.agentName)", isError: true)
+                chatStreamErrorText = outcome.error ?? "Could not send message to \(session.agentName)."
             }
+        }
+    }
+
+    private func startLiveTranscriptTail(for session: IndexedAgentSession) {
+        liveTailTask?.cancel()
+        let targetID = session.id
+        liveTailTask = Task { [weak self] in
+            let delaysNs: [UInt64] = [
+                500_000_000,
+                900_000_000,
+                1_300_000_000,
+                1_800_000_000,
+                2_500_000_000,
+                3_500_000_000
+            ]
+            for delay in delaysNs {
+                try? await Task.sleep(nanoseconds: delay)
+                guard !Task.isCancelled, let self else { return }
+                guard self.selectedIndexedSessionID == targetID, self.streamingSessionID == nil else { return }
+                self.reloadSelectedSessionTurns(showLoadingIndicator: false)
+            }
+            if !Task.isCancelled {
+                self?.refresh()
+            }
+        }
+    }
+
+    private func runStreamingTurn(
+        for session: IndexedAgentSession,
+        prompt: String,
+        restoreDraftOnLaunchFailure: Bool
+    ) {
+        guard let projectPath = session.projectPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !projectPath.isEmpty else {
+            chatStreamErrorText = "This session has no project folder path on disk."
+            if restoreDraftOnLaunchFailure && consoleComposerText.isEmpty {
+                consoleComposerText = prompt
+            }
+            return
+        }
+
+        sessionTurnsTask?.cancel()
+        liveTailTask?.cancel()
+        liveTailTask = nil
+        chatStreamErrorText = nil
+
+        var baseTurns = streamedTurnsBySessionID[session.id] ?? (selectedIndexedSessionID == session.id ? selectedSessionTurns : [])
+        let userTurn = SessionChatTurn(
+            id: "user-\(UUID().uuidString)",
+            kind: .user,
+            text: prompt,
+            timestamp: Date()
+        )
+        baseTurns.append(userTurn)
+        streamedTurnsBySessionID[session.id] = baseTurns
+        if selectedIndexedSessionID == session.id {
+            selectedSessionTurns = baseTurns
+            loadedTurnsSessionID = session.id
+            isLoadingSessionTurns = false
+        }
+
+        updateSessionMetadataInPlace(
+            sessionKey: session.id,
+            updatedAt: Date(),
+            snippet: WorkspaceSessionIndexer.sanitizeInlineText(prompt, maxLength: 140),
+            incrementTurnCount: true
+        )
+
+        #if DEBUG
+        if inspector == nil {
+            let reply = SessionChatTurn(
+                id: "fixture-reply-\(UUID().uuidString)",
+                kind: .assistant,
+                text: "Simulated streaming response in preview mode.",
+                timestamp: Date()
+            )
+            baseTurns.append(reply)
+            streamedTurnsBySessionID[session.id] = baseTurns
+            fixtureTurnsBySessionID[session.id] = baseTurns
+            if selectedIndexedSessionID == session.id {
+                selectedSessionTurns = baseTurns
+            }
+            return
+        }
+        #endif
+
+        let request = AgentChatStreamRequest(
+            provider: session.provider,
+            sessionID: session.sessionID,
+            projectPath: projectPath,
+            prompt: prompt,
+            preferredExecutablePath: session.liveObservation?.process.executablePath
+        )
+
+        let streamToken = UUID()
+        activeStreamToken = streamToken
+        activeStreamSessionKey = session.id
+        streamingSessionID = session.id
+        streamingStatusText = "\(session.agentName) yanıtlıyor…"
+
+        let startResult = chatStreamRunner.start(request: request) { [weak self] event in
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.handleChatStreamEvent(event, streamToken: streamToken)
+                }
+            }
+        }
+
+        switch startResult {
+        case .success(let runID):
+            if activeStreamToken == streamToken {
+                activeChatRunID = runID
+            }
+        case .failure(let err):
+            activeStreamToken = nil
+            activeStreamSessionKey = nil
+            activeChatRunID = nil
+            streamingSessionID = nil
+            streamingStatusText = nil
+            chatStreamErrorText = err.localizedDescription
+            var reverted = streamedTurnsBySessionID[session.id] ?? []
+            reverted.removeAll { $0.id == userTurn.id }
+            streamedTurnsBySessionID[session.id] = reverted
+            if selectedIndexedSessionID == session.id {
+                selectedSessionTurns = reverted
+            }
+            if restoreDraftOnLaunchFailure && consoleComposerText.isEmpty {
+                consoleComposerText = prompt
+            }
+        }
+    }
+
+    private func handleChatStreamEvent(_ event: AgentChatStreamEvent, streamToken: UUID) {
+        guard activeStreamToken == streamToken, var sessionKey = activeStreamSessionKey else { return }
+
+        switch event {
+        case .sessionStarted(let rawSID):
+            guard let validSID = AgentContextValidation.sessionID(rawSID),
+                  let currentSession = indexedSessions.first(where: { $0.id == sessionKey }) else {
+                return
+            }
+            let newKey = "\(Self.sessionKeyPrefix(for: currentSession.provider)):\(validSID)"
+            let promoted = IndexedAgentSession(
+                id: newKey,
+                provider: currentSession.provider,
+                agentName: currentSession.agentName,
+                sessionID: validSID,
+                title: currentSession.title,
+                projectPath: currentSession.projectPath,
+                projectName: currentSession.projectName,
+                gitBranch: currentSession.gitBranch,
+                sourcePath: currentSession.sourcePath,
+                updatedAt: Date(),
+                isLive: currentSession.isLive,
+                liveObservation: currentSession.liveObservation,
+                canResumeNatively: true,
+                nativeSteerMode: WorkspaceSessionIndexer.nativeResumeMode(for: currentSession.provider),
+                liveSteerMode: currentSession.liveSteerMode,
+                lastMessageSnippet: currentSession.lastMessageSnippet,
+                turnCount: max(1, currentSession.turnCount)
+            )
+            if let idx = indexedSessions.firstIndex(where: { $0.id == sessionKey }) {
+                indexedSessions[idx] = promoted
+            }
+            if let idx = inAppCreatedSessions.firstIndex(where: { $0.id == sessionKey }) {
+                inAppCreatedSessions[idx] = promoted
+            } else if !inAppCreatedSessions.contains(where: { $0.id == newKey }) {
+                inAppCreatedSessions.insert(promoted, at: 0)
+            }
+            if newKey != sessionKey {
+                if let turns = streamedTurnsBySessionID.removeValue(forKey: sessionKey) {
+                    streamedTurnsBySessionID[newKey] = turns
+                }
+                if selectedIndexedSessionID == sessionKey {
+                    selectedIndexedSessionID = newKey
+                }
+                if loadedTurnsSessionID == sessionKey {
+                    loadedTurnsSessionID = newKey
+                }
+                activeStreamSessionKey = newKey
+                streamingSessionID = newKey
+                sessionKey = newKey
+            }
+
+        case .assistantMessageUpdated(let turnID, let text):
+            var turns = streamedTurnsBySessionID[sessionKey] ?? []
+            let updatedTurn = SessionChatTurn(
+                id: turnID,
+                kind: .assistant,
+                text: text,
+                timestamp: Date()
+            )
+            if let existingIdx = turns.firstIndex(where: { $0.id == turnID }) {
+                turns[existingIdx] = updatedTurn
+            } else {
+                turns.append(updatedTurn)
+            }
+            streamedTurnsBySessionID[sessionKey] = turns
+            if selectedIndexedSessionID == sessionKey {
+                selectedSessionTurns = turns
+            }
+            let agentLabel = indexedSessions.first(where: { $0.id == sessionKey })?.agentName ?? "Agent"
+            streamingStatusText = "\(agentLabel) yazıyor…"
+            updateSessionMetadataInPlace(
+                sessionKey: sessionKey,
+                updatedAt: Date(),
+                snippet: WorkspaceSessionIndexer.sanitizeInlineText(text, maxLength: 140),
+                incrementTurnCount: false
+            )
+
+        case .toolCallUpdated(let toolTurn):
+            var turns = streamedTurnsBySessionID[sessionKey] ?? []
+            if let existingIdx = turns.firstIndex(where: { $0.id == toolTurn.id }) {
+                turns[existingIdx] = toolTurn
+            } else {
+                turns.append(toolTurn)
+            }
+            streamedTurnsBySessionID[sessionKey] = turns
+            if selectedIndexedSessionID == sessionKey {
+                selectedSessionTurns = turns
+            }
+            let toolLabel = toolTurn.toolName ?? "tool"
+            streamingStatusText = "\(toolLabel): \(toolTurn.text)"
+
+        case .error(let message):
+            chatStreamErrorText = message
+
+        case .finished:
+            activeStreamToken = nil
+            activeChatRunID = nil
+            activeStreamSessionKey = nil
+            streamingSessionID = nil
+            streamingStatusText = nil
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 650_000_000)
+                self?.refresh(forceHeavy: true)
+            }
+        }
+    }
+
+    private func updateSessionMetadataInPlace(
+        sessionKey: String,
+        updatedAt: Date,
+        snippet: String?,
+        incrementTurnCount: Bool
+    ) {
+        func updatedCopy(_ session: IndexedAgentSession) -> IndexedAgentSession {
+            IndexedAgentSession(
+                id: session.id,
+                provider: session.provider,
+                agentName: session.agentName,
+                sessionID: session.sessionID,
+                title: session.title,
+                projectPath: session.projectPath,
+                projectName: session.projectName,
+                gitBranch: session.gitBranch,
+                sourcePath: session.sourcePath,
+                updatedAt: updatedAt,
+                isLive: session.isLive,
+                liveObservation: session.liveObservation,
+                canResumeNatively: session.canResumeNatively,
+                nativeSteerMode: session.nativeSteerMode,
+                liveSteerMode: session.liveSteerMode,
+                lastMessageSnippet: snippet ?? session.lastMessageSnippet,
+                turnCount: incrementTurnCount ? session.turnCount + 1 : session.turnCount
+            )
+        }
+        if let idx = indexedSessions.firstIndex(where: { $0.id == sessionKey }) {
+            let modified = updatedCopy(indexedSessions[idx])
+            indexedSessions.remove(at: idx)
+            indexedSessions.insert(modified, at: 0)
+        }
+        if let idx = inAppCreatedSessions.firstIndex(where: { $0.id == sessionKey }) {
+            let modified = updatedCopy(inAppCreatedSessions[idx])
+            inAppCreatedSessions.remove(at: idx)
+            inAppCreatedSessions.insert(modified, at: 0)
         }
     }
 
@@ -2799,6 +3424,14 @@ final class DashboardModel: ObservableObject {
     func shutdown() {
         approvalInboxWatcher?.stop()
         approvalInboxWatcher = nil
+        chatStreamRunner.cancelAll()
+        activeChatRunID = nil
+        activeStreamToken = nil
+        activeStreamSessionKey = nil
+        streamingSessionID = nil
+        streamingStatusText = nil
+        liveTailTask?.cancel()
+        liveTailTask = nil
         livePollTask?.cancel()
         livePollTask = nil
         cleanupScanTask?.cancel()

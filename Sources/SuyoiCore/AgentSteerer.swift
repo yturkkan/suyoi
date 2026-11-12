@@ -101,7 +101,7 @@ public struct AgentSteerer: AgentSteering, Sendable {
         case .openCodeSession: name = "opencode"
         case .codexResume: name = "codex"
         case .claudeResume: name = "claude"
-        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
+        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow, .geminiResume:
             return failure("Native session target is invalid")
         }
         guard let executable = resolve(name, agent: agent) else { return failure("Agent executable is unavailable") }
@@ -119,7 +119,7 @@ public struct AgentSteerer: AgentSteering, Sendable {
                   verifiedDatabasePath(result.stdoutText, catalog: catalog) else {
                 return failure("This OpenCode executable cannot verify its session store. Update OpenCode and try again.")
             }
-            arguments = ["--standalone", "run", "--session", target.sessionID, "--", clean]
+            arguments = ["run", "--session", target.sessionID, "--", clean]
         case .codexResume:
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.withoutEscapingSlashes]
@@ -130,7 +130,7 @@ public struct AgentSteerer: AgentSteering, Sendable {
             arguments = ["exec", "-c", "sqlite_home=" + path, "resume", target.sessionID, "--", clean]
         case .claudeResume:
             arguments = ["--print", "--resume", target.sessionID, "--", clean]
-        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
+        case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow, .geminiResume:
             return failure("Native session target is invalid")
         }
         guard catalog.validate(target, for: agent, live: live) else {
@@ -229,7 +229,7 @@ public struct AgentSteerer: AgentSteering, Sendable {
             return steerKitty(agent: agent, pid: pid, uid: uid, live: live, tty: tty, device: device, clean: clean)
         case .terminalTTY:
             break
-        case .openCodeSession, .codexResume, .claudeResume:
+        case .openCodeSession, .codexResume, .claudeResume, .geminiResume:
             return failure("Terminal association changed or is unavailable")
         }
         guard let terminal = agent.terminalApp, ["Terminal", "iTerm2"].contains(terminal) else {
@@ -569,17 +569,10 @@ public struct AgentSteerer: AgentSteering, Sendable {
         if let preferredExecutable, preferredExecutable.hasSuffix("/" + name) {
             candidates.append(preferredExecutable)
         }
-        candidates += ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
-        if name == "claude" {
-            candidates.append(homeDirectory.appendingPathComponent(".claude/local/claude").path)
-        }
-        candidates += [".opencode/bin", ".local/bin", ".npm-global/bin", ".bun/bin", "Library/pnpm", ".volta/bin", ".asdf/shims", ".local/share/mise/shims"].map {
-            homeDirectory.appendingPathComponent($0).appendingPathComponent(name).path
+        for dir in AgentChatStreamRunner.searchDirectories(homeDirectory: homeDirectory) {
+            candidates.append(URL(fileURLWithPath: dir, isDirectory: true).appendingPathComponent(name).path)
         }
         if name == "codex" { candidates.append("/Applications/Codex.app/Contents/Resources/codex") }
-        for dir in (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":") where dir.hasPrefix("/") && dir != "/" {
-            candidates.append(URL(fileURLWithPath: String(dir)).appendingPathComponent(name).path)
-        }
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
@@ -675,10 +668,9 @@ public struct AgentSteerer: AgentSteering, Sendable {
             }
             cliName = "codex"
         case .openCodeSession:
-            guard validSessionID.hasPrefix("ses_") else {
-                return failure("OpenCode session ID is invalid")
-            }
             cliName = "opencode"
+        case .geminiResume:
+            cliName = "gemini"
         case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
             return failure("Invalid continuation mode")
         }
@@ -701,7 +693,9 @@ public struct AgentSteerer: AgentSteering, Sendable {
             }
             arguments = ["exec", "-c", "sqlite_home=" + quotedHome, "resume", validSessionID, "--", clean]
         case .openCodeSession:
-            arguments = ["--standalone", "run", "--session", validSessionID, "--", clean]
+            arguments = ["run", "--session", validSessionID, "--", clean]
+        case .geminiResume:
+            arguments = ["--resume", validSessionID, "--prompt=" + clean]
         case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
             return failure("Invalid continuation mode")
         }

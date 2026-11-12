@@ -263,13 +263,13 @@ public enum SuyoiAppIdentity {
 }
 
 public enum AgentSteerMode: String, Codable, Equatable, Sendable {
-    case terminalTTY, tmuxPane, weztermPane, kittyWindow, openCodeSession, codexResume, claudeResume
+    case terminalTTY, tmuxPane, weztermPane, kittyWindow, openCodeSession, codexResume, claudeResume, geminiResume
 
     public var isLiveTerminalDelivery: Bool {
         switch self {
         case .terminalTTY, .tmuxPane, .weztermPane, .kittyWindow:
             return true
-        case .openCodeSession, .codexResume, .claudeResume:
+        case .openCodeSession, .codexResume, .claudeResume, .geminiResume:
             return false
         }
     }

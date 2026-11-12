@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import SQLite3
@@ -210,12 +211,33 @@ public struct WorkspaceSessionIndexer: Sendable {
         maxPerProvider: Int = 36
     ) -> [IndexedAgentSession] {
         let cap = max(4, min(maxPerProvider, 120))
+        let claudeSessions = discoverClaudeSessions(limit: cap)
+        let codexSessions = discoverCodexSessions(limit: cap)
+        let openCodeSessions = discoverOpenCodeSessions(limit: cap)
+        let cursorSessions = discoverCursorSessions(limit: max(8, cap / 2))
+
+        var seedProjectPaths: [String] = []
+        for s in claudeSessions + codexSessions + openCodeSessions + cursorSessions {
+            if let path = s.projectPath {
+                seedProjectPaths.append(path)
+            }
+        }
+        for obs in liveAgents {
+            if let root = obs.project?.rootPath {
+                seedProjectPaths.append(root)
+            }
+            if let cwd = obs.process.cwd {
+                seedProjectPaths.append(cwd)
+            }
+        }
+        let geminiSessions = discoverGeminiSessions(limit: cap, seedProjectPaths: seedProjectPaths)
+
         var diskSessions: [IndexedAgentSession] = []
-        diskSessions.append(contentsOf: discoverClaudeSessions(limit: cap))
-        diskSessions.append(contentsOf: discoverCodexSessions(limit: cap))
-        diskSessions.append(contentsOf: discoverOpenCodeSessions(limit: cap))
-        diskSessions.append(contentsOf: discoverGeminiSessions(limit: max(8, cap / 2)))
-        diskSessions.append(contentsOf: discoverCursorSessions(limit: max(8, cap / 2)))
+        diskSessions.append(contentsOf: claudeSessions)
+        diskSessions.append(contentsOf: codexSessions)
+        diskSessions.append(contentsOf: openCodeSessions)
+        diskSessions.append(contentsOf: geminiSessions)
+        diskSessions.append(contentsOf: cursorSessions)
 
         // Sort disk sessions newest first so live process correlation picks the freshest match.
         diskSessions.sort { lhs, rhs in
@@ -286,6 +308,8 @@ public struct WorkspaceSessionIndexer: Sendable {
                 let mergedBranch = obs.project?.gitBranch ?? disk.gitBranch
                 let mergedUpdated = maxDate(obs.lastActivityAt, disk.updatedAt)
                 let mergedSnippet = obs.currentTask ?? disk.lastMessageSnippet
+                let nativeMode = disk.nativeSteerMode ?? Self.nativeResumeMode(for: disk.provider)
+                let canResume = disk.canResumeNatively || (mergedProjectPath != nil && (disk.sessionID ?? obs.sessionID) != nil && nativeMode != nil)
                 correlatedResults.append(
                     IndexedAgentSession(
                         id: disk.id,
@@ -300,8 +324,8 @@ public struct WorkspaceSessionIndexer: Sendable {
                         updatedAt: mergedUpdated,
                         isLive: true,
                         liveObservation: obs,
-                        canResumeNatively: disk.canResumeNatively,
-                        nativeSteerMode: disk.nativeSteerMode,
+                        canResumeNatively: canResume,
+                        nativeSteerMode: canResume ? nativeMode : nil,
                         liveSteerMode: liveSteer,
                         lastMessageSnippet: mergedSnippet,
                         turnCount: disk.turnCount
@@ -370,13 +394,73 @@ public struct WorkspaceSessionIndexer: Sendable {
         }
     }
 
-    private static func nativeResumeMode(for provider: SessionProviderKind) -> AgentSteerMode? {
+    public static func nativeResumeMode(for provider: SessionProviderKind) -> AgentSteerMode? {
         switch provider {
         case .claude: return .claudeResume
         case .codex: return .codexResume
         case .openCode: return .openCodeSession
-        case .cursor, .gemini, .other: return nil
+        case .gemini: return .geminiResume
+        case .cursor, .other: return nil
         }
+    }
+
+    /// Returns deduplicated workspace folders for the `+ New Chat` project picker.
+    public func discoverWorkspaceDirectories(additionalPaths: [String] = []) -> [String] {
+        var result: [String] = []
+        var seen = Set<String>()
+
+        func addDirectory(_ raw: String?) {
+            guard let canonical = canonicalExistingDirectory(raw), seen.insert(canonical).inserted else { return }
+            result.append(canonical)
+        }
+
+        for path in additionalPaths {
+            addDirectory(path)
+        }
+
+        for (path, _) in readGeminiProjectsJSON() {
+            addDirectory(path)
+        }
+
+        let candidateParents = [
+            "Developer", "Projects", "Code", "Workspace", "Workspaces",
+            "GitHub", "Repos", "src", "Desktop", "Documents"
+        ]
+        let projectMarkers = [
+            ".git", "Package.swift", "package.json", "Cargo.toml",
+            "pyproject.toml", "go.mod", "AGENTS.md", "CLAUDE.md", "GEMINI.md"
+        ]
+        let fm = FileManager.default
+        var scanBudget = 320
+
+        for folder in candidateParents where scanBudget > 0 {
+            let rootURL = homeDirectory.appendingPathComponent(folder, isDirectory: true)
+            guard let children = try? fm.contentsOfDirectory(
+                at: rootURL,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+
+            let sortedChildren = children.sorted { lhs, rhs in
+                let ld = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rd = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return ld > rd
+            }
+
+            for child in sortedChildren.prefix(32) where scanBudget > 0 {
+                scanBudget -= 1
+                guard let vals = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                      vals.isDirectory == true, vals.isSymbolicLink != true else { continue }
+                let hasMarker = projectMarkers.contains { marker in
+                    fm.fileExists(atPath: child.appendingPathComponent(marker).path)
+                }
+                if hasMarker || ["Developer", "Projects", "Code", "Workspace", "Workspaces", "GitHub", "Repos"].contains(folder) {
+                    addDirectory(child.path)
+                }
+            }
+        }
+
+        return Array(result.prefix(40))
     }
 
     // MARK: - Conversation & Tool Stream Loading
@@ -409,8 +493,12 @@ public struct WorkspaceSessionIndexer: Sendable {
         case .gemini:
             if let sourcePath = session.sourcePath {
                 turns = loadGeminiTurns(at: URL(fileURLWithPath: sourcePath), maxTurns: cap)
+            } else if let sessionID = session.sessionID, let found = findGeminiFile(sessionID: sessionID) {
+                turns = loadGeminiTurns(at: found, maxTurns: cap)
             }
-        case .cursor, .other:
+        case .cursor:
+            turns = loadCursorTurns(for: session, maxTurns: cap)
+        case .other:
             break
         }
 
@@ -834,7 +922,7 @@ public struct WorkspaceSessionIndexer: Sendable {
             for row in dbRows where seenIDs.insert(row.sessionID).inserted {
                 let canonical = canonicalExistingDirectory(row.directory)
                 let projectName = (canonical ?? row.directory).map { URL(fileURLWithPath: $0).lastPathComponent } ?? "OpenCode"
-                let canResume = canonical != nil && row.sessionID.hasPrefix("ses_")
+                let canResume = canonical != nil
                 sessions.append(
                     IndexedAgentSession(
                         id: "opencode:\(row.sessionID)",
@@ -852,8 +940,8 @@ public struct WorkspaceSessionIndexer: Sendable {
                         canResumeNatively: canResume,
                         nativeSteerMode: canResume ? .openCodeSession : nil,
                         liveSteerMode: nil,
-                        lastMessageSnippet: row.title,
-                        turnCount: 1
+                        lastMessageSnippet: row.snippet ?? row.title,
+                        turnCount: max(1, row.messageCount)
                     )
                 )
             }
@@ -879,7 +967,7 @@ public struct WorkspaceSessionIndexer: Sendable {
                 }
                 return file.modifiedAt
             }()
-            let canResume = canonical != nil && sessionID.hasPrefix("ses_")
+            let canResume = canonical != nil
             sessions.append(
                 IndexedAgentSession(
                     id: "opencode:\(sessionID)",
@@ -910,14 +998,18 @@ public struct WorkspaceSessionIndexer: Sendable {
         let title: String?
         let directory: String?
         let updatedAt: Date?
+        let messageCount: Int
+        let snippet: String?
     }
 
     private func queryOpenCodeSessionsFromSQLite(at url: URL, limit: Int) -> [OpenCodeSessionRow]? {
-        withReadOnlySQLite(url) { db in
+        withReadOnlySQLite(url, maxCellBytes: 64 * 1_024) { db in
             let tables = sqliteTableNames(db)
             let table = tables.contains("session_v2") ? "session_v2" : (tables.contains("session") ? "session" : nil)
             guard let table else { return [] }
-            let sql = "SELECT id, title, directory, time_updated FROM \(table) ORDER BY time_updated DESC LIMIT \(max(1, min(limit, 80)))"
+            let msgTable = tables.contains("message_v2") ? "message_v2" : (tables.contains("message") ? "message" : nil)
+            let countSubquery = msgTable.map { "(SELECT COUNT(*) FROM \($0) m WHERE m.session_id = s.id)" } ?? "1"
+            let sql = "SELECT s.id, s.title, s.directory, s.time_updated, \(countSubquery) FROM \(table) s ORDER BY s.time_updated DESC LIMIT \(max(1, min(limit, 80)))"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
             defer { sqlite3_finalize(stmt) }
@@ -929,8 +1021,18 @@ public struct WorkspaceSessionIndexer: Sendable {
                 let title = sqliteColumnString(stmt, 1).flatMap { SessionTurnPreviewInspector.sanitizeAndRedact($0, maxLength: 96) }
                 let directory = sqliteColumnString(stmt, 2)
                 let ms = sqlite3_column_int64(stmt, 3)
+                let msgCount = Int(sqlite3_column_int64(stmt, 4))
                 let date = ms > 0 ? Date(timeIntervalSince1970: ms > 10_000_000_000 ? Double(ms) / 1_000 : Double(ms)) : nil
-                rows.append(OpenCodeSessionRow(sessionID: validID, title: title, directory: directory, updatedAt: date))
+                rows.append(
+                    OpenCodeSessionRow(
+                        sessionID: validID,
+                        title: title,
+                        directory: directory,
+                        updatedAt: date,
+                        messageCount: max(1, msgCount),
+                        snippet: title
+                    )
+                )
             }
             return rows
         }
@@ -949,7 +1051,7 @@ public struct WorkspaceSessionIndexer: Sendable {
         var counter = 0
 
         for msgFile in msgFiles {
-            guard let msgDict = readJSONDictionary(at: msgFile.url) else { continue }
+            guard let msgDict = readJSONDictionary(at: msgFile.url, maxBytes: 512 * 1_024) else { continue }
             let info = (msgDict["info"] as? [String: Any]) ?? msgDict
             let role = (info["role"] as? String) ?? ""
             guard role == "user" || role == "assistant" else { continue }
@@ -968,7 +1070,7 @@ public struct WorkspaceSessionIndexer: Sendable {
                     .appendingPathComponent(msgID, isDirectory: true)
                 let partFiles = collectFiles(under: partDir, extensions: ["json"], maxDepth: 0, maxCandidates: 32)
                     .sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
-                parts = partFiles.compactMap { readJSONDictionary(at: $0.url) }
+                parts = partFiles.compactMap { readJSONDictionary(at: $0.url, maxBytes: 512 * 1_024) }
             }
 
             if let textContent = msgDict["content"] as? String,
@@ -1095,38 +1197,70 @@ public struct WorkspaceSessionIndexer: Sendable {
 
     // MARK: - Gemini CLI Discovery & Turn Parsing
 
-    private func discoverGeminiSessions(limit: Int) -> [IndexedAgentSession] {
-        var candidates: [DatedFile] = []
+    private struct GeminiCandidateFile {
+        let file: DatedFile
+        let bucketIdentifier: String?
+    }
+
+    private struct GeminiSessionPayload {
+        let sessionID: String?
+        let cwd: String?
+        let projectHash: String?
+        let updatedAt: Date?
+        let messages: [[String: Any]]
+    }
+
+    private func discoverGeminiSessions(limit: Int, seedProjectPaths: [String] = []) -> [IndexedAgentSession] {
+        var candidates: [GeminiCandidateFile] = []
         let tmpRoot = homeDirectory.appendingPathComponent(".gemini/tmp", isDirectory: true)
         if let projectDirs = try? FileManager.default.contentsOfDirectory(
             at: tmpRoot,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
         ) {
-            for dir in projectDirs.prefix(64) {
+            for dir in projectDirs.prefix(96) {
+                let bucketName = dir.lastPathComponent
                 let chatsDir = dir.appendingPathComponent("chats", isDirectory: true)
-                candidates.append(contentsOf: collectFiles(under: chatsDir, extensions: ["json", "jsonl"], maxDepth: 0, maxCandidates: 16))
+                let chatFiles = collectFiles(under: chatsDir, extensions: ["json", "jsonl"], maxDepth: 0, maxCandidates: 24)
+                for cf in chatFiles {
+                    let lowerName = cf.url.lastPathComponent.lowercased()
+                    // Skip Gemini checkpoint snapshots so only actual conversation threads appear.
+                    if lowerName.hasPrefix("checkpoint") { continue }
+                    candidates.append(GeminiCandidateFile(file: cf, bucketIdentifier: bucketName))
+                }
             }
         }
         let sessionsDir = homeDirectory.appendingPathComponent(".gemini/sessions", isDirectory: true)
-        candidates.append(contentsOf: collectFiles(under: sessionsDir, extensions: ["json", "jsonl"], maxDepth: 1, maxCandidates: limit))
-        candidates.sort { $0.modifiedAt > $1.modifiedAt }
+        for sf in collectFiles(under: sessionsDir, extensions: ["json", "jsonl"], maxDepth: 1, maxCandidates: limit) {
+            let lowerName = sf.url.lastPathComponent.lowercased()
+            if lowerName.hasPrefix("checkpoint") { continue }
+            candidates.append(GeminiCandidateFile(file: sf, bucketIdentifier: nil))
+        }
+        candidates.sort { $0.file.modifiedAt > $1.file.modifiedAt }
+
+        guard !candidates.isEmpty else { return [] }
+
+        // Build slug -> projectPath (from ~/.gemini/projects.json) and SHA256(path) -> projectPath lookup tables
+        let (slugToProjectPath, sha256ToProjectPath) = buildGeminiProjectLookupTables(seedProjectPaths: seedProjectPaths)
 
         var sessions: [IndexedAgentSession] = []
         var seenIDs = Set<String>()
 
-        for file in candidates.prefix(limit) {
-            let messages = readGeminiMessages(at: file.url)
-            guard !messages.isEmpty else { continue }
-            let stem = file.url.deletingPathExtension().lastPathComponent
-            let rawSessionID = (messages.first?["sessionId"] as? String) ?? stem
+        for entry in candidates.prefix(limit * 2) where sessions.count < limit {
+            let payload = readGeminiSessionPayload(at: entry.file.url)
+            guard !payload.messages.isEmpty else { continue }
+            let stem = entry.file.url.deletingPathExtension().lastPathComponent
+            let rawSessionID = payload.sessionID
+                ?? (payload.messages.first?["sessionId"] as? String)
+                ?? (payload.messages.first?["session_id"] as? String)
+                ?? stem
             guard let validID = AgentContextValidation.sessionID(rawSessionID),
                   seenIDs.insert(validID).inserted else { continue }
 
             var firstUser: String?
             var lastSnippet: String?
             var count = 0
-            for msg in messages {
+            for msg in payload.messages {
                 let role = ((msg["type"] ?? msg["role"]) as? String ?? "").lowercased()
                 guard role == "user" || role == "gemini" || role == "model" || role == "assistant" else { continue }
                 if let text = extractGeminiText(msg), !text.isEmpty {
@@ -1138,6 +1272,33 @@ public struct WorkspaceSessionIndexer: Sendable {
                 }
             }
             guard count > 0 else { continue }
+
+            let resolvedProjectPath: String? = {
+                if let explicitCwd = canonicalExistingDirectory(payload.cwd) {
+                    return explicitCwd
+                }
+                if let bucket = entry.bucketIdentifier {
+                    if let bySlug = slugToProjectPath[bucket], let canon = canonicalExistingDirectory(bySlug) {
+                        return canon
+                    }
+                    if let byHash = sha256ToProjectPath[bucket.lowercased()], let canon = canonicalExistingDirectory(byHash) {
+                        return canon
+                    }
+                }
+                if let pHash = payload.projectHash {
+                    if let bySlug = slugToProjectPath[pHash], let canon = canonicalExistingDirectory(bySlug) {
+                        return canon
+                    }
+                    if let byHash = sha256ToProjectPath[pHash.lowercased()], let canon = canonicalExistingDirectory(byHash) {
+                        return canon
+                    }
+                }
+                return nil
+            }()
+
+            let projectName = resolvedProjectPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Gemini CLI"
+            let canResume = resolvedProjectPath != nil
+
             sessions.append(
                 IndexedAgentSession(
                     id: "gemini:\(validID)",
@@ -1145,15 +1306,15 @@ public struct WorkspaceSessionIndexer: Sendable {
                     agentName: "Gemini CLI",
                     sessionID: validID,
                     title: firstUser ?? "Gemini · \(validID.prefix(8))",
-                    projectPath: nil,
-                    projectName: "Gemini CLI",
+                    projectPath: resolvedProjectPath,
+                    projectName: projectName,
                     gitBranch: nil,
-                    sourcePath: file.url.path,
-                    updatedAt: file.modifiedAt,
+                    sourcePath: entry.file.url.path,
+                    updatedAt: payload.updatedAt ?? entry.file.modifiedAt,
                     isLive: false,
                     liveObservation: nil,
-                    canResumeNatively: false,
-                    nativeSteerMode: nil,
+                    canResumeNatively: canResume,
+                    nativeSteerMode: canResume ? .geminiResume : nil,
                     liveSteerMode: nil,
                     lastMessageSnippet: lastSnippet,
                     turnCount: count
@@ -1163,11 +1324,95 @@ public struct WorkspaceSessionIndexer: Sendable {
         return sessions
     }
 
+    private func readGeminiProjectsJSON() -> [String: String] {
+        let projectsFile = homeDirectory.appendingPathComponent(".gemini/projects.json")
+        guard let root = readJSONDictionary(at: projectsFile, maxBytes: 512 * 1_024) else { return [:] }
+        if let projectsMap = root["projects"] as? [String: String] {
+            return projectsMap
+        }
+        var flat: [String: String] = [:]
+        for (k, v) in root {
+            if let str = v as? String, k.hasPrefix("/") {
+                flat[k] = str
+            }
+        }
+        return flat
+    }
+
+    private func buildGeminiProjectLookupTables(seedProjectPaths: [String]) -> (slugToPath: [String: String], sha256ToPath: [String: String]) {
+        var slugToPath: [String: String] = [:]
+        var sha256ToPath: [String: String] = [:]
+
+        func registerCandidatePath(_ rawPath: String) {
+            let trimmed = rawPath.hasSuffix("/") && rawPath.count > 1 ? String(rawPath.dropLast()) : rawPath
+            guard trimmed.hasPrefix("/"), trimmed != "/" else { return }
+            let rawDigest = SHA256.hash(data: Data(trimmed.utf8)).map { String(format: "%02x", $0) }.joined()
+            if let canonical = canonicalExistingDirectory(trimmed) {
+                sha256ToPath[rawDigest] = canonical
+                let canonDigest = SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
+                sha256ToPath[canonDigest] = canonical
+            }
+        }
+
+        for (projectPath, slug) in readGeminiProjectsJSON() {
+            if let canonical = canonicalExistingDirectory(projectPath) {
+                slugToPath[slug] = canonical
+                registerCandidatePath(projectPath)
+            }
+        }
+
+        for seed in seedProjectPaths {
+            registerCandidatePath(seed)
+        }
+
+        for discovered in discoverWorkspaceDirectories(additionalPaths: seedProjectPaths) {
+            registerCandidatePath(discovered)
+        }
+
+        return (slugToPath, sha256ToPath)
+    }
+
+    private func findGeminiFile(sessionID: String) -> URL? {
+        let needle = sessionID.lowercased()
+        let tmpRoot = homeDirectory.appendingPathComponent(".gemini/tmp", isDirectory: true)
+        var candidates: [DatedFile] = []
+        if let projectDirs = try? FileManager.default.contentsOfDirectory(
+            at: tmpRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for dir in projectDirs.prefix(96) {
+                let chatsDir = dir.appendingPathComponent("chats", isDirectory: true)
+                candidates.append(contentsOf: collectFiles(under: chatsDir, extensions: ["json", "jsonl"], maxDepth: 0, maxCandidates: 24))
+            }
+        }
+        let sessionsDir = homeDirectory.appendingPathComponent(".gemini/sessions", isDirectory: true)
+        candidates.append(contentsOf: collectFiles(under: sessionsDir, extensions: ["json", "jsonl"], maxDepth: 1, maxCandidates: 48))
+        candidates.sort { $0.modifiedAt > $1.modifiedAt }
+
+        for entry in candidates {
+            let stem = entry.url.deletingPathExtension().lastPathComponent.lowercased()
+            if stem == needle || stem.contains(needle) || (needle.count >= 8 && stem.contains(String(needle.prefix(8)))) {
+                let payload = readGeminiSessionPayload(at: entry.url)
+                if payload.sessionID?.lowercased() == needle || stem == needle {
+                    return entry.url
+                }
+            }
+        }
+        for entry in candidates.prefix(32) {
+            let payload = readGeminiSessionPayload(at: entry.url)
+            if payload.sessionID?.lowercased() == needle {
+                return entry.url
+            }
+        }
+        return nil
+    }
+
     private func loadGeminiTurns(at url: URL, maxTurns: Int) -> [SessionChatTurn] {
-        let messages = readGeminiMessages(at: url)
+        let payload = readGeminiSessionPayload(at: url)
         var turns: [SessionChatTurn] = []
         var counter = 0
-        for msg in messages {
+        for msg in payload.messages {
             let role = ((msg["type"] ?? msg["role"]) as? String ?? "").lowercased()
             let timestamp = QuotaParsing.date(msg["timestamp"])
             if role == "user", let txt = extractGeminiText(msg), let clean = Self.sanitizeMultilineText(txt) {
@@ -1180,37 +1425,73 @@ public struct WorkspaceSessionIndexer: Sendable {
                 }
                 for call in (msg["toolCalls"] as? [[String: Any]]) ?? [] {
                     let name = (call["name"] as? String) ?? "tool"
-                    let args = call["args"] as? [String: Any]
+                    let args = (call["args"] as? [String: Any]) ?? (call["input"] as? [String: Any])
                     let summary = extractToolTargetSummary(from: args) ?? name
+                    let rawStatus = (call["status"] as? String ?? "completed").lowercased()
+                    let status = ["error", "failed", "cancelled"].contains(rawStatus) ? "failed" : "completed"
                     counter += 1
-                    turns.append(SessionChatTurn(id: "gm-t-\(counter)", kind: .toolCall, text: summary, toolName: name, toolStatus: "completed", timestamp: timestamp))
+                    turns.append(SessionChatTurn(id: "gm-t-\(counter)", kind: .toolCall, text: summary, toolName: name, toolStatus: status, timestamp: timestamp))
                 }
             }
         }
         return Array(turns.suffix(maxTurns))
     }
 
-    private func readGeminiMessages(at url: URL) -> [[String: Any]] {
-        if url.pathExtension == "json" {
-            guard let dict = readJSONDictionary(at: url, maxBytes: 512 * 1_024) else { return [] }
-            if let messages = dict["messages"] as? [[String: Any]] {
-                return messages
+    private func readGeminiSessionPayload(at url: URL) -> GeminiSessionPayload {
+        if url.pathExtension.lowercased() == "json" {
+            guard let dict = readJSONDictionary(at: url, maxBytes: 8 * 1_024 * 1_024) else {
+                return GeminiSessionPayload(sessionID: nil, cwd: nil, projectHash: nil, updatedAt: nil, messages: [])
             }
-            return [dict]
+            let sid = (dict["sessionId"] as? String) ?? (dict["session_id"] as? String)
+            let cwd = (dict["cwd"] as? String)
+                ?? (dict["projectRoot"] as? String)
+                ?? (dict["workingDirectory"] as? String)
+            let pHash = (dict["projectHash"] as? String) ?? (dict["project_hash"] as? String)
+            let updatedAt = QuotaParsing.date(dict["lastUpdated"] ?? dict["updatedAt"])
+            let messages = (dict["messages"] as? [[String: Any]]) ?? [dict]
+            return GeminiSessionPayload(sessionID: sid, cwd: cwd, projectHash: pHash, updatedAt: updatedAt, messages: messages)
         } else {
-            return readTailRecordsForConversation(url: url, maxBytes: 256 * 1_024) ?? []
+            guard let (head, tail) = readHeadAndTailRecords(url: url, headBytes: 32 * 1_024, tailBytes: 1_024 * 1_024) else {
+                return GeminiSessionPayload(sessionID: nil, cwd: nil, projectHash: nil, updatedAt: nil, messages: [])
+            }
+            let combined = head + tail
+            var sid: String?
+            var cwd: String?
+            var pHash: String?
+            var updatedAt: Date?
+            for rec in combined {
+                if sid == nil {
+                    sid = (rec["sessionId"] as? String) ?? (rec["session_id"] as? String)
+                }
+                if cwd == nil {
+                    cwd = (rec["cwd"] as? String)
+                        ?? (rec["projectRoot"] as? String)
+                        ?? (rec["workingDirectory"] as? String)
+                }
+                if pHash == nil {
+                    pHash = (rec["projectHash"] as? String) ?? (rec["project_hash"] as? String)
+                }
+                if let ts = QuotaParsing.date(rec["lastUpdated"] ?? rec["timestamp"]) {
+                    updatedAt = ts
+                }
+            }
+            return GeminiSessionPayload(sessionID: sid, cwd: cwd, projectHash: pHash, updatedAt: updatedAt, messages: combined)
         }
     }
 
     private func extractGeminiText(_ msg: [String: Any]) -> String? {
         if let content = msg["content"] as? String { return content }
         if let text = msg["text"] as? String { return text }
-        if let blocks = msg["content"] as? [[String: Any]] {
-            let parts = blocks.compactMap { block -> String? in
-                guard block["thought"] as? Bool != true else { return nil }
-                return block["text"] as? String
+        for arrayKey in ["content", "parts"] {
+            if let blocks = msg[arrayKey] as? [[String: Any]] {
+                let parts = blocks.compactMap { block -> String? in
+                    guard block["thought"] as? Bool != true else { return nil }
+                    return block["text"] as? String
+                }
+                if !parts.isEmpty {
+                    return parts.joined(separator: "\n\n")
+                }
             }
-            return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
         }
         return nil
     }
@@ -1316,6 +1597,144 @@ public struct WorkspaceSessionIndexer: Sendable {
             }
             return items.sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
         } ?? []
+    }
+
+    private func loadCursorTurns(for session: IndexedAgentSession, maxTurns: Int) -> [SessionChatTurn] {
+        guard let rawSID = session.sessionID,
+              let validID = AgentContextValidation.sessionID(rawSID) else { return [] }
+
+        // 1. Cursor globalStorage cursorDiskKV (`composerData:<id>` & `bubbleId:<id>:*`)
+        let globalDB = homeDirectory
+            .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        if let globalTurns = queryCursorGlobalTurns(at: globalDB, composerID: validID, maxTurns: maxTurns),
+           !globalTurns.isEmpty {
+            return globalTurns
+        }
+
+        // 2. Workspace state.vscdb inline conversation fallback
+        if let sourcePath = session.sourcePath {
+            let wsDB = URL(fileURLWithPath: sourcePath)
+            if let wsTurns = queryCursorWorkspaceTurns(at: wsDB, composerID: validID, maxTurns: maxTurns),
+               !wsTurns.isEmpty {
+                return wsTurns
+            }
+        }
+        return []
+    }
+
+    private func queryCursorGlobalTurns(at dbURL: URL, composerID: String, maxTurns: Int) -> [SessionChatTurn]? {
+        withReadOnlySQLite(dbURL, maxCellBytes: 512 * 1_024) { db in
+            let tables = sqliteTableNames(db)
+            guard tables.contains("cursorDiskKV") else { return [] }
+
+            var turns: [SessionChatTurn] = []
+            var counter = 0
+
+            // Check composerData:<composerID> first for inline conversation or ordered fullConversationHeadersOnly
+            var orderedBubbleKeys: [String] = []
+            let compSQL = "SELECT value FROM cursorDiskKV WHERE key = ? LIMIT 1"
+            var cStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, compSQL, -1, &cStmt, nil) == SQLITE_OK, let cStmt {
+                defer { sqlite3_finalize(cStmt) }
+                if sqliteBindText(cStmt, index: 1, value: "composerData:\(composerID)"),
+                   sqlite3_step(cStmt) == SQLITE_ROW,
+                   let raw = sqliteColumnString(cStmt, 0, maxBytes: 512 * 1_024),
+                   let data = raw.data(using: .utf8),
+                   let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                    if let inlineConv = dict["conversation"] as? [[String: Any]], !inlineConv.isEmpty {
+                        for item in inlineConv.suffix(maxTurns) {
+                            if let parsed = parseCursorBubbleDict(item, index: &counter) {
+                                turns.append(parsed)
+                            }
+                        }
+                        if !turns.isEmpty { return turns }
+                    }
+                    if let headers = dict["fullConversationHeadersOnly"] as? [[String: Any]] {
+                        for h in headers.suffix(maxTurns) {
+                            if let bID = h["bubbleId"] as? String {
+                                orderedBubbleKeys.append("bubbleId:\(composerID):\(bID)")
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !orderedBubbleKeys.isEmpty {
+                let bSQL = "SELECT value FROM cursorDiskKV WHERE key = ? LIMIT 1"
+                for key in orderedBubbleKeys {
+                    var bStmt: OpaquePointer?
+                    guard sqlite3_prepare_v2(db, bSQL, -1, &bStmt, nil) == SQLITE_OK, let bStmt else { continue }
+                    defer { sqlite3_finalize(bStmt) }
+                    guard sqliteBindText(bStmt, index: 1, value: key),
+                          sqlite3_step(bStmt) == SQLITE_ROW,
+                          let raw = sqliteColumnString(bStmt, 0, maxBytes: 256 * 1_024),
+                          let data = raw.data(using: .utf8),
+                          let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+                    if let parsed = parseCursorBubbleDict(dict, index: &counter) {
+                        turns.append(parsed)
+                    }
+                }
+                return Array(turns.suffix(maxTurns))
+            }
+
+            // Prefix scan fallback for bubbleId:<composerID>:%
+            let prefixSQL = "SELECT value FROM cursorDiskKV WHERE key LIKE ? LIMIT \(maxTurns)"
+            var pStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, prefixSQL, -1, &pStmt, nil) == SQLITE_OK, let pStmt else { return [] }
+            defer { sqlite3_finalize(pStmt) }
+            guard sqliteBindText(pStmt, index: 1, value: "bubbleId:\(composerID):%") else { return [] }
+            while sqlite3_step(pStmt) == SQLITE_ROW {
+                guard let raw = sqliteColumnString(pStmt, 0, maxBytes: 256 * 1_024),
+                      let data = raw.data(using: .utf8),
+                      let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+                if let parsed = parseCursorBubbleDict(dict, index: &counter) {
+                    turns.append(parsed)
+                }
+            }
+            return Array(turns.suffix(maxTurns))
+        }
+    }
+
+    private func queryCursorWorkspaceTurns(at dbURL: URL, composerID: String, maxTurns: Int) -> [SessionChatTurn]? {
+        withReadOnlySQLite(dbURL, maxCellBytes: 512 * 1_024) { db in
+            let sql = "SELECT value FROM ItemTable WHERE key = 'composer.composerData' LIMIT 1"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_step(stmt) == SQLITE_ROW,
+                  let raw = sqliteColumnString(stmt, 0, maxBytes: 512 * 1_024),
+                  let data = raw.data(using: .utf8),
+                  let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let list = root["allComposers"] as? [[String: Any]],
+                  let matched = list.first(where: { ($0["composerId"] as? String) == composerID }),
+                  let conv = matched["conversation"] as? [[String: Any]] else {
+                return []
+            }
+            var turns: [SessionChatTurn] = []
+            var counter = 0
+            for item in conv.suffix(maxTurns) {
+                if let parsed = parseCursorBubbleDict(item, index: &counter) {
+                    turns.append(parsed)
+                }
+            }
+            return turns
+        }
+    }
+
+    private func parseCursorBubbleDict(_ dict: [String: Any], index: inout Int) -> SessionChatTurn? {
+        let rawText = (dict["text"] as? String) ?? (dict["rawText"] as? String) ?? (dict["message"] as? String)
+        guard let rawText, let clean = Self.sanitizeMultilineText(rawText) else { return nil }
+        let typeInt = dict["type"] as? Int
+        let roleStr = (dict["role"] as? String ?? "").lowercased()
+        let isUser = (typeInt == 1) || roleStr == "user"
+        index += 1
+        let ts = QuotaParsing.date(dict["createdAt"] ?? dict["timingInfo"])
+        return SessionChatTurn(
+            id: "cur-\(index)",
+            kind: isUser ? .user : .assistant,
+            text: clean,
+            timestamp: ts
+        )
     }
 
     // MARK: - Low-Level Safe File & SQLite Helpers

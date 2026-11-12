@@ -286,7 +286,7 @@ struct AgentSteererTests {
         #expect(outcome.detail?.contains("Started continuation") == true)
         let request = try #require(launcher.requests.first)
         let expected = isCodex ? ["exec", "-c", "sqlite_home=\"\(catalog.codexHome.path)\"", "resume", sessionID, "--", "--follow up"]
-                               : ["--standalone", "run", "--session", sessionID, "--", "--follow up"]
+                               : ["run", "--session", sessionID, "--", "--follow up"]
         #expect(request.arguments == expected)
         #expect(request.workingDirectory?.path == project.path)
         if isCodex {
