@@ -39,21 +39,26 @@ public struct SessionTurnPreviewInspector: Sendable {
         self.homeDirectory = homeDirectory
     }
 
+    private static let secretPatterns: [NSRegularExpression] = [
+        #"(?i:Bearer)\s+[A-Za-z0-9._~+/-]+=*"#,
+        #"sk-[A-Za-z0-9_-]{12,}"#,
+        #"gh[pousr]_[A-Za-z0-9]{12,}"#,
+        #"github_pat_[A-Za-z0-9_]{20,}"#,
+        #"AKIA[0-9A-Z]{16}"#,
+        #"xox[baprs]-[A-Za-z0-9-]{10,}"#,
+        #"AIza[A-Za-z0-9_-]{16,}"#,
+        #"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?"#,
+        #"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"#,
+        #"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"#
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+
     public static func sanitizeAndRedact(_ raw: String, maxLength: Int = 160) -> String? {
         guard maxLength > 0 else { return nil }
         var text = String(String.UnicodeScalarView(raw.unicodeScalars.compactMap { scalar in
             if CharacterSet.whitespacesAndNewlines.contains(scalar) { return Unicode.Scalar(32) }
             return CharacterSet.controlCharacters.contains(scalar) ? nil : scalar
         }))
-        let patterns = [
-            #"(?i:Bearer)\s+[A-Za-z0-9._~+/-]+=*"#,
-            #"sk-[A-Za-z0-9_-]{12,}"#,
-            #"gh[pousr]_[A-Za-z0-9]{12,}"#,
-            #"AIza[A-Za-z0-9_-]{16,}"#,
-            #"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?"#
-        ]
-        for pattern in patterns {
-            guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
+        for expression in secretPatterns {
             text = expression.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "[REDACTED]")
         }
         text = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")

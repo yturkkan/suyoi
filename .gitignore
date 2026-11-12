@@ -7,11 +7,8 @@ DerivedData/
 *.xcuserstate
 .DS_Store
 
-# Keep only the packaged app bundle & archive in build/
-build/*
-!build/Suyoi.app
-!build/Suyoi.app/**
-!build/Suyoi.app.zip
+# Packaged app outputs are published via GitHub Releases, never tracked in git
+build/
 
 # Local environment & logs
 .env

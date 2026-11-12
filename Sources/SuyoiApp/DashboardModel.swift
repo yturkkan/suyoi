@@ -63,10 +63,12 @@ public enum LiveQuotaTrigger: Sendable {
 }
 
 public struct ActionBanner: Equatable, Sendable {
+    public let id: UUID
     public let message: String
     public let isError: Bool
 
-    public init(message: String, isError: Bool = false) {
+    public init(id: UUID = UUID(), message: String, isError: Bool = false) {
+        self.id = id
         self.message = message
         self.isError = isError
     }
@@ -96,7 +98,6 @@ final class DashboardModel: ObservableObject {
     @Published var selectedSteerSessionID: String?
     @Published private(set) var isLoadingSteerSessions = false
     @Published var isSteering = false
-    @Published var isShowingCleanupPreview = false
     @Published var isShowingSettings = false
     @Published var isPopoverPinned = false
     @Published var isDetachedWindowOpen = false
@@ -212,14 +213,31 @@ final class DashboardModel: ObservableObject {
     /// Automatic (refresh-tick) live quota polls are throttled; explicit user refreshes are not.
     private var lastAutomaticLiveQuotaPollAt: Date?
     private var liveQuotaFailureStreak = 0
+    private struct LoadedTurnsSignature: Equatable {
+        let sessionID: String
+        let updatedAt: Date?
+        let sourceModifiedAt: Date?
+        let isLive: Bool
+        let liveTask: String?
+        let liveActivity: AgentActivityState?
+    }
     private static let automaticLiveQuotaInterval: TimeInterval = 120
+    private static let heavyRefreshInterval: TimeInterval = 20
+    private var lastHeavyRefreshAt: Date?
+    private var lastLiveAgentFingerprint: [String] = []
+    private var lastLoadedTurnsSignature: LoadedTurnsSignature?
+    private var loadedTurnsSessionID: String?
+    private var isDrainingApprovalSpool = false
+    private var needsAnotherApprovalDrain = false
     private var cleanupScanTask: Task<Void, Never>?
     private var cleanupScanGeneration: UInt64 = 0
     private var deepStorageTask: Task<Void, Never>?
     private var deepStorageGeneration: UInt64 = 0
     private var sessionTurnsTask: Task<Void, Never>?
     private var sessionTurnsGeneration = UUID()
+    #if DEBUG
     private var fixtureTurnsBySessionID: [String: [SessionChatTurn]] = [:]
+    #endif
 
     init(
         actionExecutor: any ActionExecuting = ActionExecutor(),
@@ -330,7 +348,7 @@ final class DashboardModel: ObservableObject {
             self.scopedApprovalPolicy = savedPolicy
             self.approvalController.setScopedPolicy(savedPolicy)
         }
-        let bridgePath = Bundle.main.executableURL?.path ?? "/Applications/Suyoi.app/Contents/MacOS/Suyoi"
+        let bridgePath = Bundle.main.executableURL?.path ?? Self.defaultInstalledExecutablePath
         self.claudeHookStatus = ClaudeHookInstaller(homeDirectory: home).inspectStatus(bridgeExecutablePath: bridgePath)
 
         sharedLauncher.setStateObserver { [weak self] in
@@ -709,7 +727,7 @@ final class DashboardModel: ObservableObject {
         return Date().timeIntervalSince(capturedAt) > 30
     }
 
-    func refresh() {
+    func refresh(forceHeavy: Bool = false) {
         guard !isRefreshing, let currentInspector = inspector else { return }
         isRefreshing = true
         let currentQuotaInspector = quotaInspector
@@ -718,9 +736,25 @@ final class DashboardModel: ObservableObject {
         let sessionIndexer = WorkspaceSessionIndexer(homeDirectory: homeDirectory)
         let home = homeDirectory
         let currentUID = Int(getuid())
+        let previousFingerprint = lastLiveAgentFingerprint
+        let elapsedSinceHeavy = lastHeavyRefreshAt.map { Date().timeIntervalSince($0) } ?? .infinity
+        let cachedStorage = (!storageProgress.isIndexing) ? storageReport : nil
+        let heavyInterval = Self.heavyRefreshInterval
+
+        struct RefreshPayload: Sendable {
+            let snapshot: InventorySnapshot
+            let previews: [Int: SessionTurnPreview]
+            let orphans: [OrphanToolProcess]
+            let refreshedStorage: StorageIndexReport?
+            let fingerprint: [String]
+            let diffs: [String: WorktreeDiffSummary]?
+            let sessions: [IndexedAgentSession]?
+            let quotas: QuotaSnapshot?
+            let ranHeavy: Bool
+        }
+
         Task {
-            async let invResult = Task.detached(priority: .utility) {
-                () -> (InventorySnapshot, [Int: SessionTurnPreview], [String: WorktreeDiffSummary], [OrphanToolProcess], [IndexedAgentSession]) in
+            let payload = await Task.detached(priority: .utility) { () -> RefreshPayload in
                 let snap = currentInspector.snapshot()
                 var previews: [Int: SessionTurnPreview] = [:]
                 for obs in snap.agentObservations {
@@ -728,39 +762,128 @@ final class DashboardModel: ObservableObject {
                         previews[obs.id] = preview
                     }
                 }
-                let diffs = diffInspector.inspectActiveProjects(for: snap.agentObservations)
                 let orphans = ProcessHealthAdvisor.detectOrphanToolProcesses(in: snap, uid: currentUID)
-                let sessions = sessionIndexer.indexSessions(liveAgents: snap.agentObservations, allProcesses: snap.processes)
-                return (snap, previews, diffs, orphans, sessions)
+                let refreshedStorage = cachedStorage.map {
+                    DeepStorageIndexer(homeDirectory: home).refreshSafetyStates(
+                        in: $0,
+                        liveProcesses: snap.processes
+                    )
+                }
+                let fingerprint = snap.agentObservations
+                    .map { "\($0.process.pid):\($0.process.startTimeMicroseconds):\($0.activityState?.rawValue ?? "none")" }
+                    .sorted()
+                let runHeavy = forceHeavy
+                    || elapsedSinceHeavy >= heavyInterval
+                    || fingerprint != previousFingerprint
+                if runHeavy {
+                    async let diffsTask = diffInspector.inspectActiveProjects(for: snap.agentObservations)
+                    async let sessionsTask = sessionIndexer.indexSessions(
+                        liveAgents: snap.agentObservations,
+                        allProcesses: snap.processes
+                    )
+                    async let quotasTask = currentQuotaInspector.inspectQuotas(at: Date())
+                    let (diffs, sessions, quotas) = await (diffsTask, sessionsTask, quotasTask)
+                    return RefreshPayload(
+                        snapshot: snap,
+                        previews: previews,
+                        orphans: orphans,
+                        refreshedStorage: refreshedStorage,
+                        fingerprint: fingerprint,
+                        diffs: diffs,
+                        sessions: sessions,
+                        quotas: quotas,
+                        ranHeavy: true
+                    )
+                } else {
+                    return RefreshPayload(
+                        snapshot: snap,
+                        previews: previews,
+                        orphans: orphans,
+                        refreshedStorage: refreshedStorage,
+                        fingerprint: fingerprint,
+                        diffs: nil,
+                        sessions: nil,
+                        quotas: nil,
+                        ranHeavy: false
+                    )
+                }
             }.value
-            async let quotaResult = Task.detached(priority: .utility) { currentQuotaInspector.inspectQuotas(at: Date()) }.value
-            let ((newSnapshot, newPreviews, newDiffs, newOrphans, newSessions), newQuotas) = await (invResult, quotaResult)
-            snapshot = newSnapshot
-            agentTurnPreviews = newPreviews
-            worktreeDiffs = newDiffs
-            orphanToolProcesses = newOrphans
-            indexedSessions = newSessions
-            if selectedIndexedSessionID == nil || !newSessions.contains(where: { $0.id == selectedIndexedSessionID }) {
-                if let firstSession = newSessions.first {
+
+            snapshot = payload.snapshot
+            agentTurnPreviews = payload.previews
+            orphanToolProcesses = payload.orphans
+            lastLiveAgentFingerprint = payload.fingerprint
+
+            if payload.ranHeavy {
+                lastHeavyRefreshAt = Date()
+                if let newDiffs = payload.diffs {
+                    worktreeDiffs = newDiffs
+                }
+                if let newSessions = payload.sessions {
+                    indexedSessions = newSessions
+                }
+                if let newQuotas = payload.quotas {
+                    quotaSnapshot = newQuotas
+                    recordCurrentQuotaBurnSamples()
+                }
+            } else if !indexedSessions.isEmpty {
+                let liveByIdentity = Dictionary(
+                    payload.snapshot.agentObservations.map { ($0.process.identity, $0) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+                indexedSessions = indexedSessions.map { session in
+                    guard let oldObs = session.liveObservation,
+                          let freshObs = liveByIdentity[oldObs.process.identity] else {
+                        return session
+                    }
+                    return IndexedAgentSession(
+                        id: session.id,
+                        provider: session.provider,
+                        agentName: session.agentName,
+                        sessionID: session.sessionID,
+                        title: session.title,
+                        projectPath: session.projectPath,
+                        projectName: session.projectName,
+                        gitBranch: session.gitBranch,
+                        sourcePath: session.sourcePath,
+                        updatedAt: session.updatedAt,
+                        isLive: session.isLive,
+                        liveObservation: freshObs,
+                        canResumeNatively: session.canResumeNatively,
+                        nativeSteerMode: session.nativeSteerMode,
+                        liveSteerMode: AgentSteerer.preferredMode(for: freshObs),
+                        lastMessageSnippet: session.lastMessageSnippet,
+                        turnCount: session.turnCount
+                    )
+                }
+            }
+
+            if selectedIndexedSessionID == nil || !indexedSessions.contains(where: { $0.id == selectedIndexedSessionID }) {
+                if let firstSession = indexedSessions.first {
                     selectedIndexedSessionID = firstSession.id
                     preferLiveTerminalSteer = firstSession.canSteerInLiveTerminal
                 }
             }
-            reloadSelectedSessionTurns()
-            if let existingStorage = storageReport, !storageProgress.isIndexing {
-                storageReport = DeepStorageIndexer(homeDirectory: home).refreshSafetyStates(
-                    in: existingStorage,
-                    liveProcesses: newSnapshot.processes
-                )
+            if let activeSession = activeSelectedSession ?? indexedSessions.first(where: { $0.id == selectedIndexedSessionID }) {
+                if forceHeavy || computeTurnsSignature(for: activeSession) != lastLoadedTurnsSignature {
+                    reloadSelectedSessionTurns(showLoadingIndicator: loadedTurnsSessionID != activeSession.id)
+                }
+            } else if !selectedSessionTurns.isEmpty {
+                reloadSelectedSessionTurns()
             }
+            if let refreshedStorage = payload.refreshedStorage,
+               !storageProgress.isIndexing,
+               storageReport?.indexedAt == cachedStorage?.indexedAt,
+               storageReport?.items.count == cachedStorage?.items.count {
+                storageReport = refreshedStorage
+            }
+
             let currentAgents = agentRows
             worktreeCollisions = AgentCollisionDetector.detectCollisions(in: currentAgents)
-            stuckAgents = stuckAgentTracker.evaluate(agents: currentAgents, turnPreviews: newPreviews)
+            stuckAgents = stuckAgentTracker.evaluate(agents: currentAgents, turnPreviews: payload.previews)
             if let launcher = nativeJobLauncher {
                 continuationJobs = launcher.recentJobs()
             }
-            quotaSnapshot = newQuotas
-            recordCurrentQuotaBurnSamples()
             isRefreshing = false
             pollApprovalInboxSpool()
             evaluateAgentStateAudioTransitions(currentAgents: currentAgents)
@@ -1017,7 +1140,8 @@ final class DashboardModel: ObservableObject {
             showBanner(isLaunchAtLoginEnabled ? "Launch at Login enabled" : "Launch at Login disabled")
         } catch {
             isLaunchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
-            showBanner("Move Suyoi.app to /Applications to enable Launch at Login", isError: true)
+            let bundleName = isParallelBuild ? "Suyoi Next.app" : "Suyoi.app"
+            showBanner("Move \(bundleName) to /Applications to enable Launch at Login", isError: true)
         }
     }
 
@@ -1392,9 +1516,13 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    static var defaultInstalledExecutablePath: String {
+        let bundleName = SuyoiAppIdentity.isParallelNextBuild ? "Suyoi Next.app" : "Suyoi.app"
+        return "/Applications/\(bundleName)/Contents/MacOS/Suyoi"
+    }
+
     func copyHookSnippet(for agentName: String = "Claude Code") {
-        let bridgePath = Bundle.main.executableURL?.path ?? "/Applications/Suyoi.app/Contents/MacOS/Suyoi"
-        let snippet = AgentApprovalController.hookSnippet(for: agentName, bridgeExecutablePath: bridgePath) + " --hook-bridge"
+        let snippet = AgentApprovalController.hookSnippet(for: agentName, bridgeExecutablePath: bridgeExecutablePath) + " --hook-bridge"
             + "\n# Use as a synchronous Claude Code command hook for SessionStart, SessionEnd, and one approval event."
             + "\n# Choose PreToolUse to review tool calls or PermissionRequest to review native permission prompts."
         NSPasteboard.general.clearContents()
@@ -1405,7 +1533,7 @@ final class DashboardModel: ObservableObject {
     // MARK: - Claude Hook Installer & Scoped Read-Only Policy
 
     var bridgeExecutablePath: String {
-        Bundle.main.executableURL?.path ?? "/Applications/Suyoi.app/Contents/MacOS/Suyoi"
+        Bundle.main.executableURL?.path ?? Self.defaultInstalledExecutablePath
     }
 
     var claudeHookPreview: ClaudeHookPreview? {
@@ -1660,17 +1788,33 @@ final class DashboardModel: ObservableObject {
     }
 
     private func pollApprovalInboxSpool() {
-        let client = HookBridgeClient(
-            inboxDirectory: HookBridgeClient.defaultInboxDirectory(homeDirectory: homeDirectory),
-            outboxDirectory: HookBridgeClient.defaultOutboxDirectory(homeDirectory: homeDirectory)
-        )
-        let addedCount = client.drainInbox(into: approvalController)
-        pendingApprovals = approvalController.pendingRequests()
-        autoApprovedSessions = approvalController.activeAutoApproveRequests()
-        autoApprovedToolHistory = approvalController.recentAutoApprovedRecords()
-        if addedCount > 0 {
-            soundPlayer.play(.attentionRequired, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
-            deliverPendingApprovalNotificationsIfNeeded()
+        if isDrainingApprovalSpool {
+            needsAnotherApprovalDrain = true
+            return
+        }
+        isDrainingApprovalSpool = true
+        let home = homeDirectory
+        let controller = approvalController
+        Task {
+            let addedCount = await Task.detached(priority: .userInitiated) {
+                let client = HookBridgeClient(
+                    inboxDirectory: HookBridgeClient.defaultInboxDirectory(homeDirectory: home),
+                    outboxDirectory: HookBridgeClient.defaultOutboxDirectory(homeDirectory: home)
+                )
+                return client.drainInbox(into: controller)
+            }.value
+            pendingApprovals = controller.pendingRequests()
+            autoApprovedSessions = controller.activeAutoApproveRequests()
+            autoApprovedToolHistory = controller.recentAutoApprovedRecords()
+            if addedCount > 0 {
+                soundPlayer.play(.attentionRequired, mode: soundMode, theme: experienceTheme, selectedPack: selectedSoundPack)
+                deliverPendingApprovalNotificationsIfNeeded()
+            }
+            isDrainingApprovalSpool = false
+            if needsAnotherApprovalDrain {
+                needsAnotherApprovalDrain = false
+                pollApprovalInboxSpool()
+            }
         }
     }
 
@@ -2196,21 +2340,47 @@ final class DashboardModel: ObservableObject {
         }
     }
 
-    func reloadSelectedSessionTurns() {
+    private func computeTurnsSignature(for session: IndexedAgentSession) -> LoadedTurnsSignature {
+        let sourceModifiedAt: Date?
+        if let sourcePath = session.sourcePath, !sourcePath.isEmpty {
+            sourceModifiedAt = (try? URL(fileURLWithPath: sourcePath).resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        } else {
+            sourceModifiedAt = nil
+        }
+        return LoadedTurnsSignature(
+            sessionID: session.id,
+            updatedAt: session.updatedAt,
+            sourceModifiedAt: sourceModifiedAt,
+            isLive: session.isLive,
+            liveTask: session.liveObservation?.currentTask,
+            liveActivity: session.liveObservation?.activityState
+        )
+    }
+
+    func reloadSelectedSessionTurns(showLoadingIndicator: Bool = true) {
         guard let session = activeSelectedSession ?? indexedSessions.first(where: { $0.id == selectedIndexedSessionID }) else {
             selectedSessionTurns = []
+            loadedTurnsSessionID = nil
+            lastLoadedTurnsSignature = nil
             isLoadingSessionTurns = false
             return
         }
+        let signature = computeTurnsSignature(for: session)
+        #if DEBUG
         if inspector == nil {
             selectedSessionTurns = fixtureTurnsBySessionID[session.id] ?? []
+            loadedTurnsSessionID = session.id
+            lastLoadedTurnsSignature = signature
             isLoadingSessionTurns = false
             return
         }
+        #endif
         sessionTurnsTask?.cancel()
         let gen = UUID()
         sessionTurnsGeneration = gen
-        isLoadingSessionTurns = true
+        if showLoadingIndicator || loadedTurnsSessionID != session.id {
+            isLoadingSessionTurns = true
+        }
         let home = homeDirectory
         let procs = snapshot?.processes ?? []
         sessionTurnsTask = Task {
@@ -2223,6 +2393,8 @@ final class DashboardModel: ObservableObject {
             }.value
             guard !Task.isCancelled, sessionTurnsGeneration == gen else { return }
             selectedSessionTurns = turns
+            loadedTurnsSessionID = session.id
+            lastLoadedTurnsSignature = signature
             isLoadingSessionTurns = false
         }
     }
@@ -2625,6 +2797,19 @@ final class DashboardModel: ObservableObject {
                 showBanner(error.localizedDescription, isError: true)
             }
         }
+    }
+
+    func shutdown() {
+        approvalInboxWatcher?.stop()
+        approvalInboxWatcher = nil
+        livePollTask?.cancel()
+        livePollTask = nil
+        cleanupScanTask?.cancel()
+        cleanupScanTask = nil
+        deepStorageTask?.cancel()
+        deepStorageTask = nil
+        sessionTurnsTask?.cancel()
+        sessionTurnsTask = nil
     }
 
     private func showBanner(_ message: String, isError: Bool = false) {

@@ -128,9 +128,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             }
             .store(in: &cancellables)
 
-        model.refresh()
+        model.refresh(forceHeavy: true)
         updateIslandSurface()
-        scheduleRefreshTimer(interval: 10)
+        scheduleRefreshTimer(interval: 15)
     }
 
     private func updateIslandSurface() {
@@ -186,7 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             detachedWindow = nil
             model.isDetachedWindowOpen = false
             if !popover.isShown {
-                scheduleRefreshTimer(interval: 10)
+                scheduleRefreshTimer(interval: 15)
             }
         }
     }
@@ -216,12 +216,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
     private func scheduleRefreshTimer(interval: TimeInterval) {
         refreshTimer?.invalidate()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.model.refresh()
             }
         }
+        timer.tolerance = interval * 0.25
+        refreshTimer = timer
     }
 
     @objc private func togglePopover() {
@@ -230,6 +232,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
                 win.orderOut(nil)
                 detachedWindow = nil
                 model.isDetachedWindowOpen = false
+                if !popover.isShown {
+                    scheduleRefreshTimer(interval: 15)
+                }
             } else {
                 NSApp.activate(ignoringOtherApps: true)
                 win.makeKeyAndOrderFront(nil)
@@ -260,7 +265,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             && model.steerPromptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && model.consoleComposerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && model.selectedSteerSessionID == nil
-            && !model.isShowingCleanupPreview
             && !model.isShowingNotesPopover
     }
 
@@ -300,20 +304,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
     func popoverDidShow(_ notification: Notification) {
         installGlobalClickMonitor()
-        model.refresh()
+        model.refresh(forceHeavy: true)
         scheduleRefreshTimer(interval: 5)
     }
 
     func popoverDidClose(_ notification: Notification) {
         removeGlobalClickMonitor()
         if detachedWindow?.isVisible != true {
-            scheduleRefreshTimer(interval: 10)
+            scheduleRefreshTimer(interval: 15)
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         removeGlobalClickMonitor()
         refreshTimer?.invalidate()
+        model.shutdown()
     }
 }
 

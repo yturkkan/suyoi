@@ -770,6 +770,11 @@ public struct AgentSteerer: AgentSteering, Sendable {
             set s to item 1 of matches
             if not (exists s) then error "Terminal target no longer exists"
             if tty of s is not targetTTY then error "Terminal association changed"
+            set atShell to false
+            try
+                set atShell to (is at shell prompt of s)
+            end try
+            if atShell then error "Terminal target is at a shell"
             tell s to write text promptText
         end tell
     end run

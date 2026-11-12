@@ -8,22 +8,71 @@ public struct HookBridgeClient: Sendable {
     public let outboxDirectory: URL
     private let hookOwner: @Sendable () -> ObservedProcess?
     private let processLookup: @Sendable (Int32, Int) -> ObservedProcess?
+    private let requireActiveListener: Bool
+
+    public static let listenerIdentityFilename = ".suyoi-listener.json"
 
     public init(
         inboxDirectory: URL = HookBridgeClient.defaultInboxDirectory(),
         outboxDirectory: URL = HookBridgeClient.defaultOutboxDirectory()
     ) {
         self.init(inboxDirectory: inboxDirectory, outboxDirectory: outboxDirectory,
-                  hookOwner: { Self.claudeAncestor() }, processLookup: { DarwinProcessReader().process(pid: $0, uid: $1) })
+                  hookOwner: { Self.claudeAncestor() }, processLookup: { DarwinProcessReader().process(pid: $0, uid: $1) },
+                  requireActiveListener: true)
     }
 
     init(inboxDirectory: URL, outboxDirectory: URL,
          hookOwner: @escaping @Sendable () -> ObservedProcess?,
-         processLookup: @escaping @Sendable (Int32, Int) -> ObservedProcess?) {
+         processLookup: @escaping @Sendable (Int32, Int) -> ObservedProcess?,
+         requireActiveListener: Bool = false) {
         self.inboxDirectory = inboxDirectory
         self.outboxDirectory = outboxDirectory
         self.hookOwner = hookOwner
         self.processLookup = processLookup
+        self.requireActiveListener = requireActiveListener
+    }
+
+    /// Records the running Suyoi app's ProcessIdentity so `--hook-bridge` knows a live UI is listening.
+    public static func registerActiveListener(
+        outboxDirectory: URL = defaultOutboxDirectory(),
+        identity: ProcessIdentity? = nil
+    ) {
+        guard let resolved = identity ?? DarwinProcessReader().process(pid: getpid(), uid: Int(getuid()))?.identity,
+              resolved.isActionEligible,
+              let data = try? JSONEncoder().encode(resolved) else { return }
+        let outbox = HookBridgeFiles.openDirectory(outboxDirectory)
+        guard outbox >= 0 else { return }
+        defer { close(outbox) }
+        _ = HookBridgeFiles.writeAtomically(data, name: listenerIdentityFilename, directory: outbox)
+    }
+
+    /// Removes the listener marker on clean shutdown if it still belongs to `pid`.
+    public static func unregisterActiveListener(
+        outboxDirectory: URL = defaultOutboxDirectory(),
+        pid: Int = Int(getpid())
+    ) {
+        let outbox = HookBridgeFiles.openDirectory(outboxDirectory)
+        guard outbox >= 0 else { return }
+        defer { close(outbox) }
+        if case .data(let data) = HookBridgeFiles.readBoundedFile(name: listenerIdentityFilename, directory: outbox, maxBytes: 4_096),
+           let stored = try? JSONDecoder().decode(ProcessIdentity.self, from: data),
+           stored.pid == pid {
+            _ = unlinkat(outbox, listenerIdentityFilename, 0)
+        }
+    }
+
+    private func isActiveListenerAlive(in outbox: Int32) -> Bool {
+        guard case .data(let data) = HookBridgeFiles.readBoundedFile(
+            name: Self.listenerIdentityFilename, directory: outbox, maxBytes: 4_096
+        ),
+        let stored = try? JSONDecoder().decode(ProcessIdentity.self, from: data),
+        stored.isActionEligible,
+        stored.uid == Int(getuid()),
+        let pid = Int32(exactly: stored.pid),
+        let live = processLookup(pid, stored.uid) else {
+            return false
+        }
+        return live.identity == stored && !live.isStopped
     }
 
     public static func defaultInboxDirectory(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
@@ -130,6 +179,10 @@ public struct HookBridgeClient: Sendable {
         let outbox = HookBridgeFiles.openDirectory(outboxDirectory)
         guard outbox >= 0 else { return deny("Hook bridge unavailable") }
         defer { close(outbox) }
+        if requireActiveListener && !isActiveListenerAlive(in: outbox) {
+            // Suyoi is not running: return empty output so Claude Code falls back to its own prompt immediately.
+            return Data()
+        }
         HookBridgeFiles.pruneStaleFiles(in: outbox, suffix: ".response.json", olderThan: 180, now: now)
         let id = UUID().uuidString
         let requestName = id + ".json"
@@ -143,11 +196,16 @@ public struct HookBridgeClient: Sendable {
         }
         let started = ProcessInfo.processInfo.systemUptime
         let interval = pollInterval.isFinite && pollInterval > 0 ? max(0.001, pollInterval) : 0.05
+        var pollCount = 0
         while true {
             let remaining = timeout - (ProcessInfo.processInfo.systemUptime - started)
             guard remaining > 0 else { return deny("Approval timed out") }
             switch HookBridgeFiles.readBoundedFile(name: responseName, directory: outbox, maxBytes: 16_384) {
             case .missing:
+                pollCount &+= 1
+                if requireActiveListener && pollCount % 10 == 0 && !isActiveListenerAlive(in: outbox) {
+                    return Data()
+                }
                 Thread.sleep(forTimeInterval: min(interval, remaining))
             case .invalid:
                 return deny("Invalid approval response")
@@ -346,6 +404,7 @@ public struct HookBridgeClient: Sendable {
 /// Directory notifications are coalesced by Dispatch. The callback should rescan the inbox.
 public final class ApprovalInboxWatcher: @unchecked Sendable {
     private let inboxDirectory: URL
+    private let outboxDirectory: URL
     private let onChange: @Sendable () -> Void
     private let queue = DispatchQueue(label: "suyoi.approval-inbox", qos: .userInitiated)
     private let lock = NSLock()
@@ -354,9 +413,12 @@ public final class ApprovalInboxWatcher: @unchecked Sendable {
 
     public init(
         inboxDirectory: URL = HookBridgeClient.defaultInboxDirectory(),
+        outboxDirectory: URL? = nil,
         onChange: @escaping @Sendable () -> Void
     ) {
         self.inboxDirectory = inboxDirectory
+        self.outboxDirectory = outboxDirectory
+            ?? inboxDirectory.deletingLastPathComponent().appendingPathComponent("outbox", isDirectory: true)
         self.onChange = onChange
     }
 
@@ -365,6 +427,7 @@ public final class ApprovalInboxWatcher: @unchecked Sendable {
             guard source == nil else { return }
             let descriptor = HookBridgeFiles.openDirectory(inboxDirectory)
             guard descriptor >= 0 else { return }
+            HookBridgeClient.registerActiveListener(outboxDirectory: outboxDirectory)
             let token = UUID()
             let watcher = DispatchSource.makeFileSystemObjectSource(
                 fileDescriptor: descriptor, eventMask: [.write, .extend, .attrib, .rename], queue: queue
@@ -382,10 +445,15 @@ public final class ApprovalInboxWatcher: @unchecked Sendable {
 
     /// Cancels future notifications; an already-running callback may finish.
     public func stop() {
-        lock.withLock {
+        let wasRunning = lock.withLock { () -> Bool in
+            let active = source != nil
             generation = nil
             source?.cancel()
             source = nil
+            return active
+        }
+        if wasRunning {
+            HookBridgeClient.unregisterActiveListener(outboxDirectory: outboxDirectory)
         }
     }
 

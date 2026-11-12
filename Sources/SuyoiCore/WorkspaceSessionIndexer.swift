@@ -143,8 +143,13 @@ public struct WorkspaceSessionIndexer: Sendable {
         #"(?i:Bearer)\s+[A-Za-z0-9._~+/-]+=*"#,
         #"sk-[A-Za-z0-9_-]{12,}"#,
         #"gh[pousr]_[A-Za-z0-9]{12,}"#,
+        #"github_pat_[A-Za-z0-9_]{20,}"#,
+        #"AKIA[0-9A-Z]{16}"#,
+        #"xox[baprs]-[A-Za-z0-9-]{10,}"#,
         #"AIza[A-Za-z0-9_-]{16,}"#,
-        #"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?"#
+        #"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+)?"#,
+        #"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"#,
+        #"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"#
     ].compactMap { try? NSRegularExpression(pattern: $0) }
 
     /// Preserves readable multi-line formatting while stripping control bytes and redacting tokens.
@@ -223,29 +228,51 @@ public struct WorkspaceSessionIndexer: Sendable {
         var matchedDiskIndices = Set<Int>()
         var correlatedResults: [IndexedAgentSession] = []
 
+        // Count live agents per (provider, canonicalProject) so ambiguous multi-instance
+        // directories never guess which transcript belongs to which terminal.
+        var liveCountByProviderAndDir: [String: Int] = [:]
+        for obs in liveAgents {
+            let provider = SessionProviderKind.from(agentName: obs.agentName)
+            if let dir = canonicalExistingDirectory(obs.project?.rootPath ?? obs.process.cwd) {
+                liveCountByProviderAndDir["\(provider.rawValue)\0\(dir)", default: 0] += 1
+            }
+        }
+
         for obs in liveAgents {
             let provider = SessionProviderKind.from(agentName: obs.agentName)
             let canonicalObsProject = canonicalExistingDirectory(obs.project?.rootPath ?? obs.process.cwd)
             let liveSteer = AgentSteerer.preferredMode(for: obs)
 
             var bestMatchIndex: Int?
-            // 1. Exact sessionID match
-            if let explicitID = obs.sessionID, !explicitID.isEmpty {
+            let explicitID = obs.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let explicitID, !explicitID.isEmpty {
+                // 1. Exact sessionID match only — never fall back to another session's transcript
+                // when we already know this live process's session identifier.
                 bestMatchIndex = diskSessions.indices.first { idx in
                     !matchedDiskIndices.contains(idx)
                         && diskSessions[idx].provider == provider
                         && diskSessions[idx].sessionID?.lowercased() == explicitID.lowercased()
                 }
-            }
-            // 2. Canonical project directory match (same provider, newest updated session)
-            if bestMatchIndex == nil, let canonicalObsProject {
+            } else if let canonicalObsProject,
+                      liveCountByProviderAndDir["\(provider.rawValue)\0\(canonicalObsProject)"] == 1 {
+                // 2. Unambiguous single-instance exact directory match, and only if the session
+                // file has been active since (within 60s of) the live process start time.
+                let realEpochCutoffMicros: UInt64 = 1_000_000_000_000_000 // ~2001-09-09; synthetic test values are small
+                let earliestPlausibleUpdate: Date? = {
+                    guard let micros = obs.process.startTimeMicroseconds, micros >= realEpochCutoffMicros else {
+                        return nil
+                    }
+                    return Date(timeIntervalSince1970: Double(micros) / 1_000_000).addingTimeInterval(-60)
+                }()
                 bestMatchIndex = diskSessions.indices.first { idx in
                     guard !matchedDiskIndices.contains(idx),
                           diskSessions[idx].provider == provider,
-                          let diskProject = diskSessions[idx].projectPath else { return false }
-                    return diskProject == canonicalObsProject
-                        || diskProject.hasPrefix(canonicalObsProject + "/")
-                        || canonicalObsProject.hasPrefix(diskProject + "/")
+                          diskSessions[idx].projectPath == canonicalObsProject else { return false }
+                    if let earliestPlausibleUpdate, let updatedAt = diskSessions[idx].updatedAt,
+                       updatedAt < earliestPlausibleUpdate {
+                        return false
+                    }
+                    return true
                 }
             }
 

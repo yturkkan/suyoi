@@ -226,7 +226,7 @@ public struct AppUpdater: AppUpdating, Sendable {
             }
             try FileManager.default.moveItem(at: tempDownloadURL, to: zipURL)
 
-            let expectedHash: String?
+            let expectedHash: String
             if let suppliedHash = release.expectedSHA256 {
                 guard let hash = Self.parseSHA256File(suppliedHash, assetName: Self.activeAssetName) else {
                     throw AppUpdaterError.bundleVerificationFailed("invalid SHA-256 checksum")
@@ -235,10 +235,9 @@ public struct AppUpdater: AppUpdating, Sendable {
             } else if let checksumURL = release.sha256AssetURL {
                 expectedHash = try await Self.fetchChecksum(at: checksumURL, downloadPrefix: downloadPrefix, assetName: Self.activeAssetName)
             } else {
-                expectedHash = nil
+                throw AppUpdaterError.bundleVerificationFailed("missing SHA-256 checksum")
             }
-            if let expectedHash,
-               try Self.computeSHA256Hex(of: zipURL).lowercased() != expectedHash.lowercased() {
+            if try Self.computeSHA256Hex(of: zipURL).lowercased() != expectedHash.lowercased() {
                 throw AppUpdaterError.bundleVerificationFailed("SHA-256 checksum mismatch")
             }
 

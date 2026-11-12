@@ -170,7 +170,8 @@ public struct ClaudeHookInstaller: Sendable {
             "hooks": [
                 [
                     "type": "command",
-                    "command": expected
+                    "command": expected,
+                    "timeout": 125
                 ]
             ]
         ]
@@ -269,7 +270,10 @@ public struct ClaudeHookInstaller: Sendable {
     }
 
     private static func isSuyoiBridgeCommand(_ command: String) -> Bool {
-        command.contains("--hook-bridge")
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasSuffix(" --hook-bridge") else { return false }
+        let executablePart = String(trimmed.dropLast(" --hook-bridge".count))
+        return executablePart.localizedCaseInsensitiveContains("/suyoi")
     }
 
     private func ensureSafeClaudeDirectory() throws {
@@ -365,10 +369,27 @@ public struct ClaudeHookInstaller: Sendable {
 
         if let existingData {
             var backupStat = stat()
-            if lstat(backupFileURL.path, &backupStat) == 0 && (backupStat.st_mode & S_IFMT) != S_IFREG {
+            let backupExists = lstat(backupFileURL.path, &backupStat) == 0
+            if backupExists && (backupStat.st_mode & S_IFMT) != S_IFREG {
                 throw Error.unsafeSettingsLocation("Backup path ~/.claude/settings.json.suyoi-backup is not a regular file")
             }
-            try writeDataAtomically(existingData, to: backupFileURL)
+            // Only write/refresh the backup when none exists yet or the existing file is clean of Suyoi hooks,
+            // so toggling PreToolUse never overwrites the user's pre-Suyoi backup.
+            let existingHasSuyoiHook: Bool = {
+                guard let obj = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any],
+                      let hooks = obj["hooks"] as? [String: Any] else { return false }
+                return hooks.values.contains { !Self.extractHookBridgeCommands(in: $0).isEmpty }
+            }()
+            if !backupExists || !existingHasSuyoiHook {
+                try writeDataAtomically(existingData, to: backupFileURL)
+            }
+            // Verify settings.json did not change on disk since we read existingData.
+            let latestData = try readRawSettingsDataIfPresent()
+            guard latestData == existingData else {
+                throw Error.writeFailed("~/.claude/settings.json changed concurrently; please retry")
+            }
+        } else if FileManager.default.fileExists(atPath: settingsFileURL.path) {
+            throw Error.writeFailed("~/.claude/settings.json appeared concurrently; please retry")
         }
         try writeDataAtomically(payload, to: settingsFileURL)
     }

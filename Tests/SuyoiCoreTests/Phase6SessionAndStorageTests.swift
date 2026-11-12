@@ -493,4 +493,109 @@ struct Phase6SessionAndStorageTests {
         #expect(report.outcomes.count == 3)
         #expect(report.outcomes.allSatisfy { !$0.succeeded })
     }
+
+    @Test("WorkspaceSessionIndexer refuses to hijack historical sessions on mismatched sessionID, parent directory, or pre-launch mtime")
+    func liveCorrelationRejectsMismatchedSessionIDParentDirectoryAndStaleFile() throws {
+        let home = try makeTempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let parentDir = home.appendingPathComponent("Developer", isDirectory: true)
+        let repoDir = parentDir.appendingPathComponent("billing-service", isDirectory: true)
+        try FileManager.default.createDirectory(at: repoDir, withIntermediateDirectories: true)
+
+        let oldSessionID = "99999999-8888-4777-8666-555555555555"
+        let claudeJSONL = """
+        {"type":"user","sessionId":"\(oldSessionID)","cwd":"\(repoDir.path)","gitBranch":"main","timestamp":"2026-01-01T10:00:00Z","message":{"role":"user","content":"Old billing task"}}
+        {"type":"assistant","sessionId":"\(oldSessionID)","cwd":"\(repoDir.path)","gitBranch":"main","timestamp":"2026-01-01T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"Done months ago."}]}}
+        """
+        let claudeFile = home
+            .appendingPathComponent(".claude/projects/-Developer-billing-service", isDirectory: true)
+            .appendingPathComponent("\(oldSessionID).jsonl")
+        try writeUTF8(claudeJSONL + "\n", to: claudeFile)
+        // Stamp file mtime far in the past (2026-01-01)
+        let historicalDate = Date(timeIntervalSince1970: 1_767_261_600)
+        try FileManager.default.setAttributes([.modificationDate: historicalDate], ofItemAtPath: claudeFile.path)
+
+        let indexer = WorkspaceSessionIndexer(homeDirectory: home)
+
+        // Case 1: Live Claude process with an explicit brand-new sessionID must NOT attach to oldSessionID
+        let procWithNewID = ObservedProcess(
+            pid: 88_001,
+            parentPID: 1,
+            uid: Int(getuid()),
+            cpuPercent: 5.0,
+            residentBytes: 100_000_000,
+            executable: "/usr/local/bin/claude",
+            startTimeMicroseconds: 500,
+            cwd: repoDir.path,
+            tty: "ttys001"
+        )
+        let obsWithNewID = AgentObservation(
+            id: procWithNewID.pid,
+            agentName: "Claude Code",
+            process: procWithNewID,
+            project: ProjectContext(rootPath: repoDir.path, name: "billing-service", framework: nil, gitBranch: "main", gitCommit: nil, isWorktree: false),
+            terminalApp: "Terminal",
+            sessionID: "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb",
+            statusSource: .processOnly,
+            childServerPorts: [],
+            activityState: .idle
+        )
+        let res1 = indexer.indexSessions(liveAgents: [obsWithNewID], allProcesses: [procWithNewID])
+        #expect(res1.count == 2)
+        #expect(res1.first(where: { $0.sessionID == oldSessionID })?.isLive == false)
+
+        // Case 2: Live Claude process started in ~/Developer parent directory must NOT hijack child repo session
+        let parentProc = ObservedProcess(
+            pid: 88_002,
+            parentPID: 1,
+            uid: Int(getuid()),
+            cpuPercent: 5.0,
+            residentBytes: 100_000_000,
+            executable: "/usr/local/bin/claude",
+            startTimeMicroseconds: 500,
+            cwd: parentDir.path,
+            tty: "ttys002"
+        )
+        let parentObs = AgentObservation(
+            id: parentProc.pid,
+            agentName: "Claude Code",
+            process: parentProc,
+            project: nil,
+            terminalApp: "Terminal",
+            statusSource: .processOnly,
+            childServerPorts: [],
+            activityState: .idle
+        )
+        let res2 = indexer.indexSessions(liveAgents: [parentObs], allProcesses: [parentProc])
+        #expect(res2.count == 2)
+        #expect(res2.first(where: { $0.sessionID == oldSessionID })?.isLive == false)
+
+        // Case 3: Fresh live Claude process in same repo (started hours after historicalDate) must NOT hijack stale file
+        let freshStartMicros = UInt64(historicalDate.addingTimeInterval(86_400).timeIntervalSince1970 * 1_000_000)
+        let freshProc = ObservedProcess(
+            pid: 88_003,
+            parentPID: 1,
+            uid: Int(getuid()),
+            cpuPercent: 5.0,
+            residentBytes: 100_000_000,
+            executable: "/usr/local/bin/claude",
+            startTimeMicroseconds: freshStartMicros,
+            cwd: repoDir.path,
+            tty: "ttys003"
+        )
+        let freshObs = AgentObservation(
+            id: freshProc.pid,
+            agentName: "Claude Code",
+            process: freshProc,
+            project: ProjectContext(rootPath: repoDir.path, name: "billing-service", framework: nil, gitBranch: "main", gitCommit: nil, isWorktree: false),
+            terminalApp: "Terminal",
+            statusSource: .processOnly,
+            childServerPorts: [],
+            activityState: .idle
+        )
+        let res3 = indexer.indexSessions(liveAgents: [freshObs], allProcesses: [freshProc])
+        #expect(res3.count == 2)
+        #expect(res3.first(where: { $0.sessionID == oldSessionID })?.isLive == false)
+    }
 }

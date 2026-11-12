@@ -418,4 +418,53 @@ struct HookBridgeServiceTests {
         #expect(!FileManager.default.fileExists(atPath: requestURL.path))
         #expect(controller.pendingRequests().isEmpty)
     }
+
+    @Test func inactiveOrExitedListenerReturnsImmediatelyWithoutHangingClaudeCode() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let inbox = root.appendingPathComponent("inbox", isDirectory: true)
+        let outbox = root.appendingPathComponent("outbox", isDirectory: true)
+
+        final class ListenerState: @unchecked Sendable {
+            private let lock = NSLock()
+            private var alive = false
+            func setAlive(_ value: Bool) { lock.withLock { alive = value } }
+            func isAlive() -> Bool { lock.withLock { alive } }
+        }
+        let state = ListenerState()
+        let listenerProc = ObservedProcess(
+            pid: 99_991, parentPID: 1, uid: Int(getuid()), cpuPercent: 0, residentBytes: 0,
+            executable: "/Applications/Suyoi Next.app/Contents/MacOS/Suyoi", startTimeMicroseconds: 77_000
+        )
+        let client = HookBridgeClient(
+            inboxDirectory: inbox, outboxDirectory: outbox,
+            hookOwner: { nil },
+            processLookup: { pid, uid in
+                guard state.isAlive(), pid == 99_991, uid == Int(getuid()) else { return nil }
+                return listenerProc
+            },
+            requireActiveListener: true
+        )
+
+        // 1. No listener file at all -> returns Data() immediately, nothing spooled.
+        let started = ProcessInfo.processInfo.systemUptime
+        let passthrough = client.forwardEventAndWait(try payload("PermissionRequest"), timeout: 30, pollInterval: 0.01)
+        #expect(passthrough.isEmpty)
+        #expect(ProcessInfo.processInfo.systemUptime - started < 1.0)
+
+        // 2. Stale listener file from a crashed Suyoi process -> still returns Data() immediately.
+        HookBridgeClient.registerActiveListener(outboxDirectory: outbox, identity: listenerProc.identity)
+        let stale = client.forwardEventAndWait(try payload("PermissionRequest"), timeout: 30, pollInterval: 0.01)
+        #expect(stale.isEmpty)
+
+        // 3. Live listener that exits mid-wait -> unblocks immediately and cleans up spooled request.
+        state.setAlive(true)
+        let pending = Task.detached {
+            client.forwardEventAndWait(HookBridgeClient.simulatedApprovalPayload(), timeout: 30, pollInterval: 0.005)
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        state.setAlive(false)
+        let afterExit = await pending.value
+        #expect(afterExit.isEmpty)
+    }
 }
