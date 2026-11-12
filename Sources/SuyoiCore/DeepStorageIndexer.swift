@@ -712,7 +712,12 @@ public struct DeepStorageIndexer: Sendable {
             return ArtifactMatch(category: .buildOutputs, ecosystemLabel: "Build Output (\(name))", highImpactReason: nil)
 
         case ".venv", "venv", ".env-venv":
-            guard FileManager.default.fileExists(atPath: url.appendingPathComponent("pyvenv.cfg").path) else { return nil }
+            let hasPythonEnvMarker =
+                FileManager.default.fileExists(atPath: url.appendingPathComponent("pyvenv.cfg").path)
+                || FileManager.default.fileExists(atPath: url.appendingPathComponent("bin/python").path)
+                || FileManager.default.fileExists(atPath: url.appendingPathComponent("conda-meta").path)
+                || (name == ".venv" && FileManager.default.fileExists(atPath: url.appendingPathComponent("lib").path))
+            guard hasPythonEnvMarker else { return nil }
             return ArtifactMatch(
                 category: .pythonAndEnvs,
                 ecosystemLabel: "Python Virtual Env (\(name))",
@@ -888,6 +893,7 @@ public struct DeepStorageIndexer: Sendable {
         )
 
         // 3. AI Coding Agent Caches & Debug Logs
+        addDirect("Library/Caches/claude-cli-nodejs", title: "Claude Code · CLI Cache", subtitle: "~/Library/Caches/claude-cli-nodejs", category: .aiAgentStorage)
         addDirect(".claude/cache", title: "Claude Code · Cache", subtitle: "~/.claude/cache", category: .aiAgentStorage)
         addDirect(".claude/downloads", title: "Claude Code · Downloads", subtitle: "~/.claude/downloads", category: .aiAgentStorage)
         addDirect(".claude/debug", title: "Claude Code · Debug Logs", subtitle: "~/.claude/debug", category: .aiAgentStorage)
@@ -913,7 +919,10 @@ public struct DeepStorageIndexer: Sendable {
     private static func cleanDerivedDataName(_ folderName: String) -> String {
         guard let dashIndex = folderName.lastIndex(of: "-") else { return folderName }
         let suffix = folderName[folderName.index(after: dashIndex)...]
-        if suffix.count >= 20 && suffix.allSatisfy({ $0.isLetter || $0.isNumber }) {
+        let isHashSuffix =
+            (suffix.count >= 20 && suffix.allSatisfy({ $0.isLetter || $0.isNumber }))
+            || (suffix.count >= 12 && suffix.allSatisfy({ $0.isASCII && ($0.isLowercase || $0.isNumber) }))
+        if isHashSuffix {
             return String(folderName[..<dashIndex])
         }
         return folderName

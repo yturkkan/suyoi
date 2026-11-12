@@ -539,33 +539,41 @@ public struct WorkspaceSessionIndexer: Sendable {
                     turns.append(SessionChatTurn(id: "u-\(counter)", kind: .user, text: clean, timestamp: timestamp))
                 }
             } else if type == "assistant" {
-                if let rawText = extractClaudeMessageText(message["content"]),
-                   let clean = Self.sanitizeMultilineText(rawText) {
+                if let rawStr = message["content"] as? String,
+                   let clean = Self.sanitizeMultilineText(rawStr) {
                     counter += 1
                     turns.append(SessionChatTurn(id: "a-\(counter)", kind: .assistant, text: clean, timestamp: timestamp))
-                }
-                if let blocks = message["content"] as? [[String: Any]] {
-                    for block in blocks where block["type"] as? String == "tool_use" {
-                        guard let rawTool = block["name"] as? String,
-                              let toolName = SessionTurnPreviewInspector.sanitizeAndRedact(rawTool, maxLength: 64) else {
-                            continue
-                        }
-                        let input = block["input"] as? [String: Any]
-                        let summary = extractToolTargetSummary(from: input) ?? toolName
-                        counter += 1
-                        let callID = (block["id"] as? String) ?? "t-\(counter)"
-                        let idx = turns.count
-                        turns.append(
-                            SessionChatTurn(
-                                id: "tool-\(counter)",
-                                kind: .toolCall,
-                                text: summary,
-                                toolName: toolName,
-                                toolStatus: "completed",
-                                timestamp: timestamp
+                } else if let blocks = message["content"] as? [[String: Any]] {
+                    for block in blocks {
+                        let bType = (block["type"] as? String) ?? "text"
+                        if bType == "text" || bType == "output_text" || bType == "input_text" {
+                            if let rawText = block["text"] as? String,
+                               let clean = Self.sanitizeMultilineText(rawText) {
+                                counter += 1
+                                turns.append(SessionChatTurn(id: "a-\(counter)", kind: .assistant, text: clean, timestamp: timestamp))
+                            }
+                        } else if bType == "tool_use" {
+                            guard let rawTool = block["name"] as? String,
+                                  let toolName = SessionTurnPreviewInspector.sanitizeAndRedact(rawTool, maxLength: 64) else {
+                                continue
+                            }
+                            let input = block["input"] as? [String: Any]
+                            let summary = extractToolTargetSummary(from: input) ?? toolName
+                            counter += 1
+                            let callID = (block["id"] as? String) ?? "t-\(counter)"
+                            let idx = turns.count
+                            turns.append(
+                                SessionChatTurn(
+                                    id: "tool-\(counter)",
+                                    kind: .toolCall,
+                                    text: summary,
+                                    toolName: toolName,
+                                    toolStatus: "completed",
+                                    timestamp: timestamp
+                                )
                             )
-                        )
-                        toolTurnIndexByCallID[callID] = idx
+                            toolTurnIndexByCallID[callID] = idx
+                        }
                     }
                 }
             }
