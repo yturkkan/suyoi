@@ -266,8 +266,9 @@ jobs:
       - name: Build Debug Suyoi & export 2x Retina PNG screenshots
         run: |
           swift build --product Suyoi
+          DEBUG_BIN_DIR="$(swift build --show-bin-path)"
           mkdir -p docs/screenshots
-          .build/debug/Suyoi --export-screenshots docs/screenshots
+          "$DEBUG_BIN_DIR/Suyoi" --export-screenshots docs/screenshots
           ls -lh docs/screenshots/*.png
 
       - name: Upload screenshots artifact
@@ -283,7 +284,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/screenshots/*.png
           if ! git diff --cached --quiet; then
-            git commit -m "docs(screenshots): add 2x Retina macOS 15 screenshots for Suyoi [skip ci]"
+            git commit -m "docs(screenshots): update 2x Retina macOS 15 screenshots for Suyoi v0.6.0 [skip ci]"
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi

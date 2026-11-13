@@ -96,9 +96,9 @@ enum DashboardFixture {
             activeAgentCount: 2,
             waitingAgentCount: 1,
             pendingApprovalCount: 0,
-            serverCount: 1,
+            serverCount: 2,
             primaryAgentName: "Codex",
-            primaryAgentTask: "Running: swift test --filter Phase6SessionAndStorageTests",
+            primaryAgentTask: "Running: swift test --filter DeepStorageIndexerTests",
             isWaitingForInput: true,
             canInlineSteerPrimary: true,
             primarySteerModeSummary: "WezTerm (ttys004)",
@@ -108,7 +108,7 @@ enum DashboardFixture {
             activeAgentCount: 2,
             waitingAgentCount: 1,
             pendingApprovalCount: 1,
-            serverCount: 1,
+            serverCount: 2,
             primaryAgentName: "Claude Code",
             primaryAgentTask: "Waiting for question answer",
             isWaitingForInput: true,
@@ -227,7 +227,66 @@ enum DashboardFixture {
             to: outputURL.appendingPathComponent("06-pixel-arcade-theme.png")
         )
 
-        print("Exported 6 Retina screenshots to \(outputURL.path)")
+        // 7. Development Servers & Listening Project Ports (Native Glass · 920x660)
+        let serversModel = DashboardModel(fixture: showcaseSample, tab: .ports, theme: .nativeGlass)
+        serversModel.onToggleDetachedWindow = {}
+        let shot7 = SequoiaWindowCanvas(canvasSize: CGSize(width: 980, height: 720), windowCornerRadius: 14) {
+            DashboardView(model: serversModel)
+                .frame(width: 920, height: 660)
+                .background(Color(red: 0.10, green: 0.11, blue: 0.14))
+        }
+        writeScreenshot(
+            shot7,
+            size: CGSize(width: 980, height: 720),
+            to: outputURL.appendingPathComponent("07-dev-servers-ports.png")
+        )
+
+        // 8. macOS Native Light Appearance Showcase (920x660)
+        let nativeModel = DashboardModel(fixture: showcaseSample, tab: .agents, theme: .macOSSystem)
+        nativeModel.onToggleDetachedWindow = {}
+        let shot8 = SequoiaWindowCanvas(canvasSize: CGSize(width: 980, height: 720), windowCornerRadius: 14, colorScheme: .light) {
+            DashboardView(model: nativeModel)
+                .frame(width: 920, height: 660)
+                .background(Color(nsColor: .windowBackgroundColor))
+        }
+        writeScreenshot(
+            shot8,
+            size: CGSize(width: 980, height: 720),
+            colorScheme: .light,
+            to: outputURL.appendingPathComponent("08-macos-native-theme.png")
+        )
+
+        // 9. Game Boy Olive Theme Showcase (920x660)
+        let oliveModel = DashboardModel(fixture: showcaseSample, tab: .agents, theme: .pixelOlive)
+        oliveModel.onToggleDetachedWindow = {}
+        let shot9 = SequoiaWindowCanvas(canvasSize: CGSize(width: 980, height: 720), windowCornerRadius: 14) {
+            DashboardView(model: oliveModel)
+                .frame(width: 920, height: 660)
+                .background(Color(red: 0.08, green: 0.11, blue: 0.06))
+        }
+        writeScreenshot(
+            shot9,
+            size: CGSize(width: 980, height: 720),
+            to: outputURL.appendingPathComponent("09-gameboy-olive-theme.png")
+        )
+
+        // 10. Unified New Agent Conversation Composer (Native Glass · 920x660)
+        let newChatModel = DashboardModel(fixture: showcaseSample, tab: .agents, theme: .nativeGlass)
+        newChatModel.onToggleDetachedWindow = {}
+        newChatModel.beginNewChat()
+        newChatModel.consoleComposerText = "Audit safety invariants in DeepStorageIndexer and run unit tests."
+        let shot10 = SequoiaWindowCanvas(canvasSize: CGSize(width: 980, height: 720), windowCornerRadius: 14) {
+            DashboardView(model: newChatModel)
+                .frame(width: 920, height: 660)
+                .background(Color(red: 0.10, green: 0.11, blue: 0.14))
+        }
+        writeScreenshot(
+            shot10,
+            size: CGSize(width: 980, height: 720),
+            to: outputURL.appendingPathComponent("10-new-agent-chat-hub.png")
+        )
+
+        print("Exported 10 Retina screenshots to \(outputURL.path)")
         exit(0)
     }
 
@@ -235,11 +294,13 @@ enum DashboardFixture {
     private static func writeScreenshot<Content: View>(
         _ content: Content,
         size: CGSize,
+        colorScheme: ColorScheme = .dark,
         to destinationURL: URL
     ) {
-        let darkContent = content
+        let appearanceName: NSAppearance.Name = colorScheme == .light ? .aqua : .darkAqua
+        let themedContent = content
             .frame(width: size.width, height: size.height)
-            .environment(\.colorScheme, .dark)
+            .environment(\.colorScheme, colorScheme)
 
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: size),
@@ -250,22 +311,24 @@ enum DashboardFixture {
         window.isReleasedWhenClosed = false
         window.hasShadow = false
         window.isOpaque = true
-        window.backgroundColor = NSColor(calibratedRed: 0.05, green: 0.06, blue: 0.10, alpha: 1.0)
-        if let darkAqua = NSAppearance(named: .darkAqua) {
-            window.appearance = darkAqua
+        window.backgroundColor = colorScheme == .light
+            ? NSColor(calibratedRed: 0.90, green: 0.92, blue: 0.96, alpha: 1.0)
+            : NSColor(calibratedRed: 0.05, green: 0.06, blue: 0.10, alpha: 1.0)
+        if let appearance = NSAppearance(named: appearanceName) {
+            window.appearance = appearance
         }
 
-        let hostingView = NSHostingView(rootView: darkContent)
+        let hostingView = NSHostingView(rootView: themedContent)
         hostingView.frame = NSRect(origin: .zero, size: size)
-        if let darkAqua = NSAppearance(named: .darkAqua) {
-            hostingView.appearance = darkAqua
+        if let appearance = NSAppearance(named: appearanceName) {
+            hostingView.appearance = appearance
         }
         window.contentView = hostingView
         window.setFrameOrigin(NSPoint(x: 80, y: 80))
         window.makeKeyAndOrderFront(nil)
 
         RunLoop.main.run(until: Date().addingTimeInterval(0.28))
-        activateVisualEffectsRecursively(in: hostingView)
+        activateVisualEffectsRecursively(in: hostingView, appearanceName: appearanceName)
         hostingView.needsLayout = true
         hostingView.layoutSubtreeIfNeeded()
         hostingView.needsDisplay = true
@@ -295,7 +358,7 @@ enum DashboardFixture {
         }
 
         if pngData == nil {
-            let renderer = ImageRenderer(content: darkContent)
+            let renderer = ImageRenderer(content: themedContent)
             renderer.scale = 2.0
             if let nsImage = renderer.nsImage,
                let tiff = nsImage.tiffRepresentation,
@@ -320,16 +383,16 @@ enum DashboardFixture {
     }
 
     @MainActor
-    private static func activateVisualEffectsRecursively(in view: NSView) {
-        if let darkAqua = NSAppearance(named: .darkAqua) {
-            view.appearance = darkAqua
+    private static func activateVisualEffectsRecursively(in view: NSView, appearanceName: NSAppearance.Name) {
+        if let appearance = NSAppearance(named: appearanceName) {
+            view.appearance = appearance
         }
         if let effectView = view as? NSVisualEffectView {
             effectView.state = .active
-            effectView.material = .hudWindow
+            effectView.material = appearanceName == .aqua ? .windowBackground : .hudWindow
         }
         for subview in view.subviews {
-            activateVisualEffectsRecursively(in: subview)
+            activateVisualEffectsRecursively(in: subview, appearanceName: appearanceName)
         }
     }
 
@@ -358,15 +421,34 @@ enum DashboardFixture {
     private struct SequoiaWindowCanvas<Content: View>: View {
         let canvasSize: CGSize
         let windowCornerRadius: CGFloat
+        var colorScheme: ColorScheme = .dark
+        var backgroundColors: [Color]? = nil
         @ViewBuilder let content: () -> Content
+
+        private var resolvedBackgroundColors: [Color] {
+            if let backgroundColors {
+                return backgroundColors
+            }
+            if colorScheme == .light {
+                return [
+                    Color(red: 0.91, green: 0.93, blue: 0.97),
+                    Color(red: 0.84, green: 0.88, blue: 0.94)
+                ]
+            }
+            return [
+                Color(red: 0.07, green: 0.09, blue: 0.16),
+                Color(red: 0.04, green: 0.05, blue: 0.09)
+            ]
+        }
+
+        private var borderColor: Color {
+            colorScheme == .light ? Color.black.opacity(0.10) : Color.white.opacity(0.14)
+        }
 
         var body: some View {
             ZStack {
                 LinearGradient(
-                    colors: [
-                        Color(red: 0.07, green: 0.09, blue: 0.16),
-                        Color(red: 0.04, green: 0.05, blue: 0.09)
-                    ],
+                    colors: resolvedBackgroundColors,
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
@@ -375,12 +457,12 @@ enum DashboardFixture {
                     .clipShape(RoundedRectangle(cornerRadius: windowCornerRadius, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: windowCornerRadius, style: .continuous)
-                            .strokeBorder(Color.white.opacity(0.14), lineWidth: 1)
+                            .strokeBorder(borderColor, lineWidth: 1)
                     )
-                    .shadow(color: .black.opacity(0.6), radius: 22, y: 10)
+                    .shadow(color: .black.opacity(colorScheme == .light ? 0.22 : 0.6), radius: 22, y: 10)
             }
             .frame(width: canvasSize.width, height: canvasSize.height)
-            .environment(\.colorScheme, .dark)
+            .environment(\.colorScheme, colorScheme)
         }
     }
 
@@ -449,10 +531,12 @@ enum DashboardFixture {
 
         fileprivate init(scenario: Scenario) {
             let now = Date()
-            let web = ProjectContext(rootPath: root.path + "/customer-dashboard",
-                name: "customer-dashboard", framework: "Next.js",
-                gitBranch: "feature/account-usage-and-reset-windows", gitCommit: "e8bc410", isWorktree: true)
-            let service = ProjectContext(rootPath: root.path + "/notification-service",
+            let demoHome = FileManager.default.homeDirectoryForCurrentUser.path
+            let demoDev = demoHome + "/Developer"
+            let web = ProjectContext(rootPath: demoDev + "/customer-dashboard",
+                name: "customer-dashboard", framework: "Next.js 15",
+                gitBranch: "feat/usage-forecast", gitCommit: "e8bc410", isWorktree: true)
+            let service = ProjectContext(rootPath: demoDev + "/notification-service",
                 name: "notification-service", framework: "SwiftPM", gitBranch: "main", gitCommit: "c7ab391", isWorktree: false)
             let codex = ObservedProcess(pid: 90_101, parentPID: 1, uid: 501, cpuPercent: 14.2,
                 residentBytes: 436_000_000, executable: "/fixture/bin/codex", startTimeMicroseconds: 101,
@@ -465,13 +549,17 @@ enum DashboardFixture {
                 cwd: web.rootPath, tty: scenario == .showcase ? "ttys009" : nil)
             let server = ObservedProcess(pid: 90_104, parentPID: codex.pid, uid: 501, cpuPercent: 2.8,
                 residentBytes: 592_000_000, executable: "/fixture/bin/node", startTimeMicroseconds: 104, cwd: web.rootPath)
+            let apiServer = ObservedProcess(pid: 90_105, parentPID: 1, uid: 501, cpuPercent: 0.9,
+                residentBytes: 148_000_000, executable: "/fixture/bin/NotificationServer", startTimeMicroseconds: 105, cwd: service.rootPath)
             let orphanMCP1 = ObservedProcess(pid: 90_210, parentPID: 1, uid: 501, cpuPercent: 0.1,
                 residentBytes: 84_000_000, executable: "/fixture/bin/node", startTimeMicroseconds: 210, cwd: web.rootPath)
             let orphanMCP2 = ObservedProcess(pid: 90_211, parentPID: 1, uid: 501, cpuPercent: 0.0,
                 residentBytes: 62_000_000, executable: "/fixture/bin/npx", startTimeMicroseconds: 211, cwd: service.rootPath)
 
             let ports = [3000, 3001, 5173]
-            let listeners = ports.map { Listener(pid: server.pid, processName: "node", address: "127.0.0.1", port: $0) }
+            let webListeners = ports.map { Listener(pid: server.pid, processName: "node", address: "127.0.0.1", port: $0) }
+            let apiListener = Listener(pid: apiServer.pid, processName: "NotificationServer", address: "127.0.0.1", port: 8080)
+            let listeners = scenario == .showcase ? (webListeners + [apiListener]) : webListeners
             let codexSession = "205926f6-c738-4b6a-8204-e032447c1303"
             let agents = [
                 AgentObservation(id: codex.pid, agentName: "Codex", process: codex,
@@ -480,7 +568,7 @@ enum DashboardFixture {
                     statusSource: .processOnly,
                     childServerPorts: ports, activityState: .active, activityDetail: "Active CPU / running child command",
                     lastActivityAt: now, sessionID: scenario == .steering ? nil : codexSession,
-                    currentTask: scenario == .steering ? nil : "Running: swift test --filter Phase5FeaturesTests"),
+                    currentTask: scenario == .steering ? nil : "Running: swift test --filter AgentSteererTests"),
                 AgentObservation(id: claude.pid, agentName: "Claude Code", process: claude, project: service,
                     terminalApp: "Terminal", statusSource: .processOnly, childServerPorts: [],
                     activityState: .waiting, activityDetail: "Waiting for tool approval",
@@ -496,16 +584,23 @@ enum DashboardFixture {
                     currentTask: scenario == .showcase ? "Refactoring customer-dashboard routes" : nil)
             ]
             let group = ServerGroup(id: "fixture-web", rootPID: server.pid, name: "Customer dashboard",
-                memberPIDs: [server.pid], memberIdentities: [server.identity], listeners: listeners, project: web,
+                memberPIDs: [server.pid], memberIdentities: [server.identity], listeners: webListeners, project: web,
                 cpuPercent: 2.8, residentBytes: server.residentBytes, footprintBytes: nil,
                 startedAt: now.addingTimeInterval(-9_500), stoppedByAgentBoundary: true)
+            let apiGroup = ServerGroup(id: "fixture-api", rootPID: apiServer.pid, name: "Notification service",
+                memberPIDs: [apiServer.pid], memberIdentities: [apiServer.identity], listeners: [apiListener], project: service,
+                cpuPercent: 0.9, residentBytes: apiServer.residentBytes, footprintBytes: nil,
+                startedAt: now.addingTimeInterval(-4_200), stoppedByAgentBoundary: false)
+            let sampleProcesses = scenario == .showcase
+                ? [codex, claude, openCode, server, apiServer, orphanMCP1, orphanMCP2]
+                : [codex, claude, openCode, server, orphanMCP1, orphanMCP2]
             inventory = InventorySnapshot(
-                processes: [codex, claude, openCode, server, orphanMCP1, orphanMCP2],
+                processes: sampleProcesses,
                 listeners: listeners,
                 warnings: [],
                 capturedAt: now,
                 agentObservations: agents,
-                serverGroups: [group],
+                serverGroups: scenario == .showcase ? [group, apiGroup] : [group],
                 projectsByPath: [web.rootPath: web, service.rootPath: service]
             )
             let codexUsage = TokenUsageSummary(windowMinutes: 300, startedAt: now.addingTimeInterval(-18_000),
@@ -604,7 +699,7 @@ enum DashboardFixture {
             steeringAgentID = scenario == .showcase ? codex.pid : nil
             instruction = scenario == .steering
                 ? "Check the failing browser fixture."
-                : (scenario == .showcase ? "/test --filter Phase5FeaturesTests" : "")
+                : (scenario == .showcase ? "/test --filter AgentSteererTests" : "")
             approvals = (scenario == .approval || scenario == .showcase) ? [
                 PendingApprovalRequest(
                     id: "fixture-approval",
@@ -622,7 +717,7 @@ enum DashboardFixture {
                 codex.pid: SessionTurnPreview(
                     sessionID: codexSession,
                     lastUserPromptPreview: "Verify WezTerm steering and slash snippet expansion.",
-                    lastAssistantReplyPreview: "Updated AgentSteerer and running Phase5FeaturesTests now.",
+                    lastAssistantReplyPreview: "Updated AgentSteerer and running AgentSteererTests now.",
                     recentTools: [SessionToolCallSummary(toolName: "swift", targetSummary: "swift test", status: "running")],
                     updatedAt: now
                 )
@@ -650,7 +745,7 @@ enum DashboardFixture {
                         sampleFiles: [
                             "Sources/SuyoiCore/AgentSteerer.swift",
                             "Sources/SuyoiApp/IslandWindowController.swift",
-                            "Tests/SuyoiCoreTests/Phase5FeaturesTests.swift"
+                            "Tests/SuyoiCoreTests/AgentSteererTests.swift"
                         ]
                     ),
                     service.rootPath: WorktreeDiffSummary(
@@ -775,7 +870,7 @@ enum DashboardFixture {
                     canResumeNatively: true,
                     nativeSteerMode: .codexResume,
                     liveSteerMode: .weztermPane,
-                    lastMessageSnippet: "Running Phase6SessionAndStorageTests across monorepo fixtures.",
+                    lastMessageSnippet: "Running DeepStorageIndexerTests across monorepo fixtures.",
                     turnCount: 6
                 ),
                 IndexedAgentSession(
@@ -820,16 +915,16 @@ enum DashboardFixture {
                     agentName: "Claude Code",
                     sessionID: "91d4a7c2-4312-4091-a211-88910e43fb12",
                     title: "Fix Xcode DerivedData & pnpm store cleanup rules",
-                    projectPath: "/Users/yturkkan/Developer/suyoi",
+                    projectPath: demoDev + "/suyoi",
                     projectName: "suyoi",
-                    gitBranch: "next",
+                    gitBranch: "main",
                     updatedAt: now.addingTimeInterval(-2_100),
                     isLive: false,
                     liveObservation: nil,
                     canResumeNatively: true,
                     nativeSteerMode: .claudeResume,
                     liveSteerMode: nil,
-                    lastMessageSnippet: "All 455 core tests passed; ready to resume whenever needed.",
+                    lastMessageSnippet: "All 474 core tests passed; ready to resume whenever needed.",
                     turnCount: 14
                 ),
                 IndexedAgentSession(
@@ -838,7 +933,7 @@ enum DashboardFixture {
                     agentName: "Cursor",
                     sessionID: cursorSessionID,
                     title: "Design system token migration for dark glass theme",
-                    projectPath: "/Users/yturkkan/Developer/design-tokens",
+                    projectPath: demoDev + "/design-tokens",
                     projectName: "design-tokens",
                     gitBranch: "feat/sequoia-glass",
                     updatedAt: now.addingTimeInterval(-9_400),
@@ -854,7 +949,7 @@ enum DashboardFixture {
                     agentName: "Gemini CLI",
                     sessionID: geminiSessionID,
                     title: "Benchmark POSIX openat/fstatat vs FileManager enumerator",
-                    projectPath: "/Users/yturkkan/Developer/storage-bench",
+                    projectPath: demoDev + "/storage-bench",
                     projectName: "storage-bench",
                     gitBranch: "main",
                     updatedAt: now.addingTimeInterval(-120),
@@ -898,7 +993,7 @@ enum DashboardFixture {
                     SessionChatTurn(
                         id: "t5",
                         kind: .toolCall,
-                        text: "swift test --filter Phase6SessionAndStorageTests",
+                        text: "swift test --filter DeepStorageIndexerTests",
                         toolName: "Bash",
                         toolStatus: "running",
                         timestamp: now.addingTimeInterval(-22)
@@ -906,7 +1001,7 @@ enum DashboardFixture {
                     SessionChatTurn(
                         id: "t6",
                         kind: .assistant,
-                        text: "Replaced the over-broad substring path blocker with root-anchored sensitive path checks in DeepStorageIndexer. Running Phase6SessionAndStorageTests now to confirm Put Back recovery.",
+                        text: "Replaced the over-broad substring path blocker with root-anchored sensitive path checks in DeepStorageIndexer. Running DeepStorageIndexerTests now to confirm Put Back recovery.",
                         timestamp: now.addingTimeInterval(-8)
                     )
                 ]
@@ -914,7 +1009,7 @@ enum DashboardFixture {
 
             let deepItems: [IndexedStorageItem] = [
                 IndexedStorageItem(
-                    path: "/Users/yturkkan/Library/Developer/Xcode/DerivedData/Suyoi-fbqpmzxlk",
+                    path: demoHome + "/Library/Developer/Xcode/DerivedData/Suyoi-fbqpmzxlk",
                     displayName: "DerivedData · Suyoi",
                     subtitle: "Xcode DerivedData build intermediates & index store",
                     projectName: "Suyoi",
@@ -928,11 +1023,11 @@ enum DashboardFixture {
                     safety: .ready
                 ),
                 IndexedStorageItem(
-                    path: "/Users/yturkkan/Developer/search-engine/target",
+                    path: demoDev + "/search-engine/target",
                     displayName: "search-engine · target",
                     subtitle: "Rust Cargo debug & release artifacts",
                     projectName: "search-engine",
-                    projectRootPath: "/Users/yturkkan/Developer/search-engine",
+                    projectRootPath: demoDev + "/search-engine",
                     category: .buildOutputs,
                     ecosystemLabel: "Rust / Cargo",
                     bytes: 7_850_000_000,
@@ -943,11 +1038,11 @@ enum DashboardFixture {
                     safety: .ready
                 ),
                 IndexedStorageItem(
-                    path: "/Users/yturkkan/Developer/monorepo/apps/analytics-web/node_modules",
+                    path: demoDev + "/monorepo/apps/analytics-web/node_modules",
                     displayName: "analytics-web · node_modules",
                     subtitle: "Node / pnpm workspace dependencies",
                     projectName: "analytics-web",
-                    projectRootPath: "/Users/yturkkan/Developer/monorepo/apps/analytics-web",
+                    projectRootPath: demoDev + "/monorepo/apps/analytics-web",
                     category: .dependencies,
                     ecosystemLabel: "Node / pnpm",
                     bytes: 3_240_000_000,
@@ -958,7 +1053,7 @@ enum DashboardFixture {
                     safety: .ready
                 ),
                 IndexedStorageItem(
-                    path: "/Users/yturkkan/Library/pnpm/store/v3",
+                    path: demoHome + "/Library/pnpm/store/v3",
                     displayName: "pnpm Content-Addressable Store",
                     subtitle: "Global pnpm package store cache",
                     category: .toolchainCaches,
@@ -971,11 +1066,11 @@ enum DashboardFixture {
                     safety: .ready
                 ),
                 IndexedStorageItem(
-                    path: "/Users/yturkkan/Developer/ml-pipeline/.venv",
+                    path: demoDev + "/ml-pipeline/.venv",
                     displayName: "ml-pipeline · .venv",
                     subtitle: "Python virtual environment (PyTorch / uv)",
                     projectName: "ml-pipeline",
-                    projectRootPath: "/Users/yturkkan/Developer/ml-pipeline",
+                    projectRootPath: demoDev + "/ml-pipeline",
                     category: .pythonAndEnvs,
                     ecosystemLabel: "Python venv",
                     bytes: 3_680_000_000,
@@ -986,7 +1081,7 @@ enum DashboardFixture {
                     safety: .highImpactReview(reason: "Virtual environment — recreate via uv sync or pip install -r requirements.txt")
                 ),
                 IndexedStorageItem(
-                    path: "/Users/yturkkan/Library/Caches/claude-cli-nodejs",
+                    path: demoHome + "/Library/Caches/claude-cli-nodejs",
                     displayName: "Claude Code · CLI Cache",
                     subtitle: "Regenerable AI agent runtime & update cache",
                     category: .aiAgentStorage,
@@ -1018,9 +1113,9 @@ enum DashboardFixture {
             let report = StorageIndexReport(
                 items: deepItems,
                 scannedRoots: [
-                    "/Users/yturkkan/Developer",
-                    "/Users/yturkkan/Projects",
-                    "/Users/yturkkan/Code"
+                    demoDev,
+                    demoHome + "/Projects",
+                    demoHome + "/Code"
                 ],
                 scannedDirectories: 18_420,
                 indexedAt: now
