@@ -41,7 +41,7 @@ public struct SafetyEvaluator: SafetyEvaluating, Sendable {
             usage = cwd.0
             reasons.append(contentsOf: cwd.1)
             if let name = candidate.agentName,
-               processes.value.contains(where: { AgentRecognizer.agentName(for: $0)?.caseInsensitiveCompare(name) == .orderedSame }) {
+               processes.value.contains(where: { AgentRecognizer.runningProviderName(for: $0)?.caseInsensitiveCompare(name) == .orderedSame }) {
                 usage = .inUse
                 reasons.append("\(name) is currently running")
             }

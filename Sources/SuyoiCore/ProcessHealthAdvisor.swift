@@ -56,7 +56,7 @@ public enum ProcessHealthAdvisor {
                   proc.identity.isActionEligible,
                   !agentPIDs.contains(proc.pid),
                   !serverMemberPIDs.contains(proc.pid),
-                  AgentRecognizer.agentName(for: proc) == nil,
+                  AgentRecognizer.runningProviderName(for: proc) == nil,
                   let pid32 = Int32(exactly: proc.pid),
                   let kind = classifier(pid32, proc.executable) else {
                 continue

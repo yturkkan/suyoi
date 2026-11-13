@@ -21,9 +21,27 @@ struct ProcessContextTests {
         }
         for path in ["/bin/Codex Helper", "/bin/OpenCode Helper", "/bin/claude-worker", "/bin/notcodex", "/bin/GEMINI",
             "/Applications/Codex.app/Contents/Frameworks/Codex Helper", "/Applications/OpenCode.app/Contents/Frameworks/OpenCode Helper (Renderer)",
-            "/Applications/Codex.app/Contents/Frameworks/X.framework/codex", "/Applications/OpenCode.app/Contents/Frameworks/OpenCode"] {
+            "/Applications/Codex.app/Contents/Frameworks/X.framework/codex", "/Applications/OpenCode.app/Contents/Frameworks/OpenCode",
+            "/Applications/OpenCode.app/Contents/MacOS/OpenCode", "/Applications/Codex.app/Contents/MacOS/Codex"] {
             #expect(!AgentRecognizer.isAgent(process(1, 0, path)))
+            #expect(AgentRecognizer.agentName(for: process(1, 0, path)) == nil)
         }
+        #expect(AgentRecognizer.runningProviderName(for: process(1, 0, "/Applications/OpenCode.app/Contents/MacOS/OpenCode")) == "OpenCode")
+        #expect(AgentRecognizer.runningProviderName(for: process(1, 0, "/Applications/Codex.app/Contents/MacOS/Codex")) == "Codex")
+
+        let embeddedInteractive = ObservedProcess(
+            pid: 101, parentPID: 1, uid: 501, cpuPercent: 0, residentBytes: 0,
+            executable: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            agentInvocation: AgentInvocation(agentName: "Codex", entrypoint: "codex", isBackgroundService: false)
+        )
+        #expect(AgentRecognizer.agentName(for: embeddedInteractive) == "Codex")
+
+        let embeddedDaemon = ObservedProcess(
+            pid: 102, parentPID: 1, uid: 501, cpuPercent: 0, residentBytes: 0,
+            executable: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            agentInvocation: AgentInvocation(agentName: "Codex", entrypoint: "codex", isBackgroundService: true)
+        )
+        #expect(AgentRecognizer.agentName(for: embeddedDaemon) == nil)
     }
 
     @Test func terminalParents() {

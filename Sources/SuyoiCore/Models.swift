@@ -22,11 +22,30 @@ public struct AgentInvocation: Codable, Equatable, Sendable {
     public let agentName: String
     public let runtime: String?
     public let entrypoint: String?
+    public let isBackgroundService: Bool
 
-    public init(agentName: String, runtime: String? = nil, entrypoint: String? = nil) {
+    public init(
+        agentName: String,
+        runtime: String? = nil,
+        entrypoint: String? = nil,
+        isBackgroundService: Bool = false
+    ) {
         self.agentName = agentName
         self.runtime = runtime
         self.entrypoint = entrypoint
+        self.isBackgroundService = isBackgroundService
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentName, runtime, entrypoint, isBackgroundService
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.agentName = try values.decode(String.self, forKey: .agentName)
+        self.runtime = try values.decodeIfPresent(String.self, forKey: .runtime)
+        self.entrypoint = try values.decodeIfPresent(String.self, forKey: .entrypoint)
+        self.isBackgroundService = try values.decodeIfPresent(Bool.self, forKey: .isBackgroundService) ?? false
     }
 }
 
@@ -84,8 +103,11 @@ public struct ObservedProcess: Identifiable, Codable, Equatable, Sendable {
     public var id: Int { pid }
     public var name: String { URL(fileURLWithPath: executable).lastPathComponent }
     public var agentName: String? {
-        if let invoked = agentInvocation?.agentName, !invoked.isEmpty {
-            return invoked
+        if let invocation = agentInvocation {
+            guard !invocation.isBackgroundService, !invocation.agentName.isEmpty else {
+                return nil
+            }
+            return invocation.agentName
         }
         switch name {
         case "codex", "Codex": return "Codex"

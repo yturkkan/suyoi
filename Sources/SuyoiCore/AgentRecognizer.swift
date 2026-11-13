@@ -2,8 +2,24 @@ import Foundation
 
 /// Executable-name hints only; never evidence of an agent's task/session state.
 public enum AgentRecognizer {
+    private static func desktopHostProviderName(for executable: String) -> String? {
+        guard !executable.contains(".app/Contents/Frameworks/"),
+              !executable.contains(".app/Contents/Resources/") else { return nil }
+        let standardized = URL(fileURLWithPath: executable).standardizedFileURL.path
+        if standardized.hasSuffix("/OpenCode.app/Contents/MacOS/OpenCode") { return "OpenCode" }
+        if standardized.hasSuffix("/Codex.app/Contents/MacOS/Codex") { return "Codex" }
+        if standardized.hasSuffix("/Claude.app/Contents/MacOS/Claude") { return "Claude Code" }
+        if standardized.hasSuffix("/Qoder.app/Contents/MacOS/Qoder") { return "Qoder" }
+        if standardized.hasSuffix("/Kiro.app/Contents/MacOS/Kiro") { return "Kiro" }
+        return nil
+    }
+
     public static func agentName(for process: ObservedProcess) -> String? {
         guard !process.executable.contains(".app/Contents/Frameworks/") else { return nil }
+        guard desktopHostProviderName(for: process.executable) == nil else { return nil }
+        if let invocation = process.agentInvocation {
+            return (!invocation.isBackgroundService && !invocation.agentName.isEmpty) ? invocation.agentName : nil
+        }
         if let name = process.agentName { return name }
         switch process.name {
         case "codex", "Codex": return "Codex"
@@ -29,6 +45,18 @@ public enum AgentRecognizer {
         case "windsurf-agent": return "Windsurf"
         default: return nil
         }
+    }
+
+    /// Returns the coding agent provider for safety/cache protection, including desktop app shells and background daemons.
+    public static func runningProviderName(for process: ObservedProcess) -> String? {
+        guard !process.executable.contains(".app/Contents/Frameworks/") else { return nil }
+        if let hostProvider = desktopHostProviderName(for: process.executable) {
+            return hostProvider
+        }
+        if let invoked = process.agentInvocation?.agentName, !invoked.isEmpty {
+            return invoked
+        }
+        return agentName(for: process)
     }
 
     public static func isAgent(_ process: ObservedProcess) -> Bool { agentName(for: process) != nil }

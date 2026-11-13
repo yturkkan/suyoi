@@ -124,7 +124,7 @@ public struct SessionLogRetentionScanner: Sendable {
             let provider = components[0] == ".codex" ? "Codex" : "Claude Code"
             // Displayed session IDs come from bounded heuristics. While a
             // provider process exists, a different ID does not exclude ownership.
-            guard !observed.value.contains(where: { AgentRecognizer.agentName(for: $0) == provider }) else {
+            guard !observed.value.contains(where: { AgentRecognizer.runningProviderName(for: $0) == provider }) else {
                 outcomes.append(failed("A running agent may still own this session log"))
                 continue
             }

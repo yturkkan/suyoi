@@ -112,4 +112,48 @@ struct ProcessArgumentsReaderTests {
         execData.append(contentsOf: "/Applications/Example.app/Contents/Resources/../MacOS/Example\0".utf8)
         #expect(ProcessArgumentsReader.parseExecutablePath(from: execData) == "/Applications/Example.app/Contents/MacOS/Example")
     }
+
+    @Test func backgroundServiceSubcommandsAreFlaggedAndExcludedFromLiveAgents() {
+        let daemonCases: [(String, [String], String)] = [
+            ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+             ["codex", "-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"], "Codex"),
+            ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+             ["codex", "-c", "forced_login_method=\"chatgpt\"", "exec-server", "--concurrent-requests", "32"], "Codex"),
+            ("/opt/bin/opencode-cli", ["opencode-cli", "serve", "--service"], "OpenCode"),
+            ("/opt/bin/opencode", ["opencode", "--log-level", "INFO", "serve"], "OpenCode"),
+            ("/bin/node", ["node", "/opt/@openai/codex/bin/codex.js", "mcp-server"], "Codex"),
+            ("/opt/bin/hermes", ["hermes", "gateway"], "Hermes Agent")
+        ]
+        for (execPath, args, expectedProvider) in daemonCases {
+            let invocation = ProcessArgumentsReader.parseInvocation(from: fixture(args), executablePath: execPath)
+            #expect(invocation?.agentName == expectedProvider)
+            #expect(invocation?.isBackgroundService == true)
+            let proc = ObservedProcess(pid: 99, parentPID: 1, uid: 501, cpuPercent: 0, residentBytes: 0,
+                                       executable: execPath, agentInvocation: invocation)
+            #expect(proc.agentName == nil)
+            #expect(AgentRecognizer.agentName(for: proc) == nil)
+            #expect(!AgentRecognizer.isAgent(proc))
+            #expect(AgentRecognizer.runningProviderName(for: proc) == expectedProvider)
+        }
+
+        let interactiveCases: [(String, [String], String)] = [
+            ("/bin/codex", ["codex"], "Codex"),
+            ("/bin/codex", ["codex", "-m", "gpt-5", "explain app-server"], "Codex"),
+            ("/bin/codex", ["codex", "exec", "run tests"], "Codex"),
+            ("/bin/codex", ["codex", "resume", "019abc"], "Codex"),
+            ("/opt/bin/opencode", ["opencode"], "OpenCode"),
+            ("/opt/bin/opencode", ["opencode", "run", "--session", "ses_123", "hi"], "OpenCode"),
+            ("/opt/bin/claude", ["claude", "-p", "review"], "Claude Code")
+        ]
+        for (execPath, args, expectedName) in interactiveCases {
+            let invocation = ProcessArgumentsReader.parseInvocation(from: fixture(args), executablePath: execPath)
+            #expect(invocation?.agentName == expectedName)
+            #expect(invocation?.isBackgroundService == false)
+            let proc = ObservedProcess(pid: 100, parentPID: 1, uid: 501, cpuPercent: 0, residentBytes: 0,
+                                       executable: execPath, agentInvocation: invocation)
+            #expect(proc.agentName == expectedName)
+            #expect(AgentRecognizer.agentName(for: proc) == expectedName)
+            #expect(AgentRecognizer.isAgent(proc))
+        }
+    }
 }

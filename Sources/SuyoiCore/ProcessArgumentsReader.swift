@@ -46,33 +46,102 @@ struct ProcessArgumentsReader {
         return Self.parseExecutablePath(from: data)
     }
 
-    static func parseInvocation(from data: Data, executablePath: String) -> AgentInvocation? {
-        let executable = URL(fileURLWithPath: executablePath).lastPathComponent
-        if let (name, entry) = direct(executable) { return AgentInvocation(agentName: name, entrypoint: entry) }
-        guard runtime(executable), data.count >= 4 else { return nil }
-        let bytes = data
-        let raw = UInt32(bytes[0]) | UInt32(bytes[1]) << 8 | UInt32(bytes[2]) << 16 | UInt32(bytes[3]) << 24
+    private static func parseArgvTokens(from data: Data, requiredCount: Int, maxCount: Int = 12) -> [String]? {
+        guard data.count >= 4 else { return nil }
+        let raw = UInt32(data[0]) | UInt32(data[1]) << 8 | UInt32(data[2]) << 16 | UInt32(data[3]) << 24
         let argc = Int32(bitPattern: raw)
         guard argc > 0 else { return nil }
         var index = 4
-        guard let end = bytes[index...].firstIndex(of: 0) else { return nil }
-        index = end + 1
-        while index < bytes.count && bytes[index] == 0 { index += 1 }
+        guard let execEnd = data[index...].firstIndex(of: 0) else { return nil }
+        index = execEnd + 1
+        while index < data.count && data[index] == 0 { index += 1 }
+        let limit = min(Int(argc), maxCount)
+        let required = min(Int(argc), requiredCount)
         var args: [String] = []
-        for _ in 0..<min(Int(argc), 3) {
-            guard index < bytes.count, let end = bytes[index...].firstIndex(of: 0),
-                  let token = String(bytes: bytes[index..<end], encoding: .utf8) else { return nil }
+        for idx in 0..<limit {
+            guard index < data.count, let end = data[index...].firstIndex(of: 0),
+                  let token = String(bytes: data[index..<end], encoding: .utf8) else {
+                if idx < required { return nil }
+                break
+            }
             args.append(token)
             index = end + 1
         }
-        guard args.count > 1 else { return nil }
+        return args
+    }
+
+    private static func firstSubcommand(entrypoint: String, tailArgs: ArraySlice<String>) -> String? {
+        let valueFlags: Set<String> = [
+            "-c", "--config", "-m", "--model", "-p", "--profile", "-C", "--cd",
+            "-s", "--sandbox", "-a", "--ask-for-approval", "-i", "--image",
+            "--add-dir", "--enable", "--disable", "--log-level", "--port", "--hostname"
+        ]
+        let promptStopFlags: Set<String> = ["--prompt", "--message", "--resume", "-r", "--print"]
+        var idx = tailArgs.startIndex
+        while idx < tailArgs.endIndex {
+            let token = tailArgs[idx]
+            if token == "--" || promptStopFlags.contains(token) || (entrypoint == "claude" && token == "-p") {
+                return nil
+            }
+            if token.hasPrefix("-") {
+                if token.contains("=") {
+                    idx += 1
+                    continue
+                }
+                if valueFlags.contains(token) {
+                    idx += 2
+                    continue
+                }
+                idx += 1
+                continue
+            }
+            return token.lowercased()
+        }
+        return nil
+    }
+
+    private static func isBackgroundServiceSubcommand(entrypoint: String, tailArgs: ArraySlice<String>) -> Bool {
+        guard let sub = firstSubcommand(entrypoint: entrypoint, tailArgs: tailArgs) else {
+            return false
+        }
+        switch entrypoint {
+        case "codex":
+            return ["app-server", "exec-server", "mcp-server", "mcp", "completion"].contains(sub)
+        case "opencode":
+            return ["serve", "web", "acp", "mcp", "completion"].contains(sub)
+        case "claude":
+            return ["mcp", "doctor", "update", "install", "config"].contains(sub)
+        case "hermes":
+            return ["gateway", "mcp"].contains(sub)
+        case "gemini":
+            return ["mcp"].contains(sub)
+        default:
+            return false
+        }
+    }
+
+    static func parseInvocation(from data: Data, executablePath: String) -> AgentInvocation? {
+        let executable = URL(fileURLWithPath: executablePath).lastPathComponent
+        if let (name, entry) = direct(executable) {
+            if let args = parseArgvTokens(from: data, requiredCount: 1, maxCount: 12), args.count > 1 {
+                let isDaemon = isBackgroundServiceSubcommand(entrypoint: entry, tailArgs: args.dropFirst())
+                return AgentInvocation(agentName: name, entrypoint: entry, isBackgroundService: isDaemon)
+            }
+            return AgentInvocation(agentName: name, entrypoint: entry)
+        }
+        guard runtime(executable),
+              let args = parseArgvTokens(from: data, requiredCount: 3, maxCount: 12),
+              args.count > 1 else { return nil }
         let token: String
+        let tailStartIndex: Int
         if executable.hasPrefix("python"), args[1] == "-m" {
             guard args.count > 2, !args[2].hasPrefix("-") else { return nil }
             token = args[2]
+            tailStartIndex = 3
         } else {
             guard !args[1].hasPrefix("-") else { return nil }
             token = args[1]
+            tailStartIndex = 2
         }
         let parts = token.split(separator: "/").map(String.init)
         let base = parts.last ?? token
@@ -93,17 +162,22 @@ struct ProcessArgumentsReader {
             }
         }
         guard let (name, entry) = match else { return nil }
-        return AgentInvocation(agentName: name, runtime: executable, entrypoint: entry)
+        let isDaemon = args.count > tailStartIndex
+            ? isBackgroundServiceSubcommand(entrypoint: entry, tailArgs: args[tailStartIndex...])
+            : false
+        return AgentInvocation(agentName: name, runtime: executable, entrypoint: entry, isBackgroundService: isDaemon)
     }
 
     func invocation(pid: Int32, executablePath: String) -> AgentInvocation? {
         guard Self.candidate(executablePath) else { return nil }
+        if let data = readProcArgsData(pid: pid) {
+            return Self.parseInvocation(from: data, executablePath: executablePath)
+        }
         let executable = URL(fileURLWithPath: executablePath).lastPathComponent
         if let (name, entry) = Self.direct(executable) {
             return AgentInvocation(agentName: name, entrypoint: entry)
         }
-        guard let data = readProcArgsData(pid: pid) else { return nil }
-        return Self.parseInvocation(from: data, executablePath: executablePath)
+        return nil
     }
 
     static func parseMCPHelperKind(from data: Data, executablePath: String) -> String? {
